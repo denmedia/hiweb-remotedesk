@@ -74,8 +74,9 @@ Android-клиент удалённого рабочего стола (RDP) дл
   Ссылки на UIAutomationClient/Types берутся из `Framework64\v4.0.30319\WPF`.
 - Репозиторий: https://github.com/denmedia/hiweb-remotedesk (публичный, ветка `main`). Релиз: поднять
   `versionCode`/`versionName`, `:app:assembleRelease`, APK `HiWebRemoteDesk-<версия>.apk` → `gh release create v<версия>`.
-  Подпись release — `keystore.properties` в корне (в `.gitignore`, ключ `D:/MY/keys`, общий с IP Cam); без файла
-  release неподписан. Release-подпись отличается от debug: поверх debug-сборки на планшете не ставится. R8 выключен.
+  Подпись release — путь к файлу с паролями ключа в `local.properties` (`signing.properties=…`, файл в `D:/MY/keys`,
+  ключ общий с IP Cam) или `keystore.properties` в корне; пароли не копировать и не коммитить. Без файла release
+  неподписан. Release-подпись отличается от debug: поверх debug-сборки на планшете не ставится. R8 выключен.
 - Python не установлен; для скриптов — node. Большие heredoc в Bash ломаются: скрипт писать файлом.
 
 ## Планшет и adb — осторожно
