@@ -1,0 +1,21 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Ключ подписи и пароли — только локально
+keystore.properties
+*.jks
+*.keystore
+
+# Локальные служебные папки
+/.kotlin
+/.claude
+/app/build
+/windows-agent/obj
