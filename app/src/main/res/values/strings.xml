@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">RemoteDesk</string>
+    <string name="key_capture_label">RemoteDesk: передача клавиш</string>
+    <string name="key_capture_description">Передаёт сочетания клавиш (Win, Alt+Tab и другие) на удалённый компьютер, пока открыт экран удалённого рабочего стола. В остальное время клавиши не перехватываются и никуда не отправляются.</string>
+</resources>
