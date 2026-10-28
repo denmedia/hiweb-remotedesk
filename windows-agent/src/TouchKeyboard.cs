@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Windows.Automation;
 
@@ -51,6 +52,9 @@ namespace HiWebAgent
 
         [DllImport("user32.dll")]
         static extern IntPtr GetDesktopWindow();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetClassName(IntPtr hwnd, StringBuilder name, int max);
 
         [StructLayout(LayoutKind.Sequential)]
         struct Point
@@ -216,6 +220,10 @@ namespace HiWebAgent
         /// <summary>Фокус в поле, куда можно печатать: Edit или документ с текстовым курсором, не только для чтения.</summary>
         static bool IsTextInputFocused()
         {
+            // Программы, которые рисуют текст и курсор сами, не отдают UI Automation ни поля ввода, ни системного
+            // курсора (Notepad++ и другие на Scintilla, PhpStorm и прочие IDE на Java): узнаём их по классу окна.
+            string cls = FocusWindowClass();
+            if (IsSelfDrawnEditor(cls)) return true;
             AutomationElement el;
             try { el = AutomationElement.FocusedElement; }
             catch (Exception) { return HasCaret(); }
@@ -225,10 +233,38 @@ namespace HiWebAgent
             catch (ElementNotAvailableException) { return false; }
             // Страница браузера или окно просмотра тоже «документ»: печатать в них можно, только если есть курсор.
             bool candidate = type == ControlType.Edit || (type == ControlType.Document && HasCaret());
-            if (!candidate) return false;
+            if (!candidate)
+            {
+                Log.Write("touch keyboard: not an input, class=" + cls + ", type=" + type.ProgrammaticName);
+                return false;
+            }
             object pattern;
             if (el.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) return !((ValuePattern)pattern).Current.IsReadOnly;
             return true;
+        }
+
+        /// <summary>Класс окна, которому принадлежит фокус ввода (или активного окна, если фокус не определён).</summary>
+        static string FocusWindowClass()
+        {
+            uint pid;
+            IntPtr fg = GetForegroundWindow();
+            uint thread = GetWindowThreadProcessId(fg, out pid);
+            var info = new GuiThreadInfo();
+            info.Size = Marshal.SizeOf(typeof(GuiThreadInfo));
+            IntPtr hwnd = thread != 0 && GetGUIThreadInfo(thread, ref info) && info.Focus != IntPtr.Zero ? info.Focus : fg;
+            var name = new StringBuilder(256);
+            return GetClassName(hwnd, name, name.Capacity) > 0 ? name.ToString() : "";
+        }
+
+        /// <summary>
+        /// Окна редакторов с собственной отрисовкой текста: Scintilla (Notepad++, SciTE) и Java AWT/Swing (IDE
+        /// JetBrains). О том, какой именно элемент в окне Java в фокусе, система не знает: клавиатура покажется
+        /// при щелчке в любом месте такого окна, зато печатать в редакторе можно.
+        /// </summary>
+        static bool IsSelfDrawnEditor(string cls)
+        {
+            return cls.StartsWith("Scintilla", StringComparison.OrdinalIgnoreCase)
+                || cls.StartsWith("SunAwt", StringComparison.OrdinalIgnoreCase);
         }
 
         static bool HasCaret()

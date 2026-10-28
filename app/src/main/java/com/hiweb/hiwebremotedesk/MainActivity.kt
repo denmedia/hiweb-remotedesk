@@ -7,6 +7,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import com.hiweb.hiwebremotedesk.agent.GuardNotifications
+import com.hiweb.hiwebremotedesk.data.GuardNavigation
 import com.hiweb.hiwebremotedesk.ui.HomeScreen
 import com.hiweb.hiwebremotedesk.ui.theme.HiWebRemoteDeskTheme
 
@@ -30,7 +32,21 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        showGuardFrom(intent)
         // Если ПК привязаны к HiWeb Agent, ждём их команду «Переключиться на Планшет».
         com.hiweb.hiwebremotedesk.agent.SwitchListenerService.startIfPaired(this)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        showGuardFrom(intent)
+    }
+
+    /** Нажатие на уведомление об угрозе открывает окно защиты этого ПК. */
+    private fun showGuardFrom(intent: Intent?) {
+        val device = intent?.getStringExtra(GuardNotifications.EXTRA_DEVICE) ?: return
+        intent.removeExtra(GuardNotifications.EXTRA_DEVICE)
+        GuardNavigation.open.value = device
     }
 }

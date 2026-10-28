@@ -7,6 +7,10 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Rect
+import android.graphics.RenderEffect
+import android.graphics.RenderNode
+import android.graphics.Shader
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
@@ -113,12 +117,57 @@ class RemoteView(context: Context) : View(context) {
         setBackgroundColor(Color.BLACK)
     }
 
+    // Смена ориентации: прежняя картинка стола поворачивается, мутнеет и исчезает, когда Windows пришлёт новый размер.
+    private class Transition(
+        val picture: Bitmap,
+        var clock: RotationClock,
+        var fromAngle: Float,
+        var fromScaleX: Float,
+        var fromScaleY: Float,
+    )
+
+    private var transition: Transition? = null
+
+    /** Прежняя картинка: ею заливается новый рабочий стол, пока Windows не нарисовала его целиком. */
+    @Volatile private var prefill: Bitmap? = null
+    private val prefillPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+    /** Идущая смена ориентации уже перешла на новый рабочий стол: до этого живой кадр старого размера не рисуется. */
+    @Volatile private var desktopFresh = true
+
+    /** Идёт ожидание ответа Windows (картинка размыта, нужен лоадер); вызывается из UI-потока. */
+    var onRotationWait: ((Boolean) -> Unit)? = null
+
+    // Сколько площади нового стола Windows уже перерисовала (под [lock]); -1 — не ждём.
+    private var awaitCovered = -1L
+    private var awaitArea = 0L
+    private var awaitFirst = false
+    private val snapshotNode = RenderNode("rotation")
+    private val desktopReady: Runnable = Runnable {
+        synchronized(lock) { awaitCovered = -1 }
+        removeCallbacks(desktopQuiet)
+        transition?.clock?.ready(SystemClock.uptimeMillis())
+        onRotationWait?.invoke(false)
+        invalidate()
+    }
+
+    // Кадры нового стола перестали приходить: после экрана входа и «Добро пожаловать» Windows присылает сам стол.
+    private val desktopQuiet: Runnable = Runnable { desktopReady.run() }
+
     fun initDesktop(width: Int, height: Int) {
         synchronized(lock) {
             if (bitmap?.width != width || bitmap?.height != height) {
-                bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                val created = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                bitmap = created
                 cursorX = width / 2f
                 cursorY = height / 2f
+                prefill?.let { old ->
+                    Canvas(created).drawBitmap(old, null, Rect(0, 0, width, height), prefillPaint)
+                    awaitCovered = 0
+                    awaitArea = width.toLong() * height
+                    awaitFirst = false
+                    desktopFresh = true
+                }
             }
         }
         post { computeLayout(); invalidate() }
@@ -126,12 +175,109 @@ class RemoteView(context: Context) : View(context) {
 
     /** Вызывается из потока RDP. */
     fun applyBitmap(left: Int, top: Int, w: Int, h: Int, argb: IntArray) {
+        var settled = false
+        var first = false
         synchronized(lock) {
             val b = bitmap ?: return
             if (left < 0 || top < 0 || left + w > b.width || top + h > b.height) return
             b.setPixels(argb, 0, w, left, top, w, h)
+            if (awaitCovered >= 0) {
+                awaitCovered += w.toLong() * h
+                if (!awaitFirst) {
+                    awaitFirst = true
+                    first = true
+                }
+                settled = awaitCovered * 2 >= awaitArea
+            }
+        }
+        // Картинка уходит, когда Windows перерисовала половину стола и кадры затихли: анимация экрана входа или
+        // «Добро пожаловать» их не прерывает. Не дольше FRAMES_CAP_MS после первого кадра (на столе может идти видео).
+        if (first) postDelayed(desktopReady, FRAMES_CAP_MS)
+        if (settled) {
+            removeCallbacks(desktopQuiet)
+            postDelayed(desktopQuiet, FRAMES_QUIET_MS)
         }
         postInvalidateOnAnimation()
+    }
+
+    /**
+     * Начало смены ориентации (из UI-потока, до перекладки под новый размер): запоминает картинку стола и
+     * поворот дисплея [delta] (1 — на 90° по часовой, 3 — против, см. [SessionRotation.delta]). Картинка стартует
+     * там, где пользователь её видел, и за время анимации становится вровень с новым окном.
+     */
+    fun beginRotation(delta: Int) {
+        if (delta == 0 || width == 0 || height == 0) return
+        val now = SystemClock.uptimeMillis()
+        removeCallbacks(desktopReady)
+        // Три четверти оборота по часовой — это четверть против: картинка поворачивается кратчайшим путём.
+        val turns = if (delta == 3) -1 else delta
+        val current = transition
+        if (current != null) {
+            // Поворот поверх идущего: продолжаем с того, что сейчас на экране.
+            val p = current.clock.progress(now)
+            val b = current.picture
+            current.fromAngle = current.fromAngle * (1 - p) - turns * 90f
+            current.fromScaleX += (width / b.width.toFloat() - current.fromScaleX) * p
+            current.fromScaleY += (height / b.height.toFloat() - current.fromScaleY) * p
+            current.clock = RotationClock(now, current.clock.blur(now))
+        } else {
+            val picture = synchronized(lock) { bitmap?.copy(Bitmap.Config.ARGB_8888, false) } ?: return
+            transition = Transition(picture, RotationClock(now), -turns * 90f, scale, scale)
+            prefill = picture
+        }
+        desktopFresh = false
+        synchronized(lock) { awaitCovered = -1 }
+        removeCallbacks(desktopQuiet)
+        onRotationWait?.invoke(true)
+        invalidate()
+    }
+
+    /** Новый размер стола не понадобился (поворот отменён или размер тот же): прежняя картинка просто исчезает. */
+    fun finishRotation() {
+        desktopFresh = true
+        removeCallbacks(desktopReady)
+        post(desktopReady)
+    }
+
+    private fun endTransition() {
+        removeCallbacks(desktopReady)
+        removeCallbacks(desktopQuiet)
+        onRotationWait?.invoke(false)
+        transition = null
+        prefill = null
+        desktopFresh = true
+    }
+
+    private fun drawTransition(canvas: Canvas, tr: Transition, now: Long) {
+        val b = tr.picture
+        val p = tr.clock.progress(now)
+        val blur = tr.clock.blur(now)
+        val sx = tr.fromScaleX + (width / b.width.toFloat() - tr.fromScaleX) * p
+        val sy = tr.fromScaleY + (height / b.height.toFloat() - tr.fromScaleY) * p
+        if (!canvas.isHardwareAccelerated) {
+            canvas.save()
+            canvas.translate(width / 2f, height / 2f)
+            canvas.rotate(tr.fromAngle * (1 - p))
+            canvas.scale(sx, sy)
+            canvas.translate(-b.width / 2f, -b.height / 2f)
+            paint.alpha = (tr.clock.alpha(now) * 255).toInt()
+            canvas.drawBitmap(b, 0f, 0f, paint)
+            paint.alpha = 255
+            canvas.restore()
+            return
+        }
+        snapshotNode.setPosition(0, 0, width, height)
+        val rc = snapshotNode.beginRecording(width, height)
+        rc.translate(width / 2f, height / 2f)
+        rc.rotate(tr.fromAngle * (1 - p))
+        rc.scale(sx, sy)
+        rc.translate(-b.width / 2f, -b.height / 2f)
+        rc.drawBitmap(b, 0f, 0f, paint)
+        snapshotNode.endRecording()
+        val radius = BLUR_RADIUS_DP * resources.displayMetrics.density * blur
+        snapshotNode.setRenderEffect(if (radius < 0.5f) null else RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP))
+        snapshotNode.setAlpha(tr.clock.alpha(now))
+        canvas.drawRenderNode(snapshotNode)
     }
 
     fun snapshot(): Bitmap? = synchronized(lock) { bitmap?.copy(Bitmap.Config.ARGB_8888, false) }
@@ -152,15 +298,59 @@ class RemoteView(context: Context) : View(context) {
 
     override fun onDraw(canvas: Canvas) {
         canvas.drawColor(Color.BLACK)
-        synchronized(lock) {
-            val b = bitmap ?: return
-            canvas.save()
-            canvas.translate(offX, offY)
-            canvas.scale(scale, scale)
-            canvas.drawBitmap(b, 0f, 0f, paint)
-            canvas.restore()
+        val tr = transition
+        val now = SystemClock.uptimeMillis()
+        // Новый стол (экран входа Windows, «Добро пожаловать») не должен просвечивать из-за вращающейся картинки:
+        // он показывается только под исчезающей.
+        if (tr == null || (desktopFresh && tr.clock.alpha(now) < 1f)) {
+            synchronized(lock) {
+                val b = bitmap ?: return
+                canvas.save()
+                canvas.translate(offX, offY)
+                canvas.scale(scale, scale)
+                canvas.drawBitmap(b, 0f, 0f, paint)
+                canvas.restore()
+            }
         }
-        if (captured) drawCursor(canvas)
+        if (tr != null) {
+            if (tr.clock.finished(now)) {
+                endTransition()
+                invalidate()
+            } else {
+                drawTransition(canvas, tr, now)
+                postInvalidateOnAnimation()
+            }
+            return
+        }
+        if (captured && (!fingerInput || fingerCursorShown())) drawCursor(canvas)
+    }
+
+    /** Последним вводом был палец на экране, а не тачпад или мышь: курсор не рисуется, пока палец не в режиме перетаскивания. */
+    private var fingerInput = false
+    private var fingerCursorWasShown = false
+
+    /**
+     * Пальцем курсор нужен, только когда он что-то делает: долгое касание (до отпускания — правая кнопка, дальше —
+     * перетаскивание с левой) и перетаскивание вторым пальцем. Обычный тап, прокрутка и жесты курсора не показывают.
+     */
+    private fun fingerCursorShown(): Boolean = when (touchMode) {
+        TouchMode.SINGLE -> longFired || (regrip && fingerDown)
+        TouchMode.DRAG -> true
+        else -> false
+    }
+
+    /** Перерисовка, когда курсор под пальцем появился, пропал или двигается. */
+    private fun refreshFingerCursor() {
+        val shown = fingerCursorShown()
+        if (shown || shown != fingerCursorWasShown) postInvalidateOnAnimation()
+        fingerCursorWasShown = shown
+    }
+
+    /** Ввод тачпадом или мышью возвращает курсор. */
+    private fun pointerInput() {
+        if (!fingerInput) return
+        fingerInput = false
+        postInvalidateOnAnimation()
     }
 
     private val cursorFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
@@ -179,8 +369,23 @@ class RemoteView(context: Context) : View(context) {
     @Volatile private var cursorArt: CursorArt? = null
     private val invertPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { blendMode = BlendMode.DIFFERENCE }
 
-    /** Вызывается из потока RDP. */
+    // Windows по RDP присылает только «стрелку» (PTR_DEFAULT) при любой смене курсора; пока агент на ПК сообщает
+    // настоящую форму, эта стрелка её не перекрывает.
+    @Volatile private var agentCursor = false
+
+    /** Курсор от сервера RDP. Вызывается из потока RDP. */
     fun setRemoteCursor(cursor: RemoteCursor) {
+        if (agentCursor && cursor === RemoteCursor.Default) return
+        applyCursor(cursor)
+    }
+
+    /** Курсор от агента на ПК; null — агент пропал, возвращаемся к серверному. Вызывается из любого потока. */
+    fun setAgentCursor(cursor: RemoteCursor?) {
+        agentCursor = cursor != null
+        applyCursor(cursor ?: RemoteCursor.Default)
+    }
+
+    private fun applyCursor(cursor: RemoteCursor) {
         cursorArt = (cursor as? CursorImage)?.let { img ->
             val color = Bitmap.createBitmap(img.width, img.height, Bitmap.Config.ARGB_8888)
             color.setPixels(img.argb, 0, img.width, 0, 0, img.width, img.height)
@@ -285,16 +490,40 @@ class RemoteView(context: Context) : View(context) {
     private fun applyButtons(state: Int, rx: Int, ry: Int) {
         val changed = state xor lastButtons
         if (changed == 0) return
-        fun edge(androidMask: Int, rdpFlag: Int) {
-            if (changed and androidMask == 0) return
-            val down = state and androidMask != 0
-            client?.sendMouse(rdpFlag or if (down) RdpClient.PTR_DOWN else 0, rx, ry)
+        // Дополнительные кнопки в журнале: видно, дошло ли нажатие до приложения или его съела система.
+        if (changed and (MotionEvent.BUTTON_TERTIARY or MotionEvent.BUTTON_BACK or MotionEvent.BUTTON_FORWARD) != 0) {
+            Log.i("Input", "mouse buttons state=$state changed=$changed")
         }
-        edge(MotionEvent.BUTTON_PRIMARY, RdpClient.PTR_LEFT)
-        edge(MotionEvent.BUTTON_SECONDARY, RdpClient.PTR_RIGHT)
-        edge(MotionEvent.BUTTON_TERTIARY, RdpClient.PTR_MIDDLE)
+        for (mask in MOUSE_BUTTONS) {
+            if (changed and mask != 0) sendButton(mask, state and mask != 0, rx, ry)
+        }
         lastButtons = state
         lastX = rx; lastY = ry
+    }
+
+    /** Кнопка мыши на ПК: левая, правая и средняя — обычными флагами, «назад»/«вперёд» — боковыми (XBUTTON). */
+    private fun sendButton(androidMask: Int, down: Boolean, x: Int, y: Int) {
+        val c = client ?: return
+        val d = if (down) RdpClient.PTR_DOWN else 0
+        when (androidMask) {
+            MotionEvent.BUTTON_PRIMARY -> c.sendMouse(RdpClient.PTR_LEFT or d, x, y)
+            MotionEvent.BUTTON_SECONDARY -> c.sendMouse(RdpClient.PTR_RIGHT or d, x, y)
+            MotionEvent.BUTTON_TERTIARY -> c.sendMouse(RdpClient.PTR_MIDDLE or d, x, y)
+            MotionEvent.BUTTON_BACK -> c.sendMouseX(RdpClient.PTRX_BACK, down, x, y)
+            MotionEvent.BUTTON_FORWARD -> c.sendMouseX(RdpClient.PTRX_FORWARD, down, x, y)
+        }
+    }
+
+    /**
+     * Кнопка мыши, пришедшая клавишей: Samsung превращает среднюю, «назад» и «вперёд» в Home/Back/Forward по настройкам
+     * ОС. [androidMask] — `MotionEvent.BUTTON_TERTIARY/BACK/FORWARD`. Бит в [lastButtons] общий с обычным путём, поэтому
+     * если кнопка придёт ещё и событием мыши, на ПК она нажмётся и отпустится один раз.
+     */
+    fun mouseButtonKey(androidMask: Int, down: Boolean) {
+        val held = lastButtons and androidMask != 0
+        if (down == held) return
+        lastButtons = if (down) lastButtons or androidMask else lastButtons and androidMask.inv()
+        sendButton(androidMask, down, if (lastX >= 0) lastX else cursorX.roundToInt(), if (lastY >= 0) lastY else cursorY.roundToInt())
     }
 
     /** Колесо в точке, где сейчас курсор; [units] в единицах RDP (120 — щелчок), > 0 — вверх/вправо. */
@@ -367,6 +596,30 @@ class RemoteView(context: Context) : View(context) {
         engine.desktop = profile
     }
     private var padUnits = TouchpadEngine.DEFAULT_UNITS_PER_MM
+
+    /**
+     * Скорость курсора физической (Bluetooth) мыши из настроек ПК (1 — по умолчанию, 2 — вдвое быстрее).
+     * Тачпада чехла не касается: у него своё ускорение в [TouchpadEngine].
+     */
+    private var mouseSpeed = 1f
+
+    /** Скорость перемещения курсора мышью; применяется сразу, без переподключения. */
+    fun setMouseSpeed(speed: Float) {
+        mouseSpeed = speed
+    }
+
+    private var mouseWheelSpeed = 1f
+
+    /** Скорость прокрутки колёсиком физической мыши (1 — щелчок как в Windows); пальцев и тачпада не касается. */
+    fun setMouseWheelSpeed(speed: Float) {
+        mouseWheelSpeed = speed
+    }
+
+    /** Колесо физической мыши: ось колеса в щелчках, масштабируется настройкой скорости колёсика. */
+    private fun mouseWheel(e: MotionEvent) {
+        gestures.scrollNotches(true, e.getAxisValue(MotionEvent.AXIS_VSCROLL) * mouseWheelSpeed)
+        gestures.scrollNotches(false, e.getAxisValue(MotionEvent.AXIS_HSCROLL) * mouseWheelSpeed)
+    }
 
     /**
      * Захват указателя: Android отдаёт приложению сырые касания тачпада и сам не обрабатывает на нём жесты
@@ -462,6 +715,7 @@ class RemoteView(context: Context) : View(context) {
     }
 
     private fun handleTouchpad(e: MotionEvent) {
+        pointerInput()
         if (!padUnitsKnown) learnPadUnits(e)
         val action = e.actionMasked
         var n = 0
@@ -503,13 +757,14 @@ class RemoteView(context: Context) : View(context) {
 
     /** Мышь в режиме захвата присылает относительные смещения в пикселях экрана. */
     private fun handleRelativeMouse(e: MotionEvent) {
+        pointerInput()
         when (e.actionMasked) {
             MotionEvent.ACTION_MOVE, MotionEvent.ACTION_HOVER_MOVE ->
-                moveCursorBy(e.getAxisValue(MotionEvent.AXIS_RELATIVE_X) / scale, e.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) / scale)
-            MotionEvent.ACTION_SCROLL -> {
-                gestures.scrollNotches(true, e.getAxisValue(MotionEvent.AXIS_VSCROLL))
-                gestures.scrollNotches(false, e.getAxisValue(MotionEvent.AXIS_HSCROLL))
-            }
+                moveCursorBy(
+                    e.getAxisValue(MotionEvent.AXIS_RELATIVE_X) / scale * mouseSpeed,
+                    e.getAxisValue(MotionEvent.AXIS_RELATIVE_Y) / scale * mouseSpeed,
+                )
+            MotionEvent.ACTION_SCROLL -> mouseWheel(e)
         }
         applyButtons(e.buttonState, cursorX.roundToInt(), cursorY.roundToInt())
     }
@@ -538,6 +793,19 @@ class RemoteView(context: Context) : View(context) {
 
     private companion object {
         const val MAX_FINGERS = 8
+
+        /** Размытие прежней картинки при смене ориентации (радиус в dp при полной степени). */
+        const val BLUR_RADIUS_DP = 26f
+
+        /** Сколько кадры нового стола должны молчать, прежде чем убирать прежнюю картинку, и самый долгий срок ожидания после первого кадра. */
+        const val FRAMES_QUIET_MS = 500L
+        const val FRAMES_CAP_MS = 5_000L
+
+        /** Кнопки мыши Android, которые пересылаются на ПК. */
+        val MOUSE_BUTTONS = intArrayOf(
+            MotionEvent.BUTTON_PRIMARY, MotionEvent.BUTTON_SECONDARY, MotionEvent.BUTTON_TERTIARY,
+            MotionEvent.BUTTON_BACK, MotionEvent.BUTTON_FORWARD,
+        )
 
         /** Через сколько палец, не сдвигаясь, даёт правую кнопку (долгое касание, как в iPadOS). */
         const val LONG_PRESS_MS = 500L
@@ -637,13 +905,13 @@ class RemoteView(context: Context) : View(context) {
     override fun onGenericMotionEvent(e: MotionEvent): Boolean {
         if (handleGesture(e)) return true
         if (!isMouse(e)) return super.onGenericMotionEvent(e)
+        pointerInput()
         when (e.actionMasked) {
             MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_ENTER -> { move(e.x, e.y); syncButtons(e) }
             MotionEvent.ACTION_BUTTON_PRESS, MotionEvent.ACTION_BUTTON_RELEASE -> syncButtons(e)
             MotionEvent.ACTION_SCROLL -> {
                 move(e.x, e.y)
-                gestures.scrollNotches(true, e.getAxisValue(MotionEvent.AXIS_VSCROLL))
-                gestures.scrollNotches(false, e.getAxisValue(MotionEvent.AXIS_HSCROLL))
+                mouseWheel(e)
             }
             else -> return super.onGenericMotionEvent(e)
         }
@@ -653,6 +921,7 @@ class RemoteView(context: Context) : View(context) {
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (handleGesture(e)) return true
         if (isMouse(e)) {
+            pointerInput()
             move(e.x, e.y)
             syncButtons(e)
             if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
@@ -661,7 +930,9 @@ class RemoteView(context: Context) : View(context) {
             }
             return true
         }
+        fingerInput = true
         fingerTouch(e)
+        refreshFingerCursor()
         return true
     }
 
@@ -967,6 +1238,7 @@ class RemoteView(context: Context) : View(context) {
         longFired = true
         performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         move(downX, downY)
+        refreshFingerCursor()
     }
 
     private fun rightClick(x: Float, y: Float) {

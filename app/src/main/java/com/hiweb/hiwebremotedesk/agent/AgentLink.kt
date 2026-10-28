@@ -1,11 +1,25 @@
 package com.hiweb.hiwebremotedesk.agent
 
+import android.graphics.BitmapFactory
 import android.util.Log
+import com.hiweb.hiwebremotedesk.rdp.CursorImage
 import com.hiweb.hiwebremotedesk.rdp.DvcHandler
+import com.hiweb.hiwebremotedesk.rdp.RemoteCursor
 import org.json.JSONObject
 
-/** Уведомление Windows, пересланное агентом. */
-data class PcNotification(val id: Long, val app: String, val title: String, val text: String, val timeMs: Long)
+/**
+ * Уведомление Windows, пересланное агентом. [ack] — агент ждёт ответа `notif_ack` (проверка пересылки в меню агента).
+ * [iconPng] — иконка приложения Windows (PNG), если агент смог её получить.
+ */
+class PcNotification(
+    val id: Long,
+    val app: String,
+    val title: String,
+    val text: String,
+    val timeMs: Long,
+    val ack: Boolean = false,
+    val iconPng: ByteArray? = null,
+)
 
 /**
  * Связь с HiWeb Agent на ПК через динамический канал RDP «HiWeb::Agent» (протокол — windows-agent/PROTOCOL.md).
@@ -32,6 +46,12 @@ class AgentLink(
 
         /** Состояние ПК (сообщение `status`): блокировка, сон, выключение — для карточки ПК в списке. */
         fun onAgentStatus(msg: JSONObject) {}
+
+        /** Защита подключений: сообщения `guard_state`, `conn`, `threat`, `guard_result`. */
+        fun onAgentGuard(msg: JSONObject) {}
+
+        /** Форма курсора на ПК (Windows по RDP присылает только стрелку, поэтому её сообщает агент). */
+        fun onAgentCursor(cursor: RemoteCursor) {}
     }
 
     @Volatile private var write: ((ByteArray) -> Unit)? = null
@@ -69,6 +89,8 @@ class AgentLink(
             }
             "activate" -> listener.onAgentActivate()
             "status" -> listener.onAgentStatus(msg)
+            "guard_state", "conn", "threat", "guard_result" -> listener.onAgentGuard(msg)
+            "cursor" -> parseCursor(msg)?.let(listener::onAgentCursor)
             "tkb" -> listener.onKeyboardPane(
                 if (msg.optBoolean("visible")) {
                     android.graphics.Rect(msg.optInt("left"), msg.optInt("top"), msg.optInt("right"), msg.optInt("bottom"))
@@ -83,6 +105,9 @@ class AgentLink(
                     title = msg.optString("title"),
                     text = msg.optString("text"),
                     timeMs = msg.optLong("time"),
+                    ack = msg.optBoolean("ack"),
+                    iconPng = msg.optString("icon").takeIf { it.isNotEmpty() }
+                        ?.let { runCatching { java.util.Base64.getDecoder().decode(it) }.getOrNull() },
                 ),
             )
         }
@@ -128,12 +153,36 @@ class AgentLink(
         )
     }
 
+    /** Курсор из сообщения `cursor`: PNG с точкой привязки либо `hidden`; null, если картинка не читается. */
+    private fun parseCursor(msg: JSONObject): RemoteCursor? {
+        if (msg.optBoolean("hidden")) return RemoteCursor.Hidden
+        val png = runCatching { java.util.Base64.getDecoder().decode(msg.optString("png")) }.getOrNull() ?: return null
+        val bmp = BitmapFactory.decodeByteArray(png, 0, png.size) ?: return null
+        val argb = IntArray(bmp.width * bmp.height)
+        bmp.getPixels(argb, 0, bmp.width, 0, 0, bmp.width, bmp.height)
+        val cursor = CursorImage(
+            bmp.width, bmp.height,
+            msg.optInt("hx").coerceIn(0, bmp.width - 1), msg.optInt("hy").coerceIn(0, bmp.height - 1),
+            argb, null,
+        )
+        bmp.recycle()
+        return cursor
+    }
+
     private fun stateMessage(fg: Boolean) = JSONObject().put("t", "state").put("fg", fg)
 
     private fun batteryMessage(level: Int, charging: Boolean) =
         JSONObject().put("t", "battery").put("level", level).put("charging", charging)
 
     private fun keyboardMessage(present: Boolean) = JSONObject().put("t", "keyboard").put("physical", present)
+
+    /** Ответ на уведомление с `ack`: показано ли оно, а если нет — почему ([PcNotifications.BLOCKED_VISIBLE] и др.). */
+    fun sendNotificationAck(id: Long, blockedBy: String?) {
+        send(JSONObject().put("t", "notif_ack").put("id", id).put("posted", blockedBy == null).put("reason", blockedBy ?: ""))
+    }
+
+    /** Произвольное сообщение агенту (команды защиты); ничего не делает, пока канал не открыт. */
+    fun sendRaw(msg: JSONObject) = send(msg)
 
     private fun send(msg: JSONObject) {
         val w = write ?: return

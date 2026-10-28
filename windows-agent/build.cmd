@@ -13,7 +13,7 @@ if not exist "%OUT%" mkdir "%OUT%"
 "%FW%\csc.exe" -nologo -target:winexe -optimize+ -win32manifest:app.manifest -win32icon:app.ico -resource:laptop.png,HiWebAgent.laptop.png -out:"%OUT%\HiWebAgent.exe" ^
   -r:System.Windows.Forms.dll -r:System.Drawing.dll -r:"%FW%\System.Web.Extensions.dll" -r:System.Core.dll -r:System.Security.dll ^
   -r:"%FW%\WPF\UIAutomationClient.dll" -r:"%FW%\WPF\UIAutomationTypes.dll" ^
-  -r:"%FW%\System.Runtime.dll" -r:"%WM%\Windows.Foundation.winmd" -r:"%WM%\Windows.UI.winmd" -r:"%WM%\Windows.ApplicationModel.winmd" ^
+  -r:"%FW%\System.Runtime.dll" -r:"%WM%\Windows.Foundation.winmd" -r:"%WM%\Windows.Data.winmd" -r:"%WM%\Windows.UI.winmd" -r:"%WM%\Windows.ApplicationModel.winmd" ^
   src\*.cs obj\BuildInfo.cs
 if errorlevel 1 exit /b 1
 <nul set /p =%VER%> "%OUT%\version.txt"

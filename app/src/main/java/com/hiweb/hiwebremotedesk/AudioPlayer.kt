@@ -30,7 +30,12 @@ class AudioPlayer : AudioSink {
                 } finally {
                     queuedBytes.addAndGet(-pcm.size)
                 }
-                done()
+                // Подтверждение блока уходит в сеть из этого потока; если сеанс уже закрыт (выход, обрыв), запись в
+                // сокет бросает исключение, а необработанное исключение потока роняет всё приложение.
+                try {
+                    done()
+                } catch (_: Exception) {
+                }
             }
         } catch (_: RejectedExecutionException) {
             queuedBytes.addAndGet(-pcm.size)

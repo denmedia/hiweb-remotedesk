@@ -22,6 +22,8 @@ namespace HiWebAgent
         [STAThread]
         static int Main(string[] args)
         {
+            // Повышенная копия для блокировки подсетей (запускается агентом через UAC): без трея и окон.
+            if (args.Length > 0 && args[0] == FirewallRules.ElevatedArg) return FirewallRules.RunElevated(args);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             string self = Assembly.GetExecutingAssembly().Location;
@@ -50,6 +52,9 @@ namespace HiWebAgent
                 return 1;
             }
 
+            // Агент без окон: падение иначе проходит молча, а в журнале остаётся только «started».
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e) { Log.Write("crash: " + e.ExceptionObject); };
+            Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e) { Log.Write("error: " + e.Exception); };
             bool createdNew;
             using (var instance = new Mutex(true, Installer.InstanceMutex, out createdNew))
             {

@@ -12,95 +12,43 @@ using Microsoft.Win32;
 namespace HiWebAgent
 {
     /// <summary>
-    /// Планшет, к которому привязан агент: приходит по каналу RDP (сообщение pair) и хранится в реестре
-    /// пользователя; общий ключ зашифрован DPAPI. Нужен, чтобы позвать планшет, когда он не подключён.
-    /// </summary>
-    sealed class TabletPairing
-    {
-        const string Key = Installer.SettingsKey + @"\Tablet";
-
-        public string DeviceId;   // идентификатор этого ПК в приложении на планшете
-        public string Name;       // модель планшета
-        public int Port;
-        public string[] Addresses;
-        public byte[] Secret;
-
-        public static TabletPairing Load()
-        {
-            try
-            {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(Key))
-                {
-                    if (k == null) return null;
-                    var p = new TabletPairing();
-                    p.DeviceId = k.GetValue("DeviceId") as string;
-                    p.Name = k.GetValue("Name") as string;
-                    object port = k.GetValue("Port");
-                    p.Port = port is int ? (int)port : 0;
-                    p.Addresses = (k.GetValue("Addresses") as string ?? "").Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    byte[] secret = k.GetValue("Secret") as byte[];
-                    if (p.DeviceId == null || p.Port <= 0 || secret == null) return null;
-                    p.Secret = ProtectedData.Unprotect(secret, null, DataProtectionScope.CurrentUser);
-                    return p;
-                }
-            }
-            catch (Exception e)
-            {
-                Log.Write("pairing load: " + e.Message);
-                return null;
-            }
-        }
-
-        public void Save()
-        {
-            using (RegistryKey k = Registry.CurrentUser.CreateSubKey(Key))
-            {
-                k.SetValue("DeviceId", DeviceId);
-                k.SetValue("Name", Name ?? "");
-                k.SetValue("Port", Port, RegistryValueKind.DWord);
-                k.SetValue("Addresses", string.Join(" ", Addresses ?? new string[0]));
-                k.SetValue("Secret", ProtectedData.Protect(Secret, null, DataProtectionScope.CurrentUser), RegistryValueKind.Binary);
-            }
-        }
-    }
-
-    /// <summary>
-    /// «Переключиться на планшет», когда планшет не подключён: подписанная (HMAC-SHA256) команда по UDP на
-    /// известные адреса планшета и широковещательно в локальные сети; планшет отвечает подписанным подтверждением.
+    /// «Переключиться на устройство», когда оно не подключено: подписанная (HMAC-SHA256) команда по UDP на
+    /// известные адреса устройства и широковещательно в локальные сети; устройство отвечает подписанным
+    /// подтверждением. У каждого устройства свой ключ (см. <see cref="PairedDevice"/>).
     /// </summary>
     static class TabletSwitch
     {
         const int ATTEMPTS = 4;
         const int WAIT_MS = 800;
 
-        /// <summary>Блокирует поток до ~4 секунд. true — планшет подтвердил команду.</summary>
-        public static bool Call(TabletPairing p)
+        /// <summary>Блокирует поток до ~4 секунд. true — устройство подтвердило команду.</summary>
+        public static bool Call(PairedDevice p)
         {
             return Exchange(p, "switch", "ack", ATTEMPTS) != null;
         }
 
-        /// <summary>Ищет планшет в локальной сети (запрос «where»); возвращает его адрес или null.</summary>
-        public static IPAddress Discover(TabletPairing p)
+        /// <summary>Ищет устройство в локальной сети (запрос «where»); возвращает его адрес или null.</summary>
+        public static IPAddress Discover(PairedDevice p)
         {
             IPEndPoint from = Exchange(p, "where", "here", 2);
             return from == null ? null : from.Address;
         }
 
         /// <summary>
-        /// Подписанный запрос [type] на известные адреса планшета и широковещательно; ждёт ответ [replyType],
+        /// Подписанный запрос [type] на известные адреса устройства и широковещательно; ждёт ответ [replyType],
         /// подписанный тем же ключом (HMAC от «replyType|nonce»). Возвращает адрес ответившего или null.
         /// </summary>
-        static IPEndPoint Exchange(TabletPairing p, string type, string replyType, int attempts)
+        static IPEndPoint Exchange(PairedDevice p, string type, string replyType, int attempts)
         {
             var json = new JavaScriptSerializer();
             string nonce = Guid.NewGuid().ToString("N");
             long ts = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
             var msg = new Dictionary<string, object>();
             msg["t"] = type;
-            msg["pc"] = p.DeviceId;
+            msg["pc"] = p.PcId;
             msg["ts"] = ts;
             msg["nonce"] = nonce;
-            msg["mac"] = Crypto.Mac(p.Secret, type + "|" + p.DeviceId + "|" + ts + "|" + nonce);
+            msg["mac"] = Crypto.Mac(p.Secret, type + "|" + p.PcId + "|" + ts + "|" + nonce);
             byte[] payload = Encoding.UTF8.GetBytes(json.Serialize(msg));
             string expected = Crypto.Mac(p.Secret, replyType + "|" + nonce);
 

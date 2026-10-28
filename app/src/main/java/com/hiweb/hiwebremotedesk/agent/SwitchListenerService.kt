@@ -44,6 +44,7 @@ class SwitchListenerService : Service() {
             .setContentText("«Переключиться на Планшет» в меню HiWeb Agent откроет сеанс")
             .setOngoing(true)
             .setContentIntent(open)
+            .addAction(hideAction())
             .build()
         startForeground(PcNotifications.SWITCH_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         // Без этой блокировки Wi-Fi-адаптер при выключенном экране отбрасывает широковещательные пакеты.
@@ -61,8 +62,22 @@ class SwitchListenerService : Service() {
                 pairing,
                 knownDevice = { repo.get(it) != null },
                 onScreen = { pc, jpeg -> runCatching { thumbnails.saveJpeg(pc, jpeg) } },
+                onGuard = { pc, msg, link, reply -> runCatching { GuardHub.onMessage(this, pc, msg, link, reply) }.onFailure { Log.w(TAG, "guard message failed", it) } },
             ) { pc, msg -> PcStateStore.get(this).report(pc, msg) }
         }, "agent-server").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * Убрать уведомление службы самой службой нельзя: Android требует его, пока она в фоне. Но пользователь может
+     * выключить его канал — служба продолжит работать, а уведомление исчезнет; кнопка открывает настройки этого канала.
+     */
+    private fun hideAction(): Notification.Action {
+        val settings = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, PcNotifications.CHANNEL_SWITCH)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pending = PendingIntent.getActivity(this, 1, settings, PendingIntent.FLAG_IMMUTABLE)
+        return Notification.Action.Builder(null, "Скрыть", pending).build()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

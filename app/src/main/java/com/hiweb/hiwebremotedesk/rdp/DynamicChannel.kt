@@ -16,11 +16,15 @@ interface DvcHandler {
 
 /**
  * Статический канал drdynvc (MS-RDPEDYC): подтверждает возможности, открывает каналы, для которых есть
- * обработчик в [handlers], остальные отклоняет. Имена запрошенных каналов пишутся в лог.
+ * обработчик в [handlers] или фабрика в [factories], остальные отклоняет. Имена запрошенных каналов пишутся в лог.
+ * Фабрика нужна каналам, которые сервер открывает по несколько раз одновременно (Windows открывает
+ * канал камеры дважды — для потока и для свойств): у каждого экземпляра должно быть своё состояние и свой
+ * [DvcHandler.onOpen]-писатель, иначе ответы одного канала уходят в другой.
  */
 class DynamicChannel(
     private val send: (ByteArray) -> Unit,
     private val handlers: Map<String, DvcHandler>,
+    private val factories: Map<String, () -> DvcHandler> = emptyMap(),
     private val log: (String) -> Unit = { Log.i(TAG, it) },
 ) {
     companion object {
@@ -76,7 +80,7 @@ class DynamicChannel(
                 val nameBytes = r2.bytes(r2.remaining)
                 val end = nameBytes.indexOf(0).let { if (it < 0) nameBytes.size else it }
                 val name = String(nameBytes, 0, end, Charsets.US_ASCII)
-                val handler = handlers[name]
+                val handler = factories[name]?.invoke() ?: handlers[name]
                 log("DVC create request id=$id name=$name accepted=${handler != null}")
                 val rsp = ByteWriter().u8((CMD_CREATE shl 4) or cbId)
                 writeId(rsp, cbId, id)

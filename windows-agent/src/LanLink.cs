@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -10,13 +11,14 @@ using System.Web.Script.Serialization;
 namespace HiWebAgent
 {
     /// <summary>
-    /// Связь с планшетом по локальной сети без сеанса RDP: агент сам подключается к планшету по TCP (порт из
-    /// pair). Исходящее соединение не требует правил брандмауэра и прав администратора. Через эту связь
-    /// планшет видит, что ПК с агентом доступен, и какие действия питания возможны, и отдаёт команды питания.
+    /// Связь с устройствами (планшет, смартфон) по локальной сети без сеанса RDP: агент сам подключается к
+    /// каждому известному устройству по TCP (порт из pair) и держит соединение, пока устройство в сети.
+    /// Исходящее соединение не требует правил брандмауэра и прав администратора. Через эту связь устройство
+    /// видит, что ПК с агентом доступен, какие действия питания возможны, и отдаёт команды питания.
     ///
-    /// Рукопожатие: планшет → challenge(n1); агент → auth(pc, n2, HMAC(secret, auth|pc|n1|n2));
-    /// планшет → ok(HMAC(secret, ok|n1|n2)). Далее каждая строка «mac json», где mac = HMAC(K, dir|seq|json),
-    /// K = HMAC(secret, session|n1|n2), dir — «a» от агента и «t» от планшета, seq — номер строки в направлении.
+    /// Рукопожатие: устройство → challenge(n1); агент → auth(pc, n2, HMAC(secret, auth|pc|n1|n2));
+    /// устройство → ok(HMAC(secret, ok|n1|n2)). Далее каждая строка «mac json», где mac = HMAC(K, dir|seq|json),
+    /// K = HMAC(secret, session|n1|n2), dir — «a» от агента и «t» от устройства, seq — номер строки в направлении.
     /// </summary>
     sealed class LanLink
     {
@@ -26,61 +28,112 @@ namespace HiWebAgent
         const int READ_TIMEOUT_MS = 45000;
         const int POWER_DELAY_MS = 1500;
 
-        readonly Func<TabletPairing> pairing;
-        readonly Action<TabletPairing> savePairing;
+        readonly Func<PairedDevice[]> all;
+        readonly Func<string, PairedDevice> get;
+        readonly Action<PairedDevice> save;
         readonly Func<Dictionary<string, object>> status;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
+        readonly ConcurrentDictionary<string, Session> sessions = new ConcurrentDictionary<string, Session>();
         volatile bool stopped;
-        volatile TcpClient current;
-        volatile SecureLines live;
 
-        /// <summary>Связь установлена (true) или потеряна (false). Вызывается из фонового потока.</summary>
-        public event Action<bool> ConnectedChanged;
-
-        public LanLink(Func<TabletPairing> pairing, Action<TabletPairing> savePairing, Func<Dictionary<string, object>> status)
+        /// <summary>Сеанс связи с одним устройством; ключ — идентификатор устройства.</summary>
+        sealed class Session
         {
-            this.pairing = pairing;
-            this.savePairing = savePairing;
+            public readonly PairedDevice Device;
+            public TcpClient Client;
+            public SecureLines Lines;
+
+            public Session(PairedDevice device)
+            {
+                Device = device;
+            }
+        }
+
+        /// <summary>Набор устройств на связи изменился. Вызывается из фонового потока.</summary>
+        public event Action Changed;
+
+        public LanLink(Func<PairedDevice[]> all, Func<string, PairedDevice> get, Action<PairedDevice> save, Func<Dictionary<string, object>> status)
+        {
+            this.all = all;
+            this.get = get;
+            this.save = save;
             this.status = status;
         }
 
-        /// <summary>
-        /// Сообщает планшету состояние ПК сразу, в вызывающем потоке: перед сном у Windows есть секунда-две, пока
-        /// сеть ещё работает. Без связи ничего не делает.
-        /// </summary>
-        public void SendStatus(Dictionary<string, object> snapshot)
+        /// <summary>Устройства, с которыми связь сейчас есть.</summary>
+        public PairedDevice[] Connected()
         {
-            SecureLines c = live;
-            if (c == null) return;
-            try { c.Send(json.Serialize(snapshot)); }
-            catch (Exception e) { Log.Write("lan status: " + e.Message); }
+            var list = new List<PairedDevice>();
+            foreach (KeyValuePair<string, Session> pair in sessions) list.Add(pair.Value.Device);
+            return list.ToArray();
+        }
+
+        /// <summary>Есть ли связь с устройством прямо сейчас.</summary>
+        public bool IsConnected(string key)
+        {
+            return key != null && sessions.ContainsKey(key);
         }
 
         /// <summary>
-        /// Шлёт снимок экрана (JPEG) для превью ПК на планшете, зашифрованным. Блокирует до отправки, поэтому
-        /// вызывать из фонового потока. Без связи ничего не делает; возвращает, ушёл ли снимок.
+        /// Сообщает состояние ПК всем устройствам сразу, в вызывающем потоке: перед сном у Windows есть
+        /// секунда-две, пока сеть ещё работает. Без связи ничего не делает.
+        /// </summary>
+        public void SendStatus(Dictionary<string, object> snapshot)
+        {
+            Send(snapshot);
+        }
+
+        /// <summary>Сообщение всем устройствам на связи, в вызывающем потоке.</summary>
+        public void Send(Dictionary<string, object> msg)
+        {
+            string text = json.Serialize(msg);
+            foreach (KeyValuePair<string, Session> pair in sessions)
+            {
+                SecureLines c = pair.Value.Lines;
+                if (c == null) continue;
+                try { c.Send(text); }
+                catch (Exception e) { Log.Write("lan send: " + e.Message); }
+            }
+        }
+
+        /// <summary>Что слать устройству сразу после подключения (кроме возможностей и состояния); вызывается из потока связи.</summary>
+        public Func<List<Dictionary<string, object>>> Greeting;
+
+        /// <summary>
+        /// Команда устройства защите RDP (сообщение guard): тело и способ ответить. Вызывается из потока связи —
+        /// обработчик сам переносит работу в нужный поток.
+        /// </summary>
+        public Action<Dictionary<string, object>, Action<Dictionary<string, object>>> GuardCommand;
+
+        /// <summary>
+        /// Шлёт снимок экрана (JPEG) для превью ПК на устройства, зашифрованным. Блокирует до отправки, поэтому
+        /// вызывать из фонового потока. Возвращает, ушёл ли снимок хоть кому-то.
         /// </summary>
         public bool SendScreen(byte[] jpeg, int width, int height)
         {
-            SecureLines c = live;
-            if (c == null) return false;
-            try
+            bool sent = false;
+            foreach (KeyValuePair<string, Session> pair in sessions)
             {
-                byte[][] sealedData = c.Encrypt(jpeg);
-                var msg = new Dictionary<string, object>();
-                msg["t"] = "screen";
-                msg["w"] = width;
-                msg["h"] = height;
-                msg["iv"] = Convert.ToBase64String(sealedData[0]);
-                msg["data"] = Convert.ToBase64String(sealedData[1]);
-                c.Send(json.Serialize(msg));
-                return true;
+                SecureLines c = pair.Value.Lines;
+                if (c == null) continue;
+                try
+                {
+                    byte[][] sealedData = c.Encrypt(jpeg);
+                    var msg = new Dictionary<string, object>();
+                    msg["t"] = "screen";
+                    msg["w"] = width;
+                    msg["h"] = height;
+                    msg["iv"] = Convert.ToBase64String(sealedData[0]);
+                    msg["data"] = Convert.ToBase64String(sealedData[1]);
+                    c.Send(json.Serialize(msg));
+                    sent = true;
+                }
+                catch (Exception e)
+                {
+                    Log.Write("lan screen: " + e.Message);
+                }
             }
-            catch (Exception e)
-            {
-                Log.Write("lan screen: " + e.Message);
-                return false;
-            }
+            return sent;
         }
 
         public void Start()
@@ -94,44 +147,93 @@ namespace HiWebAgent
         public void Stop()
         {
             stopped = true;
-            TcpClient c = current;
-            if (c != null) c.Close();
+            foreach (KeyValuePair<string, Session> pair in sessions)
+            {
+                TcpClient c = pair.Value.Client;
+                if (c != null) c.Close();
+            }
         }
 
+        /// <summary>
+        /// Следит за списком устройств: на каждое заводит поток связи, удалённым закрывает соединение. Устройства
+        /// появляются в списке только когда к ПК подключаются (см. <see cref="PairedDevices.Upsert"/>).
+        /// </summary>
         void Loop()
         {
             while (!stopped)
             {
-                TabletPairing p = pairing();
-                if (p != null)
+                try
                 {
-                    try { Session(p); }
-                    catch (Exception e) { if (!stopped) Log.Write("lan: " + e.GetBaseException().Message); }
+                    var known = new List<string>();
+                    foreach (PairedDevice d in all())
+                    {
+                        known.Add(d.Key);
+                        if (sessions.ContainsKey(d.Key)) continue;
+                        var session = new Session(d);
+                        if (!sessions.TryAdd(d.Key, session)) continue;
+                        var thread = new Thread(delegate() { RunLoop(session); });
+                        thread.IsBackground = true;
+                        thread.Name = "lan-" + d.Key;
+                        thread.Start();
+                    }
+                    // Устройство удалили из списка агента: связь с ним больше не нужна.
+                    foreach (KeyValuePair<string, Session> pair in sessions)
+                    {
+                        if (known.Contains(pair.Key)) continue;
+                        TcpClient c = pair.Value.Client;
+                        if (c != null) c.Close();
+                    }
+                }
+                catch (Exception e)
+                {
+                    Log.Write("lan watch: " + e.Message);
                 }
                 for (int waited = 0; waited < RETRY_MS && !stopped; waited += 500) Thread.Sleep(500);
             }
         }
 
-        void Session(TabletPairing p)
+        /// <summary>Держит связь с одним устройством, пока его не удалят или не остановят агента.</summary>
+        void RunLoop(Session session)
         {
-            TcpClient client = ConnectAny(p);
+            try
+            {
+                while (!stopped && sessions.ContainsKey(session.Device.Key))
+                {
+                    try { SessionRun(session); }
+                    catch (Exception e) { if (!stopped) Log.Write("lan: " + e.GetBaseException().Message); }
+                    for (int waited = 0; waited < RETRY_MS && !stopped && sessions.ContainsKey(session.Device.Key); waited += 500) Thread.Sleep(500);
+                }
+            }
+            finally
+            {
+                Session own;
+                sessions.TryRemove(session.Device.Key, out own);
+                Raise();
+            }
+        }
+
+        void SessionRun(Session session)
+        {
+            PairedDevice device = get(session.Device.Key);
+            if (device == null) return;
+            TcpClient client = ConnectAny(device);
             if (client == null)
             {
-                // Адрес планшета мог смениться: спрашиваем сеть, где он.
-                IPAddress found = TabletSwitch.Discover(p);
+                // Адрес устройства мог смениться: спрашиваем сеть, где оно.
+                IPAddress found = TabletSwitch.Discover(device);
                 if (found == null) return;
-                if (Array.IndexOf(p.Addresses, found.ToString()) < 0)
+                if (Array.IndexOf(device.Addresses, found.ToString()) < 0)
                 {
                     var list = new List<string> { found.ToString() };
-                    list.AddRange(p.Addresses);
-                    p.Addresses = list.ToArray();
-                    savePairing(p);
+                    list.AddRange(device.Addresses);
+                    device.Addresses = list.ToArray();
+                    save(device);
                 }
-                client = Connect(found, p.Port);
+                client = Connect(found, device.Port);
                 if (client == null) return;
             }
-            current = client;
             bool announced = false;
+            session.Client = client;
             try
             {
                 client.ReceiveTimeout = READ_TIMEOUT_MS;
@@ -147,29 +249,34 @@ namespace HiWebAgent
                 string n2 = Guid.NewGuid().ToString("N");
                 var auth = new Dictionary<string, object>();
                 auth["t"] = "auth";
-                auth["pc"] = p.DeviceId;
+                auth["pc"] = device.PcId;
                 auth["nonce"] = n2;
-                auth["mac"] = Crypto.Mac(p.Secret, "auth|" + p.DeviceId + "|" + n1 + "|" + n2);
+                auth["mac"] = Crypto.Mac(device.Secret, "auth|" + device.PcId + "|" + n1 + "|" + n2);
                 writer.WriteLine(json.Serialize(auth));
                 Dictionary<string, object> ok = Parse(reader.ReadLine());
-                if (Str(ok, "t") != "ok" || Str(ok, "mac") != Crypto.Mac(p.Secret, "ok|" + n1 + "|" + n2))
+                if (Str(ok, "t") != "ok" || Str(ok, "mac") != Crypto.Mac(device.Secret, "ok|" + n1 + "|" + n2))
                 {
-                    Log.Write("lan: tablet failed authentication");
+                    Log.Write("lan: device " + device.Title + " failed authentication");
                     return;
                 }
-                var channel = new SecureLines(Crypto.Hmac(p.Secret, "session|" + n1 + "|" + n2), writer);
-                Log.Write("lan: connected to tablet " + client.Client.RemoteEndPoint);
+                var channel = new SecureLines(Crypto.Hmac(device.Secret, "session|" + n1 + "|" + n2), writer);
+                session.Lines = channel;
+                Log.Write("lan: connected to " + device.Title + " at " + client.Client.RemoteEndPoint);
                 announced = true;
-                Raise(true);
+                Raise();
                 channel.Send(json.Serialize(Caps()));
                 channel.Send(json.Serialize(status()));
-                live = channel;
+                Func<List<Dictionary<string, object>>> greeting = Greeting;
+                if (greeting != null)
+                {
+                    foreach (Dictionary<string, object> m in greeting()) channel.Send(json.Serialize(m));
+                }
 
-                var pinger = new Thread(() => PingLoop(client, channel));
+                var pinger = new Thread(delegate() { PingLoop(client, channel); });
                 pinger.IsBackground = true;
                 pinger.Start();
 
-                while (!stopped)
+                while (!stopped && sessions.ContainsKey(device.Key))
                 {
                     string line = reader.ReadLine();
                     if (line == null) break;
@@ -184,13 +291,13 @@ namespace HiWebAgent
             }
             finally
             {
-                live = null;
-                current = null;
+                session.Lines = null;
+                session.Client = null;
                 client.Close();
                 if (announced)
                 {
-                    Log.Write("lan: disconnected");
-                    Raise(false);
+                    Log.Write("lan: disconnected from " + device.Title);
+                    Raise();
                 }
             }
         }
@@ -200,7 +307,7 @@ namespace HiWebAgent
             int n = 0;
             try
             {
-                while (client.Connected && current == client)
+                while (client.Connected)
                 {
                     Thread.Sleep(PING_MS);
                     // Раз в минуту заново сообщаем возможности: гибернацию могли включить или выключить.
@@ -216,7 +323,14 @@ namespace HiWebAgent
 
         void Handle(Dictionary<string, object> msg, SecureLines channel)
         {
-            if (msg == null || Str(msg, "t") != "power") return;
+            if (msg == null) return;
+            if (Str(msg, "t") == "guard")
+            {
+                var command = GuardCommand;
+                if (command != null) command(msg, delegate(Dictionary<string, object> reply) { channel.Send(json.Serialize(reply)); });
+                return;
+            }
+            if (Str(msg, "t") != "power") return;
             string action = Str(msg, "action");
             var result = new Dictionary<string, object>();
             result["t"] = "power_result";
@@ -230,9 +344,9 @@ namespace HiWebAgent
             }
             result["ok"] = true;
             channel.Send(json.Serialize(result));
-            Log.Write("lan: power " + action + " requested by tablet");
+            Log.Write("lan: power " + action + " requested by device");
             // Пауза: ответ успевает уйти до того, как Windows начнёт засыпать или выключаться.
-            var t = new Thread(() =>
+            var t = new Thread(delegate()
             {
                 Thread.Sleep(POWER_DELAY_MS);
                 try { Power.Run(action); }
@@ -252,13 +366,17 @@ namespace HiWebAgent
             return caps;
         }
 
-        void Raise(bool connected)
+        void Raise()
         {
-            var h = ConnectedChanged;
-            if (h != null) h(connected);
+            var h = Changed;
+            if (h != null)
+            {
+                try { h(); }
+                catch (Exception e) { Log.Write("lan changed: " + e.Message); }
+            }
         }
 
-        static TcpClient ConnectAny(TabletPairing p)
+        static TcpClient ConnectAny(PairedDevice p)
         {
             foreach (string a in p.Addresses)
             {
@@ -355,7 +473,7 @@ namespace HiWebAgent
             }
         }
 
-        /// <summary>Тело строки от планшета или null, если подпись не сходится.</summary>
+        /// <summary>Тело строки от устройства или null, если подпись не сходится.</summary>
         public string Verify(string line)
         {
             int space = line.IndexOf(' ');

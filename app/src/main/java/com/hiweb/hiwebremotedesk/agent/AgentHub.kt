@@ -56,20 +56,32 @@ object AgentHub {
     @Volatile private var server: ServerSocket? = null
     @Volatile private var onStatus: (String, JSONObject) -> Unit = { _, _ -> }
     @Volatile private var onScreen: (String, ByteArray) -> Unit = { _, _ -> }
+    @Volatile private var onGuard: (String, JSONObject, Any, (JSONObject) -> Unit) -> Unit = { _, _, _, _ -> }
+
+    /** Агент этого ПК сейчас подключён к планшету по локальной сети. */
+    fun isLinked(deviceId: String): Boolean = links.containsKey(deviceId)
+
+    /** Шлёт сообщение агенту ПК; блокирует на записи в сокет, поэтому только из фонового потока. */
+    fun send(deviceId: String, msg: JSONObject) {
+        links[deviceId]?.send(msg)
+    }
 
     /**
      * Принимает подключения агентов, пока сервер не остановлен [stop]. Блокирует поток. [onStatus] получает
      * сообщения агентов о состоянии ПК (id ПК, сообщение), [onScreen] — расшифрованные снимки экрана для превью
-     * (id ПК, JPEG); оба вызываются в потоке связи.
+     * (id ПК, JPEG), [onGuard] — сообщения защиты подключений (id ПК, сообщение, канал, способ ответить);
+     * все вызываются в потоке связи.
      */
     fun serve(
         pairing: AgentPairing,
         knownDevice: (String) -> Boolean,
         onScreen: (String, ByteArray) -> Unit,
+        onGuard: (String, JSONObject, Any, (JSONObject) -> Unit) -> Unit,
         onStatus: (String, JSONObject) -> Unit,
     ) {
         this.onStatus = onStatus
         this.onScreen = onScreen
+        this.onGuard = onGuard
         val s = try {
             ServerSocket().apply { reuseAddress = true; bind(java.net.InetSocketAddress(AgentPairing.PORT)) }
         } catch (e: Exception) {
@@ -185,6 +197,7 @@ object AgentHub {
                 val done = link.pending.remove(msg.optString("action")) ?: return
                 done(if (msg.optBoolean("ok")) null else msg.optString("error").ifBlank { "Агент не выполнил команду" })
             }
+            "guard_state", "conn", "threat", "guard_result" -> onGuard(pc, msg, link) { reply -> runCatching { link.send(reply) } }
         }
     }
 }

@@ -31,10 +31,27 @@ namespace HiWebAgent
         readonly HashSet<uint> seen = new HashSet<uint>();
         volatile bool stopped;
         bool baseline;
+        // Для проверки пересылки: когда опрос в последний раз удался и чем кончился последний неудачный.
+        int lastPollTick;
+        volatile bool polled;
+        volatile string lastError;
+
+        /// <summary>Сколько секунд назад центр уведомлений опрашивался успешно; -1 — ещё ни разу.</summary>
+        public double PollAgeSec
+        {
+            get { return polled ? unchecked(Environment.TickCount - lastPollTick) / 1000.0 : -1; }
+        }
+
+        /// <summary>Ошибка последнего опроса; null, если он удался.</summary>
+        public string LastError
+        {
+            get { return lastError; }
+        }
 
         /// <summary>Новое уведомление (кроме отфильтрованных). Вызывается из потока опроса.</summary>
         public event Action<ToastInfo> NewNotification;
 
+        /// <summary>Состояние доступа; вызывать из потока интерфейса, где создан [listener].</summary>
         public UserNotificationListenerAccessStatus Status
         {
             get
@@ -70,23 +87,36 @@ namespace HiWebAgent
 
         void Loop()
         {
+            // Объект слушателя привязан к потоку, где он создан: из потока интерфейса (STA) его нельзя вызывать
+            // здесь (RPC_E_WRONG_THREAD), поэтому опрос берёт свой.
+            UserNotificationListener pollListener = UserNotificationListener.Current;
             while (!stopped)
             {
                 try
                 {
-                    if (Status == UserNotificationListenerAccessStatus.Allowed) Poll();
+                    if (pollListener.GetAccessStatus() == UserNotificationListenerAccessStatus.Allowed)
+                    {
+                        Poll(pollListener);
+                        if (!polled) Log.Write("notifications: опрос центра уведомлений идёт");
+                        lastPollTick = Environment.TickCount;
+                        polled = true;
+                        lastError = null;
+                    }
                 }
                 catch (Exception e)
                 {
-                    Log.Write("poll: " + e.GetBaseException().Message);
+                    string message = e.GetBaseException().Message;
+                    // Одна и та же ошибка каждую секунду засорила бы журнал.
+                    if (message != lastError) Log.Write("poll: " + message);
+                    lastError = message;
                 }
                 Thread.Sleep(POLL_MS);
             }
         }
 
-        void Poll()
+        void Poll(UserNotificationListener source)
         {
-            IReadOnlyList<UserNotification> list = Wait(listener.GetNotificationsAsync(NotificationKinds.Toast));
+            IReadOnlyList<UserNotification> list = Wait(source.GetNotificationsAsync(NotificationKinds.Toast));
             var current = new HashSet<uint>();
             var fresh = new List<UserNotification>();
             foreach (UserNotification n in list)
@@ -106,7 +136,9 @@ namespace HiWebAgent
             foreach (UserNotification n in fresh)
             {
                 ToastInfo info = Describe(n);
-                if (info != null && !IsFiltered(info)) handler(info);
+                if (info == null) continue;
+                if (IsFiltered(info)) Log.Write("notif: " + (info.App ?? info.AppId) + " — не отправлено: свои и Phone Link не пересылаются");
+                else handler(info);
             }
         }
 

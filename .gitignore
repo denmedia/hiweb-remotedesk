@@ -1,21 +1,59 @@
+# Android Studio / IDE
 *.iml
-.gradle
-/local.properties
 /.idea
-.DS_Store
+/.vscode
+/.kotlin
+
+# Gradle и результаты сборки
+.gradle
 /build
+/app/build
 /captures
 .externalNativeBuild
 .cxx
-local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.hprof
 
-# Ключ подписи и пароли — только локально
+# Локальные настройки и пути (SDK, файл с паролями подписи)
+local.properties
+signing.properties
+
+# Ключ подписи, пароли и секреты — только локально
 keystore.properties
 *.jks
 *.keystore
+*.pem
+*.key
+*.pfx
+.env
+.env.*
 
-# Локальные служебные папки
-/.kotlin
+# Данные работающего агента и сеансов: адреса, имена, журналы реального ПК
+guard.json
+agent.log
+*.log
+*.pcap
+*.pcapng
+
+# Снимки экрана и дампы устройств из отладки
+/screenshots
+/dumps
+*.hprof
+
+# Служебные и временные файлы
 /.claude
-/app/build
+/.dsh-acl
+/scratch
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Агент Windows: промежуточные файлы сборки и тестов
 /windows-agent/obj
+/windows-agent/tests/obj
+/windows-agent/tests/*.exe

@@ -4,6 +4,8 @@ import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,6 +28,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -33,9 +36,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.SecondaryScrollableTabRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
+import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -53,8 +58,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
@@ -71,6 +81,8 @@ import com.hiweb.hiwebremotedesk.data.SafTree
 import com.hiweb.hiwebremotedesk.ui.theme.Accent
 import com.hiweb.hiwebremotedesk.ui.theme.DangerRed
 import com.hiweb.hiwebremotedesk.ui.theme.Outline
+import com.hiweb.hiwebremotedesk.ui.theme.SurfaceButton
+import com.hiweb.hiwebremotedesk.CameraSource
 import com.hiweb.hiwebremotedesk.ui.theme.Surface
 import com.hiweb.hiwebremotedesk.ui.theme.TextPrimary
 import com.hiweb.hiwebremotedesk.ui.theme.TextSecondary
@@ -123,9 +135,15 @@ fun DeviceEditDialog(
     var useNla by remember { mutableStateOf(device?.useNla ?: true) }
     var scale by remember { mutableStateOf((device?.scalePercent ?: 100).toFloat()) }
     var colorDepth by remember { mutableStateOf(device?.colorDepth ?: Device.DEFAULT_COLOR_DEPTH) }
-    var scrollLevel by remember { mutableStateOf((device?.scrollLevel ?: StrengthLevels.DEFAULT).toFloat()) }
-    var inertiaLevel by remember { mutableStateOf((device?.inertiaLevel ?: StrengthLevels.DEFAULT).toFloat()) }
+    var scrollPercent by remember { mutableStateOf((device?.scrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var inertiaPercent by remember { mutableStateOf((device?.inertiaPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var mouseSpeedPercent by remember { mutableStateOf((device?.mouseSpeedPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var mouseWheelPercent by remember { mutableStateOf((device?.mouseWheelPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var fileTransfer by remember { mutableStateOf(device?.fileTransfer ?: true) }
+    var microphone by remember { mutableStateOf(device?.microphone ?: false) }
+    var camera by remember { mutableStateOf(device?.camera ?: false) }
+    val cameraOff = remember { mutableStateListOf<String>().apply { addAll(device?.cameraOff.orEmpty()) } }
+    val cameraRotation = remember { mutableStateMapOf<String, Int>().apply { putAll(device?.cameraRotation.orEmpty()) } }
     var driveEnabled by remember { mutableStateOf(device?.driveEnabled ?: false) }
     var driveUri by remember { mutableStateOf(device?.driveUri) }
     var driveName by remember { mutableStateOf(device?.driveName ?: Device.DEFAULT_DRIVE_NAME) }
@@ -179,187 +197,305 @@ fun DeviceEditDialog(
     val portError = tried && (portNum == null || portNum !in 1..65535)
     val driveError = tried && driveEnabled && driveUri == null
 
+    // Вкладка «Устройства» — только для Windows; при смене системы выбранная вкладка может исчезнуть.
+    val tabs = EditTab.entries.filter { it != EditTab.MEDIA || os == OsType.WINDOWS }
+    var tab by remember { mutableStateOf(EditTab.MAIN) }
+    val currentTab = if (tab in tabs) tab else EditTab.MAIN
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Surface,
         title = { Text(if (device == null) "Новое устройство" else "Настройки устройства", color = TextPrimary) },
         text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(name, { name = it }, label = { Text("Название") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Система", color = TextPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                    if (detecting) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Accent, strokeWidth = 2.dp)
-                    } else {
-                        TextButton(
-                            enabled = host.isNotBlank(),
-                            onClick = { osManual = false; scope.launch { detect(applyPort = true) } },
-                        ) { Text("Определить", color = Accent) }
-                    }
-                }
-                detectNote?.let { Text(it, color = TextSecondary, fontSize = 12.sp) }
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OsType.entries.forEach { o ->
-                        RadioRow(o.title, os == o) {
-                            osManual = true
-                            // Порт меняем только пока он стоит по умолчанию для прежней системы.
-                            if (os != o) {
-                                if (port == os.defaultPort.toString()) port = o.defaultPort.toString()
-                                os = o
-                            }
+            Column {
+                SecondaryScrollableTabRow(
+                    selectedTabIndex = tabs.indexOf(currentTab),
+                    edgePadding = 0.dp,
+                    containerColor = Color.Transparent,
+                    contentColor = Accent,
+                    divider = { HorizontalDivider(color = Outline) },
+                ) {
+                    tabs.forEach { t ->
+                        val bad = when (t) {
+                            EditTab.MAIN -> hostError || portError || wakeMacError
+                            EditTab.FILES -> driveError
+                            else -> false
                         }
-                    }
-                }
-                if (os == OsType.UBUNTU) {
-                    Text(
-                        "Подключение к экрану, открытому на Ubuntu, через штатный «Удалённый рабочий стол» GNOME (Параметры → Совместный доступ). " +
-                            "Логин и пароль здесь — те, что заданы в его настройках, они отдельные от пароля пользователя Ubuntu.",
-                        color = TextSecondary, fontSize = 12.sp,
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        host, { host = it.trim() }, label = { Text("Адрес (IP или имя)") }, singleLine = true, isError = hostError,
-                        colors = fieldColors(), modifier = Modifier.weight(1f),
-                    )
-                    OutlinedTextField(
-                        port, { port = it.filter(Char::isDigit).take(5); portManual = true }, label = { Text("Порт") }, singleLine = true, isError = portError,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), colors = fieldColors(), modifier = Modifier.width(110.dp),
-                    )
-                }
-                OutlinedTextField(
-                    user, { user = it }, label = { Text("Пользователь (ДОМЕН\\имя)") }, singleLine = true,
-                    colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
-                )
-                PasswordField(pass, { pass = it }, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(
-                    wakeMac, { wakeMac = it.trim().take(17) }, label = { Text("MAC-адрес для пробуждения по сети") }, singleLine = true,
-                    isError = wakeMacError, placeholder = { Text("00:1A:2B:3C:4D:5E") },
-                    supportingText = {
-                        Text(
-                            if (wakeMacError) "Неверный MAC-адрес"
-                            else "Спящий или выключенный ПК будится при подключении (Wake-on-LAN). HiWeb Agent заполняет адрес сам.",
-                        )
-                    },
-                    colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
-                )
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Проверка подлинности NLA", color = TextPrimary, fontSize = 15.sp)
-                        Text(
-                            if (os == OsType.UBUNTU) "GNOME Remote Desktop всегда требует NLA: логин и пароль нужно указать в полях выше"
-                            else "Выключите, если на ПК отключено требование NLA: пароль тогда вводится на экране входа Windows",
-                            color = TextSecondary, fontSize = 12.sp,
+                        Tab(
+                            selected = t == currentTab,
+                            onClick = { tab = t },
+                            text = { Text(t.title, fontSize = 14.sp, maxLines = 1) },
+                            selectedContentColor = if (bad) DangerRed else Accent,
+                            unselectedContentColor = if (bad) DangerRed else TextSecondary,
                         )
                     }
-                    Switch(checked = useNla, onCheckedChange = { useNla = it })
                 }
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(if (os == OsType.UBUNTU) "Масштаб интерфейса" else "Масштаб Windows", color = TextPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                        Text("${scale.toInt()}%", color = Accent, fontSize = 15.sp)
-                    }
-                    Slider(
-                        value = scale, onValueChange = { scale = it }, valueRange = 100f..300f, steps = 7,
-                        colors = SliderDefaults.colors(thumbColor = Accent, activeTrackColor = Accent, inactiveTrackColor = Outline),
-                    )
-                    Text("Увеличивает текст и элементы на удалённом ПК. Применяется при следующем подключении.", color = TextSecondary, fontSize = 12.sp)
-                }
-                Column {
-                    Text("Глубина цвета", color = TextPrimary, fontSize = 15.sp)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Device.COLOR_DEPTHS.forEach { depth ->
-                            Row(
-                                Modifier.selectable(selected = colorDepth == depth, role = Role.RadioButton, onClick = { colorDepth = depth }),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                RadioButton(
-                                    selected = colorDepth == depth, onClick = null,
-                                    colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextSecondary),
+                Spacer(Modifier.height(12.dp))
+                // Минимальная высота — чтобы окно не прыгало при переключении вкладок.
+                Column(
+                    Modifier.heightIn(min = 340.dp).verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    when (currentTab) {
+                        EditTab.MAIN -> {
+                            OutlinedTextField(name, { name = it }, label = { Text("Название") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("Система", color = TextPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                                if (detecting) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Accent, strokeWidth = 2.dp)
+                                } else {
+                                    TextButton(
+                                        enabled = host.isNotBlank(),
+                                        onClick = { osManual = false; scope.launch { detect(applyPort = true) } },
+                                    ) { Text("Определить", color = Accent) }
+                                }
+                            }
+                            detectNote?.let { Text(it, color = TextSecondary, fontSize = 12.sp) }
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OsType.entries.forEach { o ->
+                                    RadioRow(o.title, os == o) {
+                                        osManual = true
+                                        // Порт меняем только пока он стоит по умолчанию для прежней системы.
+                                        if (os != o) {
+                                            if (port == os.defaultPort.toString()) port = o.defaultPort.toString()
+                                            os = o
+                                        }
+                                    }
+                                }
+                            }
+                            if (os == OsType.UBUNTU) {
+                                Text(
+                                    "Подключение к экрану, открытому на Ubuntu, через штатный «Удалённый рабочий стол» GNOME (Параметры → Совместный доступ). " +
+                                        "Логин и пароль здесь — те, что заданы в его настройках, они отдельные от пароля пользователя Ubuntu.",
+                                    color = TextSecondary, fontSize = 12.sp,
                                 )
-                                Text("$depth бит", color = TextPrimary, fontSize = 14.sp, modifier = Modifier.padding(start = 4.dp, end = 10.dp, top = 8.dp, bottom = 8.dp))
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                OutlinedTextField(
+                                    host, { host = it.trim() }, label = { Text("Адрес (IP или имя)") }, singleLine = true, isError = hostError,
+                                    colors = fieldColors(), modifier = Modifier.weight(1f),
+                                )
+                                OutlinedTextField(
+                                    port, { port = it.filter(Char::isDigit).take(5); portManual = true }, label = { Text("Порт") }, singleLine = true, isError = portError,
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), colors = fieldColors(), modifier = Modifier.width(110.dp),
+                                )
+                            }
+                            OutlinedTextField(
+                                user, { user = it }, label = { Text("Пользователь (ДОМЕН\\имя)") }, singleLine = true,
+                                colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                            )
+                            PasswordField(pass, { pass = it }, modifier = Modifier.fillMaxWidth())
+                            OutlinedTextField(
+                                wakeMac, { wakeMac = it.trim().take(17) }, label = { Text("MAC-адрес для пробуждения по сети") }, singleLine = true,
+                                isError = wakeMacError, placeholder = { Text("00:1A:2B:3C:4D:5E") },
+                                supportingText = {
+                                    Text(
+                                        if (wakeMacError) "Неверный MAC-адрес"
+                                        else "Спящий или выключенный ПК будится при подключении (Wake-on-LAN). HiWeb Agent заполняет адрес сам.",
+                                    )
+                                },
+                                colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Проверка подлинности NLA", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        if (os == OsType.UBUNTU) "GNOME Remote Desktop всегда требует NLA: логин и пароль нужно указать в полях выше"
+                                        else "Выключите, если на ПК отключено требование NLA: пароль тогда вводится на экране входа Windows",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = useNla, onCheckedChange = { useNla = it })
+                            }
+                            Text(if (os == OsType.UBUNTU) "Ubuntu · RDP" else "Windows · RDP", color = TextSecondary, fontSize = 12.sp)
+                            if (onResetCertificate != null && device?.certSha256 != null) {
+                                TextButton(onClick = { onResetCertificate(); onDismiss() }) { Text("Сбросить доверие к сертификату", color = TextSecondary) }
+                            }
+                            if (onDelete != null) {
+                                TextButton(onClick = { onDelete(); onDismiss() }) { Text("Удалить устройство", color = DangerRed) }
                             }
                         }
-                    }
-                    Text(
-                        "С 24 и 32 битами шрифты и градиенты выглядят ровнее, но трафика больше. Применяется при следующем подключении.",
-                        color = TextSecondary, fontSize = 12.sp,
-                    )
-                }
-                StrengthSlider(
-                    title = "Сила скролла",
-                    hint = "Скорость прокрутки двумя пальцами на тачпаде и сенсорном экране. Применяется при следующем подключении.",
-                    value = scrollLevel,
-                    onChange = { scrollLevel = it },
-                )
-                StrengthSlider(
-                    title = "Сила инерции",
-                    hint = "Как далеко прокрутка продолжается после отрыва пальцев. Применяется при следующем подключении.",
-                    value = inertiaLevel,
-                    onChange = { inertiaLevel = it },
-                )
-                Text("Обмен файлами", color = Accent, fontSize = 13.sp)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Файлы через буфер обмена", color = TextPrimary, fontSize = 15.sp)
-                        Text(
-                            "Файлы, скопированные на ПК (Ctrl+C), можно сохранить на планшет, а файлы планшета — отправить на ПК " +
-                                "кнопкой в меню сеанса и вставить в Проводнике по Ctrl+V. Применяется при следующем подключении.",
-                            color = TextSecondary, fontSize = 12.sp,
-                        )
-                    }
-                    Switch(checked = fileTransfer, onCheckedChange = { fileTransfer = it })
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Общий диск", color = TextPrimary, fontSize = 15.sp)
-                        Text(
-                            "Папка планшета появится в Проводнике Windows как сетевой диск. Подключается после входа в Windows. " +
-                                "Применяется при следующем подключении.",
-                            color = TextSecondary, fontSize = 12.sp,
-                        )
-                    }
-                    Switch(checked = driveEnabled, onCheckedChange = { driveEnabled = it })
-                }
-                if (driveEnabled) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("Папка планшета", color = TextPrimary, fontSize = 15.sp)
-                            Text(
-                                driveFolderName ?: "Не выбрана",
-                                color = if (driveError) DangerRed else TextSecondary, fontSize = 13.sp,
+                        EditTab.DISPLAY -> {
+                            Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(if (os == OsType.UBUNTU) "Масштаб интерфейса" else "Масштаб Windows", color = TextPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                                    Text("${scale.toInt()}%", color = Accent, fontSize = 15.sp)
+                                }
+                                Slider(
+                                    value = scale, onValueChange = { scale = it }, valueRange = 100f..300f, steps = 7,
+                                    colors = SliderDefaults.colors(thumbColor = Accent, activeTrackColor = Accent, inactiveTrackColor = Outline),
+                                )
+                                Text(
+                                    if (os == OsType.UBUNTU) "Увеличивает текст и элементы на удалённом ПК. Применяется при следующем подключении."
+                                    else "Windows применяет масштаб только при создании нового сеанса. Если на ПК уже открыт сеанс (в том числе на самом ПК), он сохранит свой масштаб — его меняют в настройках Windows.",
+                                    color = TextSecondary, fontSize = 12.sp,
+                                )
+                            }
+                            Column {
+                                Text("Глубина цвета", color = TextPrimary, fontSize = 15.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Device.COLOR_DEPTHS.forEach { depth ->
+                                        Row(
+                                            Modifier.selectable(selected = colorDepth == depth, role = Role.RadioButton, onClick = { colorDepth = depth }),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            RadioButton(
+                                                selected = colorDepth == depth, onClick = null,
+                                                colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextSecondary),
+                                            )
+                                            Text("$depth бит", color = TextPrimary, fontSize = 14.sp, modifier = Modifier.padding(start = 4.dp, end = 10.dp, top = 8.dp, bottom = 8.dp))
+                                        }
+                                    }
+                                }
+                                Text(
+                                    "С 24 и 32 битами шрифты и градиенты выглядят ровнее, но трафика больше. Применяется при следующем подключении.",
+                                    color = TextSecondary, fontSize = 12.sp,
+                                )
+                            }
+                            StrengthSlider(
+                                title = "Сила скролла",
+                                hint = "Скорость прокрутки двумя пальцами на тачпаде и сенсорном экране. Применяется при следующем подключении.",
+                                value = scrollPercent,
+                                onChange = { scrollPercent = it },
+                            )
+                            StrengthSlider(
+                                title = "Сила инерции",
+                                hint = "Как далеко прокрутка продолжается после отрыва пальцев. Применяется при следующем подключении.",
+                                value = inertiaPercent,
+                                onChange = { inertiaPercent = it },
+                            )
+                            StrengthSlider(
+                                title = "Скорость курсора мыши",
+                                hint = "Скорость перемещения курсора физической (Bluetooth) мышью. Тачпада чехла и сенсорного экрана не касается. Применяется при следующем подключении.",
+                                value = mouseSpeedPercent,
+                                onChange = { mouseSpeedPercent = it },
+                            )
+                            StrengthSlider(
+                                title = "Скорость колёсика мыши",
+                                hint = "Прокрутка колёсиком физической (Bluetooth) мыши. Прокрутку пальцами не касается. Применяется при следующем подключении.",
+                                value = mouseWheelPercent,
+                                onChange = { mouseWheelPercent = it },
                             )
                         }
-                        TextButton(onClick = { folderPicker.launch(null) }) { Text(if (driveUri == null) "Выбрать" else "Изменить", color = Accent) }
-                    }
-                    OutlinedTextField(
-                        driveName,
-                        { driveName = it.filter { c -> c.code in 0x21..0x7E && c !in ":<>\"/\\|" }.take(32) },
-                        label = { Text("Имя диска в Windows") }, singleLine = true,
-                        supportingText = { Text("Латинские буквы и цифры, без пробелов", color = TextSecondary, fontSize = 12.sp) },
-                        colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
-                    )
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text("Только чтение", color = TextPrimary, fontSize = 15.sp)
-                            Text("Windows сможет читать и копировать файлы, но не изменять и не удалять их", color = TextSecondary, fontSize = 12.sp)
+                        EditTab.MEDIA -> {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Микрофон планшета", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        "Windows увидит микрофон планшета как устройство записи «перенаправлено». Передача включается " +
+                                            "кнопкой «Микрофон» в меню сеанса, чтобы звук не записывался незаметно.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = microphone, onCheckedChange = { microphone = it })
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Камера планшета", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        "В программах Windows (Zoom, Teams, браузер, «Камера») появятся камеры планшета: " +
+                                            "каждая — отдельным устройством, 720p. Передаёт кадры та программа, которая открыла камеру. " +
+                                            "Применяется при следующем подключении.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = camera, onCheckedChange = { camera = it })
+                            }
+                            if (camera) {
+                                val cameras = remember { runCatching { CameraSource(context).catalog() }.getOrDefault(emptyList()) }
+                                if (cameras.isEmpty()) {
+                                    Text("На этом устройстве камер не найдено.", color = TextSecondary, fontSize = 12.sp)
+                                }
+                                cameras.forEach { (id, title) ->
+                                    val shared = id !in cameraOff
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(title, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                        Switch(
+                                            checked = shared,
+                                            onCheckedChange = { if (it) cameraOff.remove(id) else if (id !in cameraOff) cameraOff.add(id) },
+                                        )
+                                    }
+                                    if (shared) {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            Text("Поворот", color = TextSecondary, fontSize = 12.sp)
+                                            val current = cameraRotation[id] ?: 0
+                                            Device.CAMERA_ROTATIONS.forEach { degrees ->
+                                                RotationButton("$degrees°", current == degrees) {
+                                                    if (degrees == 0) cameraRotation.remove(id) else cameraRotation[id] = degrees
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Text(
+                                    "Поворот добавляется к автоматическому по часовой стрелке: если картинка в программе на ПК " +
+                                        "перевёрнута, выберите 180°.",
+                                    color = TextSecondary, fontSize = 12.sp,
+                                )
+                            }
                         }
-                        Switch(checked = driveReadOnly, onCheckedChange = { driveReadOnly = it })
+                        EditTab.FILES -> {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Файлы через буфер обмена", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        "Файлы, скопированные на ПК (Ctrl+C), можно сохранить на планшет, а файлы планшета — отправить на ПК " +
+                                            "кнопкой в меню сеанса и вставить в Проводнике по Ctrl+V. Применяется при следующем подключении.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = fileTransfer, onCheckedChange = { fileTransfer = it })
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Общий диск", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        "Папка планшета появится в Проводнике Windows как сетевой диск. Подключается после входа в Windows. " +
+                                            "Применяется при следующем подключении.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = driveEnabled, onCheckedChange = { driveEnabled = it })
+                            }
+                            if (driveEnabled) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Папка планшета", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            driveFolderName ?: "Не выбрана",
+                                            color = if (driveError) DangerRed else TextSecondary, fontSize = 13.sp,
+                                        )
+                                    }
+                                    TextButton(onClick = { folderPicker.launch(null) }) { Text(if (driveUri == null) "Выбрать" else "Изменить", color = Accent) }
+                                }
+                                OutlinedTextField(
+                                    driveName,
+                                    { driveName = it.filter { c -> c.code in 0x21..0x7E && c !in ":<>\"/\\|" }.take(32) },
+                                    label = { Text("Имя диска в Windows") }, singleLine = true,
+                                    supportingText = { Text("Латинские буквы и цифры, без пробелов", color = TextSecondary, fontSize = 12.sp) },
+                                    colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                                )
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Только чтение", color = TextPrimary, fontSize = 15.sp)
+                                        Text("Windows сможет читать и копировать файлы, но не изменять и не удалять их", color = TextSecondary, fontSize = 12.sp)
+                                    }
+                                    Switch(checked = driveReadOnly, onCheckedChange = { driveReadOnly = it })
+                                }
+                            }
+                        }
                     }
-                }
-                Text(if (os == OsType.UBUNTU) "Ubuntu · RDP" else "Windows · RDP", color = TextSecondary, fontSize = 12.sp)
-                if (onResetCertificate != null && device?.certSha256 != null) {
-                    TextButton(onClick = { onResetCertificate(); onDismiss() }) { Text("Сбросить доверие к сертификату", color = TextSecondary) }
-                }
-                if (onDelete != null) {
-                    TextButton(onClick = { onDelete(); onDismiss() }) { Text("Удалить устройство", color = DangerRed) }
                 }
             }
         },
         confirmButton = {
             TextButton(onClick = {
                 tried = true
-                if (host.isNotBlank() && portNum != null && portNum in 1..65535 && !(driveEnabled && driveUri == null) && !wakeMacError) {
+                val mainOk = host.isNotBlank() && portNum != null && portNum in 1..65535 && !wakeMacError
+                val filesOk = !(driveEnabled && driveUri == null)
+                // Ошибка может быть на вкладке, которой сейчас не видно, — переходим к ней.
+                if (!mainOk) tab = EditTab.MAIN else if (!filesOk) tab = EditTab.FILES
+                if (mainOk && filesOk) {
                     onSave(
                         (device ?: Device(newId(), "", "")).copy(
                             name = name.ifBlank { host },
@@ -371,9 +507,15 @@ fun DeviceEditDialog(
                             useNla = useNla,
                             scalePercent = scale.toInt(),
                             colorDepth = colorDepth,
-                            scrollLevel = scrollLevel.roundToInt(),
-                            inertiaLevel = inertiaLevel.roundToInt(),
+                            scrollPercent = StrengthLevels.snap(scrollPercent),
+                            inertiaPercent = StrengthLevels.snap(inertiaPercent),
+                            mouseSpeedPercent = StrengthLevels.snap(mouseSpeedPercent),
+                            mouseWheelPercent = StrengthLevels.snap(mouseWheelPercent),
                             fileTransfer = fileTransfer,
+                            microphone = microphone,
+                            camera = camera,
+                            cameraOff = cameraOff.toSet(),
+                            cameraRotation = cameraRotation.toMap(),
                             driveEnabled = driveEnabled,
                             driveUri = driveUri,
                             driveName = driveName.ifBlank { Device.DEFAULT_DRIVE_NAME },
@@ -498,6 +640,32 @@ fun DiscoveryDialog(
     )
 }
 
+/** Вкладки формы устройства. */
+private enum class EditTab(val title: String) {
+    MAIN("Подключение"),
+    DISPLAY("Экран и ввод"),
+    MEDIA("Устройства"),
+    FILES("Файлы"),
+}
+
+/** Кнопка выбора поворота камеры: выбранная залита цветом акцента. */
+@Composable
+internal fun RotationButton(label: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        Modifier.height(36.dp).clip(RoundedCornerShape(18.dp))
+            .background(if (selected) Accent else SurfaceButton)
+            .border(1.dp, if (selected) Accent else Outline, RoundedCornerShape(18.dp))
+            .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            label, color = TextPrimary, fontSize = 13.sp, maxLines = 1,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        )
+    }
+}
+
 @Composable
 private fun RadioRow(title: String, selected: Boolean, onClick: () -> Unit) {
     Row(
@@ -513,13 +681,13 @@ private fun RadioRow(title: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun StrengthSlider(title: String, hint: String, value: Float, onChange: (Float) -> Unit) {
-    val level = value.roundToInt()
+internal fun StrengthSlider(title: String, hint: String, value: Float, onChange: (Float) -> Unit) {
+    val percent = StrengthLevels.snap(value)
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(title, color = TextPrimary, fontSize = 15.sp, modifier = Modifier.weight(1f))
             Text(
-                "${StrengthLevels.percent(level)}%" + if (level == StrengthLevels.DEFAULT) " · по умолчанию" else "",
+                "$percent%" + if (percent == StrengthLevels.DEFAULT) " · по умолчанию" else "",
                 color = Accent, fontSize = 15.sp,
             )
         }
@@ -527,7 +695,7 @@ private fun StrengthSlider(title: String, hint: String, value: Float, onChange: 
             value = value,
             onValueChange = onChange,
             valueRange = StrengthLevels.MIN.toFloat()..StrengthLevels.MAX.toFloat(),
-            steps = StrengthLevels.MAX - StrengthLevels.MIN - 1,
+            steps = (StrengthLevels.MAX - StrengthLevels.MIN) / StrengthLevels.STEP - 1,
             colors = SliderDefaults.colors(thumbColor = Accent, activeTrackColor = Accent, inactiveTrackColor = Outline),
         )
         Text(hint, color = TextSecondary, fontSize = 12.sp)

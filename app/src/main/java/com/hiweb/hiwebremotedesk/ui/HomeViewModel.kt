@@ -72,6 +72,9 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     /** ПК, агент которых сейчас на связи по локальной сети, и доступные на них действия питания. */
     val agents = com.hiweb.hiwebremotedesk.agent.AgentHub.presence
 
+    /** Журнал подключений и угрозы по каждому ПК (присылает HiWeb Agent). */
+    val guard = com.hiweb.hiwebremotedesk.data.GuardStore.get(app).data
+
     // Правила состояния зависят от времени (свежесть сообщения агента, долгая перезагрузка): пересчёт раз в 5 с.
     private val ticker = flow { while (true) { emit(System.currentTimeMillis()); delay(5_000) } }
 

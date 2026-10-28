@@ -95,4 +95,46 @@ object ScanCodes {
         evdevExtended[sc]?.let { return ScanKey(it, true) }
         return byKeyCode[e.keyCode]
     }
+
+    /**
+     * Символ в скан-код раскладки ПК — нужен, когда символ приходит из экранной клавиатуры Android,
+     * а на ПК уже зажаты модификаторы (Ctrl, Alt, Win): без скан-кода сочетание не сработает.
+     * Берутся только «позиционные» символы; для редких ([forChar] вернёт null) остаётся Unicode.
+     */
+    /**
+     * Символ, который на раскладке US набирается через Shift, → клавиша без Shift (`!` → `1`).
+     * Такие символы тоже уходят скан-кодом: Unicode-события (VK_PACKET) не принимают
+     * Notepad++, редакторы JetBrains и другие программы со своей обработкой клавиатуры.
+     */
+    fun unshifted(ch: Char): Char? {
+        val i = SHIFTED.indexOf(ch)
+        return if (i >= 0) UNSHIFTED[i] else null
+    }
+
+    private const val SHIFTED = "!@#\$%^&*()_+{}|:\"<>?~"
+    private const val UNSHIFTED = "1234567890-=[]\\;',./`"
+
+    fun forChar(ch: Char): ScanKey? {
+        val kc = when (ch) {
+            in 'a'..'z' -> KeyEvent.KEYCODE_A + (ch - 'a')
+            in 'A'..'Z' -> KeyEvent.KEYCODE_A + (ch - 'A')
+            in '0'..'9' -> KeyEvent.KEYCODE_0 + (ch - '0')
+            ' ' -> KeyEvent.KEYCODE_SPACE
+            '.' -> KeyEvent.KEYCODE_PERIOD
+            ',' -> KeyEvent.KEYCODE_COMMA
+            '-' -> KeyEvent.KEYCODE_MINUS
+            '=' -> KeyEvent.KEYCODE_EQUALS
+            '/' -> KeyEvent.KEYCODE_SLASH
+            ';' -> KeyEvent.KEYCODE_SEMICOLON
+            '\'' -> KeyEvent.KEYCODE_APOSTROPHE
+            '[' -> KeyEvent.KEYCODE_LEFT_BRACKET
+            ']' -> KeyEvent.KEYCODE_RIGHT_BRACKET
+            '\\' -> KeyEvent.KEYCODE_BACKSLASH
+            '`' -> KeyEvent.KEYCODE_GRAVE
+            '\n', '\r' -> KeyEvent.KEYCODE_ENTER
+            '\b' -> KeyEvent.KEYCODE_DEL
+            else -> 0
+        }
+        return byKeyCode[kc]
+    }
 }

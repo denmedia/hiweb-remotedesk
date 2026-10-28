@@ -13,6 +13,10 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Микрофон планшета в сеансе RDP (канал audin); спрашивается при включении кнопкой в сеансе -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Камера планшета в программах Windows (канал rdpecam), только по желанию пользователя -->
+    <uses-permission android:name="android.permission.CAMERA" />
 
     <!-- Сенсорный экран не обязателен: приложение работает и с мышью/клавиатурой -->
     <uses-feature
@@ -71,6 +75,9 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+        <receiver
+            android:name=".agent.GuardActionReceiver"
+            android:exported="false" />
         <service
             android:name=".KeyCaptureService"
             android:exported="true"

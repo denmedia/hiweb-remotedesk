@@ -16,6 +16,7 @@ object PcNotifications {
     const val CHANNEL_PC = "pc_notifications"
     const val CHANNEL_SESSION = "session"
     const val CHANNEL_SWITCH = "switch_listener"
+    const val CHANNEL_SECURITY = "pc_security"
     const val SESSION_NOTIFICATION_ID = 1
     const val SWITCH_NOTIFICATION_ID = 2
     const val SWITCH_REQUEST_ID = 3
@@ -26,6 +27,11 @@ object PcNotifications {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_PC, "Уведомления с ПК", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Уведомления Windows, пока приложение свёрнуто (нужен HiWeb Agent на ПК)"
+            },
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_SECURITY, "Безопасность ПК", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Подбор пароля и входы по RDP с неизвестных адресов (нужен HiWeb Agent на ПК)"
             },
         )
         nm.createNotificationChannel(
@@ -45,6 +51,24 @@ object PcNotifications {
     fun canPost(context: Context): Boolean =
         context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+    /** Приложение сейчас на экране: уведомления с ПК не нужны, их заменяет сам сеанс. */
+    const val BLOCKED_VISIBLE = "visible"
+
+    /** Приложению запрещены уведомления (разрешение не выдано или отключены в настройках Android). */
+    const val BLOCKED_PERMISSION = "permission"
+
+    /** Канал «Уведомления с ПК» отключён в настройках Android. */
+    const val BLOCKED_CHANNEL = "channel"
+
+    /** Почему уведомление с ПК не будет показано ([BLOCKED_PERMISSION], [BLOCKED_CHANNEL]); null — показать можно. */
+    fun blocker(context: Context): String? {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        if (!canPost(context) || !nm.areNotificationsEnabled()) return BLOCKED_PERMISSION
+        ensureChannels(context)
+        if (nm.getNotificationChannel(CHANNEL_PC)?.importance == NotificationManager.IMPORTANCE_NONE) return BLOCKED_CHANNEL
+        return null
+    }
+
     /** Возврат в сеанс: существующий экран сеанса поднимается наверх, а не открывается заново. */
     fun sessionIntent(context: Context, deviceId: String): PendingIntent {
         val intent = Intent(context, RemoteActivity::class.java)
@@ -58,6 +82,7 @@ object PcNotifications {
         val title = listOf(n.app, n.title).filter { it.isNotBlank() }.joinToString(": ").ifBlank { deviceName }
         val notification = Notification.Builder(context, CHANNEL_PC)
             .setSmallIcon(R.drawable.ic_stat_pc)
+            .setLargeIcon(NotificationIcon.compose(context, n.iconPng))
             .setContentTitle(title)
             .setContentText(n.text)
             .setStyle(Notification.BigTextStyle().bigText(n.text))

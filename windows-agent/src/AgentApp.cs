@@ -28,20 +28,34 @@ namespace HiWebAgent
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly ToolStripMenuItem switchItem = new ToolStripMenuItem("Переключиться на Планшет");
+        readonly ToolStripMenuItem devicesItem = new ToolStripMenuItem("Устройства…");
         readonly ToolStripMenuItem statusItem = new ToolStripMenuItem();
         readonly ToolStripMenuItem forwardItem = new ToolStripMenuItem("Пересылать уведомления на планшет");
         readonly ToolStripMenuItem accessItem = new ToolStripMenuItem("Разрешить доступ к уведомлениям…");
+        readonly ToolStripMenuItem checkItem = new ToolStripMenuItem("Проверить пересылку уведомлений…");
+        NotificationCheckForm checkForm;
         readonly ToolStripMenuItem touchItem = new ToolStripMenuItem("Сенсорная клавиатура, если у планшета нет клавиатуры");
         readonly System.Windows.Forms.Timer connectTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer();
         readonly ToolStripMenuItem screenItem = new ToolStripMenuItem("Обновлять превью ПК на планшете (снимок экрана раз в 15 мин)");
         readonly System.Windows.Forms.Timer screenTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer screenSoon = new System.Windows.Forms.Timer();
+        readonly ToolStripMenuItem guardItem = new ToolStripMenuItem("Защита подключений…");
+        readonly ToolStripMenuItem guardWatchItem = new ToolStripMenuItem("Следить за подключениями по RDP и предупреждать о подозрительных");
+        readonly ConnectionGuard guard;
+        GuardForm guardForm;
+        // Последнее состояние защиты для связи по локальной сети: читается из её потоков, поэтому готовое сообщение.
+        volatile Dictionary<string, object> guardState;
+        // Щелчок по уведомлению открывает окно защиты, только если показано уведомление об угрозе.
+        bool balloonIsThreat;
+        string lastThreatId;
+        bool exiting;
         volatile bool screenBusy;
         readonly PcStatus pcStatus = new PcStatus();
         string lastStatusKey;
         readonly NotificationWatcher watcher = new NotificationWatcher();
         readonly TouchKeyboard touchKeyboard = new TouchKeyboard();
+        readonly CursorWatcher cursorWatcher = new CursorWatcher();
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
         readonly SessionEvents sessionEvents;
         readonly RegisteredWaitHandle exitWait;
@@ -49,13 +63,14 @@ namespace HiWebAgent
         readonly BlockingCollection<Tuple<RdpChannel, string>> outbox = new BlockingCollection<Tuple<RdpChannel, string>>();
 
         RdpChannel channel;
-        volatile TabletPairing pairing = TabletPairing.Load();
         readonly LanLink lan;
-        bool lanConnected;
         bool switching;
         bool connecting;
         int failedAttempts;
         Icon currentIcon;
+        // Устройство, с которым открыт канал RDP (ключ в списке устройств); null — канала нет.
+        string currentDeviceKey;
+        DevicesForm devicesForm;
 
         // Состояние планшета, пока канал открыт.
         string tabletName;
@@ -76,6 +91,7 @@ namespace HiWebAgent
             forwardItem.Checked = ReadSetting("ForwardNotifications", 1) != 0;
             forwardItem.CheckedChanged += delegate { WriteSetting("ForwardNotifications", forwardItem.Checked ? 1 : 0); };
             accessItem.Click += delegate { OpenNotificationSettings(); };
+            checkItem.Click += delegate { ShowNotificationCheck(); };
             touchItem.CheckOnClick = true;
             touchItem.Checked = ReadSetting("TouchKeyboard", 1) != 0;
             touchItem.CheckedChanged += delegate { WriteSetting("TouchKeyboard", touchItem.Checked ? 1 : 0); UpdateTouchKeyboard(); };
@@ -86,6 +102,15 @@ namespace HiWebAgent
                 WriteSetting("ScreenPreview", screenItem.Checked ? 1 : 0);
                 if (screenItem.Checked) RequestScreen(1000);
             };
+            guardItem.Click += delegate { ShowGuard(null); };
+            guardWatchItem.CheckOnClick = true;
+            guardWatchItem.Checked = ReadSetting("GuardRdp", 1) != 0;
+            guardWatchItem.CheckedChanged += delegate
+            {
+                WriteSetting("GuardRdp", guardWatchItem.Checked ? 1 : 0);
+                if (guardWatchItem.Checked) guard.Start();
+                else guard.Stop();
+            };
             var versionItem = new ToolStripMenuItem(AgentInfo.Product + " " + AgentInfo.Version);
             versionItem.Enabled = false;
             var uninstallItem = new ToolStripMenuItem("Удалить " + AgentInfo.Product + "…");
@@ -93,15 +118,13 @@ namespace HiWebAgent
             var exitItem = new ToolStripMenuItem("Закрыть до следующего входа в Windows");
             exitItem.Click += delegate { ExitThread(); };
             switchItem.Font = new Font(switchItem.Font, FontStyle.Bold);
-            switchItem.Click += delegate { SwitchToTablet(); };
-            menu.Items.AddRange(new ToolStripItem[] { switchItem, new ToolStripSeparator(), statusItem, forwardItem, accessItem, touchItem, screenItem, new ToolStripSeparator(), versionItem, uninstallItem, exitItem });
+            switchItem.Click += delegate { SwitchToCurrent(); };
+            devicesItem.Click += delegate { ShowDevices(); };
+            menu.Items.AddRange(new ToolStripItem[] { switchItem, devicesItem, guardItem, new ToolStripSeparator(), statusItem, forwardItem, accessItem, checkItem, touchItem, screenItem, guardWatchItem, new ToolStripSeparator(), versionItem, uninstallItem, exitItem });
             menu.Opening += delegate
             {
                 accessItem.Visible = watcher.Status != UserNotificationListenerAccessStatus.Allowed;
-                switchItem.Enabled = !switching && (channel != null || pairing != null);
-                switchItem.ToolTipText = pairing == null && channel == null
-                    ? "Сначала подключитесь к этому ПК с планшета и установите агент"
-                    : null;
+                FillSwitchMenu();
             };
 
             tray.ContextMenuStrip = menu;
@@ -133,16 +156,35 @@ namespace HiWebAgent
             watcher.Start();
 
             touchKeyboard.PaneChanged += rect => ui.Post(delegate { SendKeyboardPane(rect); }, null);
+            cursorWatcher.Changed += msg => Send(msg);
 
-            lan = new LanLink(() => pairing, p => p.Save(), pcStatus.Snapshot);
-            lan.ConnectedChanged += connected => ui.Post(delegate
+            lan = new LanLink(() => PairedDevices.All(), key => PairedDevices.Get(key), d => PairedDevices.Save(d), pcStatus.Snapshot);
+            lan.Changed += delegate
             {
-                lanConnected = connected;
-                UpdateTray();
-                // Свежий кадр сразу после подключения: иначе превью ждало бы до 15 минут.
-                if (connected) RequestScreen(3000);
-            }, null);
+                ui.Post(delegate
+                {
+                    UpdateTray();
+                    if (devicesForm != null) devicesForm.RefreshList();
+                    // Свежий кадр сразу после подключения: иначе превью ждало бы до 15 минут.
+                    if (lan.Connected().Length > 0) RequestScreen(3000);
+                }, null);
+            };
+            lan.Greeting = delegate
+            {
+                var list = new List<Dictionary<string, object>>();
+                Dictionary<string, object> state = guardState;
+                if (state != null) list.Add(state);
+                return list;
+            };
+            lan.GuardCommand = (msg, reply) => ui.Post(delegate { OnGuardCommand(msg, reply); }, null);
             lan.Start();
+
+            guard = new ConnectionGuard(ui);
+            guard.Updated += OnGuardUpdated;
+            guardState = guard.StateMessage();
+            tray.BalloonTipClicked += delegate { if (balloonIsThreat) ShowGuard(lastThreatId); };
+            if (guardWatchItem.Checked) guard.Start();
+            UpdateGuardItem();
 
             screenTimer.Tick += delegate { SendScreen(); };
             screenTimer.Interval = SCREEN_INTERVAL_MS;
@@ -160,6 +202,7 @@ namespace HiWebAgent
 
             if (justInstalled)
             {
+                balloonIsThreat = false;
                 tray.ShowBalloonTip(5000, AgentInfo.Product, "Агент установлен и будет запускаться вместе с Windows.", ToolTipIcon.Info);
             }
         }
@@ -211,6 +254,8 @@ namespace HiWebAgent
             hello["user"] = Environment.UserName;
             hello["notifAccess"] = watcher.Status.ToString();
             Send(hello);
+            guard.TabletOpened();
+            Send(guardState);
             pcStatus.TabletSession = true;
             PushStatus(true);
             UpdateTray();
@@ -221,6 +266,7 @@ namespace HiWebAgent
             if (channel != closed) return;
             channel = null;
             tabletName = null;
+            currentDeviceKey = null;
             battery = null;
             tabletForeground = true;
             tabletKeyboard = true;
@@ -230,6 +276,7 @@ namespace HiWebAgent
             PushStatus(false);
             UpdateTray();
             UpdateTouchKeyboard();
+            UpdateCursor();
         }
 
         void OnMessage(RdpChannel from, string text)
@@ -243,6 +290,9 @@ namespace HiWebAgent
             {
                 case "hello":
                     tabletName = Str(msg, "device");
+                    // Идентификатор устройства в приложении: отличает планшет от смартфона и от прежних версий.
+                    string key = Str(msg, "id");
+                    if (!string.IsNullOrEmpty(key)) currentDeviceKey = PairedDevice.SafeName(key);
                     break;
                 case "state":
                     tabletForeground = Bool(msg, "fg", true);
@@ -253,6 +303,15 @@ namespace HiWebAgent
                 case "pair":
                     SavePairing(msg);
                     break;
+                case "guard":
+                    OnGuardCommand(msg, reply => Send(reply));
+                    break;
+                case "notif_ack":
+                    long ackId = msg.ContainsKey("id") && msg["id"] != null ? Convert.ToInt64(msg["id"]) : -1;
+                    bool posted = Bool(msg, "posted", false);
+                    Log.Write("notif: планшет " + (posted ? "показал уведомление" : "не показал уведомление: " + Str(msg, "reason")));
+                    if (checkForm != null) checkForm.OnAck(ackId, posted, Str(msg, "reason"));
+                    break;
                 case "battery":
                     object level;
                     if (msg.TryGetValue("level", out level) && level is int) battery = Math.Max(0, Math.Min(100, (int)level));
@@ -261,6 +320,13 @@ namespace HiWebAgent
             }
             UpdateTray();
             UpdateTouchKeyboard();
+            UpdateCursor();
+        }
+
+        /// <summary>Форму курсора шлём, пока планшет показывает этот сеанс.</summary>
+        void UpdateCursor()
+        {
+            cursorWatcher.Active = channel != null && tabletForeground;
         }
 
         /// <summary>Сенсорная клавиатура нужна, пока планшет без клавиатуры показывает этот сеанс.</summary>
@@ -338,7 +404,7 @@ namespace HiWebAgent
         /// </summary>
         void SendScreen()
         {
-            if (!screenItem.Checked || !lanConnected || screenBusy || !pcStatus.DesktopVisible) return;
+            if (!screenItem.Checked || lan.Connected().Length == 0 || screenBusy || !pcStatus.DesktopVisible) return;
             screenBusy = true;
             ThreadPool.QueueUserWorkItem(delegate
             {
@@ -404,30 +470,129 @@ namespace HiWebAgent
             ThreadPool.QueueUserWorkItem(delegate { lan.SendStatus(snapshot); });
         }
 
-        // ------------------------------------------------------------------ переключение на планшет
+        // ------------------------------------------------------------------ защита подключений
 
+        /// <summary>Защита что-то заметила или изменила: сообщаем устройствам, обновляем окно и, если нужно, предупреждаем.</summary>
+        void OnGuardUpdated(GuardUpdate u)
+        {
+            guardState = guard.StateMessage();
+            if (u.State) Broadcast(guardState);
+            if (u.Entries.Count > 0) Broadcast(guard.EntriesMessage(u.Entries));
+            if (u.Threats.Count > 0) Broadcast(guard.ThreatsMessage(u.Threats));
+            foreach (Threat t in u.Announce)
+            {
+                lastThreatId = t.Id;
+                balloonIsThreat = true;
+                string text = GuardText.ThreatText(t) + "\nЩёлкните, чтобы заблокировать или оставить.";
+                tray.ShowBalloonTip(20000, GuardText.ThreatTitle(t), text.Length > 250 ? text.Substring(0, 250) : text, ToolTipIcon.Warning);
+            }
+            UpdateGuardItem();
+            if (guardForm != null) guardForm.RefreshAll();
+        }
+
+        /// <summary>Сообщение по каналу RDP и по локальной сети всем устройствам, которые на связи.</summary>
+        void Broadcast(Dictionary<string, object> msg)
+        {
+            Send(msg);
+            ThreadPool.QueueUserWorkItem(delegate { lan.Send(msg); });
+        }
+
+        void UpdateGuardItem()
+        {
+            int open = guard.OpenThreats;
+            guardItem.Text = open > 0 ? "Защита подключений… (угроз: " + open + ")" : "Защита подключений…";
+            guardItem.Font = new Font(guardItem.Font, open > 0 ? FontStyle.Bold : FontStyle.Regular);
+        }
+
+        void ShowGuard(string threatId)
+        {
+            if (guardForm == null)
+            {
+                guardForm = new GuardForm(guard);
+                guardForm.FormClosed += delegate { guardForm = null; };
+                guardForm.Show();
+            }
+            else
+            {
+                guardForm.RefreshAll();
+                if (guardForm.WindowState == FormWindowState.Minimized) guardForm.WindowState = FormWindowState.Normal;
+            }
+            guardForm.Activate();
+            if (threatId != null) guardForm.ShowThreats(threatId);
+        }
+
+        /// <summary>Команда устройства (сообщение guard): sync, block, unblock, trust, dismiss. Выполняется в потоке интерфейса.</summary>
+        void OnGuardCommand(Dictionary<string, object> msg, Action<Dictionary<string, object>> reply)
+        {
+            string action = Str(msg, "do");
+            switch (action)
+            {
+                case "sync":
+                    long since = 0;
+                    object v;
+                    if (msg.TryGetValue("since", out v) && v != null) since = Convert.ToInt64(v);
+                    foreach (Dictionary<string, object> m in guard.SyncMessages(since)) reply(m);
+                    break;
+                case "block":
+                    string cidr = Str(msg, "cidr");
+                    guard.Block(cidr, Bool(msg, "enableFw", false), error => reply(GuardResult(action, cidr, error)));
+                    break;
+                case "unblock":
+                    string unblock = Str(msg, "cidr");
+                    guard.Unblock(unblock, error => reply(GuardResult(action, unblock, error)));
+                    break;
+                case "trust":
+                    guard.Trust(Str(msg, "ip"));
+                    break;
+                case "dismiss":
+                    guard.Dismiss(Str(msg, "id"));
+                    break;
+            }
+        }
+
+        Dictionary<string, object> GuardResult(string action, string cidr, string error)
+        {
+            var result = new Dictionary<string, object>();
+            result["t"] = "guard_result";
+            result["do"] = action;
+            result["cidr"] = cidr ?? "";
+            result["ok"] = error == null;
+            result["error"] = error ?? "";
+            result["fw"] = guard.FirewallOn;
+            return result;
+        }
+
+        // ------------------------------------------------------------------ устройства и переключение
+
+        /// <summary>
+        /// Устройство подключилось по каналу RDP и прислало свои данные. Оно заводится в списке агента только
+        /// так — подключением к этому ПК; повторное подключение обновляет адреса, порт и ключ.
+        /// </summary>
         void SavePairing(Dictionary<string, object> msg)
         {
             try
             {
-                var p = new TabletPairing();
-                p.DeviceId = Str(msg, "pc");
-                p.Name = Str(msg, "device") ?? tabletName;
+                string pcId = Str(msg, "pc");
+                string model = Str(msg, "device") ?? tabletName;
+                string kind = Str(msg, "kind");
+                string id = Str(msg, "id");
                 object port;
-                p.Port = msg.TryGetValue("port", out port) && port is int ? (int)port : 0;
+                int portValue = msg.TryGetValue("port", out port) && port is int ? (int)port : 0;
                 var ips = new List<string>();
                 object raw;
                 if (msg.TryGetValue("ips", out raw) && raw is System.Collections.IEnumerable)
                 {
                     foreach (object ip in (System.Collections.IEnumerable)raw) if (ip != null) ips.Add(ip.ToString());
                 }
-                p.Addresses = ips.ToArray();
                 string secret = Str(msg, "secret");
-                if (string.IsNullOrEmpty(p.DeviceId) || p.Port <= 0 || string.IsNullOrEmpty(secret)) return;
-                p.Secret = Convert.FromBase64String(secret);
-                p.Save();
-                pairing = p;
-                Log.Write("paired with tablet " + p.Name + " port " + p.Port + " at " + string.Join(",", p.Addresses));
+                if (string.IsNullOrEmpty(pcId) || portValue <= 0 || string.IsNullOrEmpty(secret)) return;
+                byte[] key = Convert.FromBase64String(secret);
+                // Идентификатор есть только в новых версиях приложения: без него устройство различается по модели.
+                PairedDevice d = PairedDevices.Upsert(id, pcId, model, kind, portValue, ips.ToArray(), key);
+                if (string.IsNullOrEmpty(id)) currentDeviceKey = d.Key;
+                else currentDeviceKey = d.Key;
+                if (devicesForm != null) devicesForm.RefreshList();
+                UpdateTray();
             }
             catch (Exception e)
             {
@@ -436,13 +601,116 @@ namespace HiWebAgent
         }
 
         /// <summary>
-        /// Открыть сеанс этого ПК на планшете: подключённому планшету — по каналу RDP, иначе — командой по
-        /// локальной сети. Когда планшет подтвердил, мониторы ПК гаснут.
+        /// Заново собирает меню переключения: одно устройство — пункт «Переключиться на …», несколько — подменю
+        /// со списком (в сети — первым, подключённое по RDP — с галочкой).
         /// </summary>
-        void SwitchToTablet()
+        void FillSwitchMenu()
+        {
+            switchItem.DropDownItems.Clear();
+            PairedDevice[] devices = PairedDevices.All();
+            string cid = channel == null ? null : currentDeviceKey;
+            PairedDevice current = cid == null ? null : PairedDevices.Get(cid);
+            if (channel != null && current == null)
+            {
+                // Старое приложение не сообщает идентификатор: подпись — модель из hello.
+                switchItem.Text = "Переключиться на " + (string.IsNullOrEmpty(tabletName) ? "Планшет" : tabletName);
+                switchItem.Enabled = !switching;
+                switchItem.ToolTipText = null;
+                return;
+            }
+            if (current != null)
+            {
+                switchItem.Text = "Переключиться на " + current.Title;
+                switchItem.Enabled = !switching;
+                switchItem.ToolTipText = null;
+                return;
+            }
+            switchItem.Text = "Переключиться на Планшет";
+            if (devices.Length == 0)
+            {
+                switchItem.Enabled = false;
+                switchItem.ToolTipText = "Сначала подключитесь к этому ПК с планшета или смартфона и установите агент";
+                return;
+            }
+            switchItem.Enabled = !switching;
+            switchItem.ToolTipText = null;
+            foreach (PairedDevice d in OrderForMenu(devices))
+            {
+                PairedDevice device = d;
+                var item = new ToolStripMenuItem(device.Title);
+                item.Checked = device.Key == currentDeviceKey;
+                bool online = lan.IsConnected(device.Key);
+                item.Image = null;
+                item.Text = device.Title + (online ? "  ·  в сети" : "");
+                item.Font = new Font(switchItem.Font, online ? FontStyle.Bold : FontStyle.Regular);
+                item.Click += delegate { SwitchToDevice(device.Key); };
+                switchItem.DropDownItems.Add(item);
+            }
+        }
+
+        /// <summary>Устройства на связи — сверху, дальше по алфавиту.</summary>
+        PairedDevice[] OrderForMenu(PairedDevice[] devices)
+        {
+            var online = new List<PairedDevice>();
+            var offline = new List<PairedDevice>();
+            foreach (PairedDevice d in devices)
+            {
+                if (lan.IsConnected(d.Key)) online.Add(d);
+                else offline.Add(d);
+            }
+            online.AddRange(offline);
+            return online.ToArray();
+        }
+
+        /// <summary>Окно со списком устройств: переключение, переименование, удаление.</summary>
+        void ShowDevices()
+        {
+            if (devicesForm == null)
+            {
+                devicesForm = new DevicesForm(
+                    key => lan.IsConnected(key),
+                    key => SwitchToDevice(key),
+                    delegate { UpdateTray(); });
+                devicesForm.FormClosed += delegate { devicesForm = null; };
+                devicesForm.Show();
+            }
+            else
+            {
+                devicesForm.RefreshList();
+                if (devicesForm.WindowState == FormWindowState.Minimized) devicesForm.WindowState = FormWindowState.Normal;
+                devicesForm.Activate();
+            }
+        }
+
+        /// <summary>Пункт меню без выбора устройства: подключённому по RDP — activate, иначе текущее из списка.</summary>
+        void SwitchToCurrent()
+        {
+            string key = channel != null ? currentDeviceKey : null;
+            if (key == null)
+            {
+                // Одно устройство — прямо на него; несколько — пусть пользователь выберет в подменю.
+                PairedDevice[] devices = PairedDevices.All();
+                if (devices.Length == 1) key = devices[0].Key;
+                else if (devices.Length == 0) return;
+                else
+                {
+                    switchItem.ShowDropDown();
+                    return;
+                }
+            }
+            SwitchToDevice(key);
+        }
+
+        /// <summary>
+        /// Открыть сеанс этого ПК на выбранном устройстве: подключённому — по каналу RDP, иначе — командой по
+        /// локальной сети. Когда устройство подтвердило, мониторы ПК гаснут.
+        /// </summary>
+        void SwitchToDevice(string key)
         {
             if (switching) return;
-            if (channel != null)
+            PairedDevice p = PairedDevices.Get(key);
+            if (p == null) return;
+            if (channel != null && key == currentDeviceKey)
             {
                 var msg = new Dictionary<string, object>();
                 msg["t"] = "activate";
@@ -450,10 +718,8 @@ namespace HiWebAgent
                 TurnOffDisplaySoon();
                 return;
             }
-            TabletPairing p = pairing;
-            if (p == null) return;
             switching = true;
-            tray.Text = AgentInfo.Product + "\nВызов планшета…";
+            tray.Text = AgentInfo.Product + "\nВызов устройства…";
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool ok = false;
@@ -469,8 +735,9 @@ namespace HiWebAgent
                     }
                     else
                     {
+                        balloonIsThreat = false;
                         tray.ShowBalloonTip(8000, AgentInfo.Product,
-                            "Планшет не ответил. Проверьте, что он включён, в той же сети Wi-Fi, а приложению HiWeb разрешена работа в фоне.",
+                            "«" + p.Title + "» не ответило. Проверьте, что устройство включено, в той же сети Wi-Fi, а приложению HiWeb разрешена работа в фоне.",
                             ToolTipIcon.Warning);
                     }
                 }, null);
@@ -493,17 +760,64 @@ namespace HiWebAgent
 
         // ------------------------------------------------------------------ уведомления
 
+        /// <summary>Почему уведомление не уйдёт на планшет; null — уйдёт.</summary>
+        string ForwardSkipReason()
+        {
+            if (!forwardItem.Checked) return "пересылка выключена в меню агента";
+            if (channel == null) return "нет канала сеанса RDP с планшетом (уведомления идут только по нему)";
+            if (tabletForeground) return "приложение на планшете на экране";
+            return null;
+        }
+
         void Forward(ToastInfo info)
         {
-            if (channel == null || tabletForeground || !forwardItem.Checked) return;
+            string skip = ForwardSkipReason();
+            // Тестовое уведомление из проверки: планшет должен ответить, показал ли он его.
+            bool probe = checkForm != null && checkForm.OnToast(info, skip);
+            // В журнал — только приложение: заголовки и тексты уведомлений личные.
+            Log.Write("notif: " + (info.App ?? info.AppId) + " — " + (skip == null ? "отправлено планшету" : "не отправлено: " + skip));
+            if (skip != null) return;
             var msg = new Dictionary<string, object>();
             msg["t"] = "notif";
+            if (probe) msg["ack"] = true;
             msg["id"] = (long)info.Id;
             msg["app"] = info.App ?? "";
             msg["title"] = info.Title ?? "";
             msg["text"] = info.Text ?? "";
             msg["time"] = info.TimeMs;
+            // Иконка приложения для карточки на планшете; без неё планшет покажет только значок RemoteDesk.
+            string icon = AppIcons.PngBase64(info.AppId);
+            if (icon != null) msg["icon"] = icon;
             Send(msg);
+        }
+
+        /// <summary>Окно проверки пересылки: что уведомление Windows доходит до планшета, а если нет — где обрывается.</summary>
+        void ShowNotificationCheck()
+        {
+            if (checkForm == null)
+            {
+                checkForm = new NotificationCheckForm(ReadCheckEnv);
+                checkForm.FormClosed += delegate { checkForm = null; };
+                checkForm.Show();
+            }
+            else
+            {
+                if (checkForm.WindowState == FormWindowState.Minimized) checkForm.WindowState = FormWindowState.Normal;
+                checkForm.Activate();
+            }
+        }
+
+        CheckEnv ReadCheckEnv()
+        {
+            var env = new CheckEnv();
+            env.Access = watcher.Status;
+            env.PollAgeSec = watcher.PollAgeSec;
+            env.PollError = watcher.LastError;
+            env.ForwardOn = forwardItem.Checked;
+            env.ChannelOpen = channel != null;
+            env.TabletForeground = tabletForeground;
+            env.TabletName = tabletName;
+            return env;
         }
 
         static void OpenNotificationSettings()
@@ -516,17 +830,34 @@ namespace HiWebAgent
 
         void UpdateTray()
         {
+            // Отложенные вызовы (связь с устройством, меню) могут прийти уже после закрытия значка.
+            if (exiting) return;
+            // Первый вызов — из конструктора, до создания связи по локальной сети.
+            PairedDevice[] online = lan == null ? new PairedDevice[0] : lan.Connected();
+            PairedDevice current = channel == null || currentDeviceKey == null ? null : PairedDevices.Get(currentDeviceKey);
+            // Подпись: имя устройства, если оно известно; иначе — как раньше, «Планшет».
+            string currentName = current != null ? current.Title : (string.IsNullOrEmpty(tabletName) ? null : tabletName);
             string status;
-            if (channel == null && lanConnected) status = "Планшет в сети" + (pairing != null && !string.IsNullOrEmpty(pairing.Name) ? " (" + pairing.Name + ")" : "");
-            else if (channel == null) status = "Планшет не подключён" + (pairing != null && !string.IsNullOrEmpty(pairing.Name) ? " (" + pairing.Name + ")" : "");
-            else if (battery == null) status = "Планшет подключён";
-            else status = "Планшет: " + battery.Value + "%" + (charging ? ", заряжается" : "");
-            if (channel != null && !string.IsNullOrEmpty(tabletName)) status += " · " + tabletName;
+            if (channel != null)
+            {
+                string who = currentName ?? "Устройство";
+                if (battery == null) status = who + " подключено";
+                else status = who + ": " + battery.Value + "%" + (charging ? ", заряжается" : "");
+            }
+            else if (online.Length == 1) status = online[0].Title + " в сети";
+            else if (online.Length > 1) status = "Устройства в сети: " + online.Length;
+            else
+            {
+                int total = PairedDevices.All().Length;
+                status = total > 0 ? "Устройства не подключены (" + total + ")" : "Устройства не подключены";
+            }
             statusItem.Text = status;
             string tip = AgentInfo.Product + "\n" + status;
             tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
 
-            Icon icon = TrayIcons.Render(channel != null, battery, charging);
+            // Значок активен, пока есть связь хотя бы с одним устройством.
+            bool linked = channel != null || online.Length > 0;
+            Icon icon = TrayIcons.Render(linked, channel == null ? null : battery, charging);
             tray.Icon = icon;
             if (currentIcon != null) currentIcon.Dispose();
             currentIcon = icon;
@@ -558,9 +889,12 @@ namespace HiWebAgent
 
         protected override void ExitThreadCore()
         {
+            exiting = true;
             SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             watcher.Stop();
+            guard.Dispose();
             touchKeyboard.Dispose();
+            cursorWatcher.Dispose();
             lan.Stop();
             connectTimer.Stop();
             statusTimer.Stop();

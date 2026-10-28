@@ -69,6 +69,9 @@ interface RdpListener {
     /** Сервер сообщил размер рабочего стола (графический конвейер); обычно он отличается от запрошенного. */
     fun onDesktopSize(width: Int, height: Int) {}
 
+    /** Программа на ПК открыла или закрыла камеру устройства (канал rdpecam). Вызывается из потока RDP. */
+    fun onCameraActive(active: Boolean) {}
+
     /** Соединение закрыто. [error] == null при штатном отключении. */
     fun onClosed(error: String?)
 }
@@ -89,6 +92,10 @@ class RdpClient(
     private val drive: DriveStorage? = null,
     /** Дополнительные динамические каналы по имени (например, канал агента на ПК). */
     private val dynamicChannels: Map<String, DvcHandler> = emptyMap(),
+    /** Если задан, микрофон устройства можно передавать на ПК (канал audin) через [setMicrophone]. */
+    private val audioSource: AudioSource? = null,
+    /** Если задана, камера устройства доступна программам Windows (канал rdpecam). */
+    private val camera: EcamCamera? = null,
     /** Канал rdpdr нужен и без папки устройства: во время сеанса можно подключить диск через [attachDrive]. */
     private val attachableDrives: Boolean = false,
 ) {
@@ -119,6 +126,7 @@ class RdpClient(
     private var dvc: DynamicChannel? = null
     private var clip: ClipboardChannel? = null
     private var sound: SoundChannel? = null
+    private var audin: AudinChannel? = null
     private var driveChannel: DriveChannel? = null
     private val channelSendLock = Any()
     private val clipUsed = cfg.clipboard || cfg.fileTransfer
@@ -180,6 +188,28 @@ class RdpClient(
     /** Диск объявлен серверу (виден в Windows как \\tsclient\имя). */
     fun isDriveAnnounced(id: Int): Boolean = driveChannel?.isAnnounced(id) == true
 
+    /** Пользователь включил микрофон: запоминается и применяется к каналу audin, когда он появится. */
+    @Volatile private var micArmed = false
+
+    /**
+     * Включает или выключает передачу звука микрофона устройства на ПК (канал audin). Windows открывает
+     * канал, только когда программа начинает запись, поэтому включение работает и до его открытия.
+     * false — микрофон для сеанса не предусмотрен или не запустился.
+     */
+    fun setMicrophone(on: Boolean): Boolean {
+        if (audioSource == null) return false
+        micArmed = on
+        return audin?.setEnabled(on) ?: true
+    }
+
+    /** Перечислитель камер текущего подключения: через него Windows узнаёт, какие камеры появились и пропали. */
+    @Volatile private var ecam: EcamEnumerator? = null
+
+    /** Набор камер планшета изменился (включение, выключение, настройки): Windows получает разницу. Можно звать из любого потока. */
+    fun refreshCameras() {
+        runCatching { inputExecutor.execute { runCatching { ecam?.refresh() } } }
+    }
+
     fun start() {
         thread = Thread({ run() }, "rdp-session").apply { isDaemon = true; start() }
     }
@@ -190,6 +220,8 @@ class RdpClient(
         inputExecutor.shutdown()
         stopFileChannels()
         audioSink?.stop()
+        audioSource?.stop()
+        camera?.stopAll()
         runCatching { socket?.close() }
     }
 
@@ -218,6 +250,8 @@ class RdpClient(
             inputExecutor.shutdown()
             stopFileChannels()
             audioSink?.stop()
+            audioSource?.stop()
+            camera?.stopAll()
             dvc?.closeAll()
             listener.onClosed(if (closedByUser) null else error ?: errorInfoText(errorInfo))
         }
@@ -394,6 +428,20 @@ class RdpClient(
                 handlers = buildMap {
                     put(MouseCursorChannel.CHANNEL_NAME, MouseCursorChannel { listener.onCursor(it) })
                     putAll(dynamicChannels)
+                    if (audioSource != null) {
+                        put(AudinChannel.CHANNEL_NAME, AudinChannel(audioSource, log = { Log.i(TAG, "audin: $it") }).also {
+                            audin = it
+                            if (micArmed) it.setEnabled(true)
+                        })
+                    }
+                    if (camera != null) {
+                        // Камеры анонсируются по каналу-перечислителю; канал устройства Windows откроет сама.
+                        put(
+                            EcamEnumerator.CHANNEL_NAME,
+                            EcamEnumerator(camera, ECAM_DEVICE_PREFIX, onDevices = { Log.i(TAG, "rdpecam: камер для Windows ${it.size}") }, log = { Log.i(TAG, "rdpecam: $it") })
+                                .also { ecam = it },
+                        )
+                    }
                     if (cfg.gfx) {
                         // Без графического конвейера Windows по DisplayControl меняет размер у себя, но не
                         // сообщает его клиенту (нет повторного Demand Active), поэтому канал берём только с GFX.
@@ -406,6 +454,24 @@ class RdpClient(
                             }) { l, t, w, h, argb -> listener.onBitmap(l, t, w, h, argb) },
                         )
                     }
+                },
+                // Канал устройства камеры Windows открывает несколько раз сразу: обработчик на каждый,
+                // состояние потока у них общее; у каждой камеры планшета свой канал и своё состояние.
+                factories = if (camera == null) emptyMap() else {
+                    val active = java.util.concurrent.atomic.AtomicInteger()
+                    // Каналы заведены на все камеры: какие из них видны Windows, решает перечислитель по `devices()`.
+                    camera.catalog().mapIndexed { index, (cameraId, _) ->
+                        val shared = EcamShared()
+                        EcamEnumerator.channelName(ECAM_DEVICE_PREFIX, index) to {
+                            EcamDevice(
+                                camera, cameraId,
+                                // При переключении новая камера может стартовать раньше остановки прежней: считаем потоки.
+                                onActive = { on -> listener.onCameraActive(if (on) active.incrementAndGet() > 0 else active.decrementAndGet() > 0) },
+                                log = { Log.i(TAG, "rdpecam-dev[$cameraId]: $it") },
+                                shared = shared,
+                            ) as DvcHandler
+                        }
+                    }.toMap()
                 },
             )
         }
@@ -528,8 +594,10 @@ class RdpClient(
         // Автовход только если заданы и имя, и пароль; иначе сервер покажет экран входа Windows.
         val autoLogon = user.isNotEmpty() && cfg.password.isNotEmpty()
         // 0x80000 — INFO_NOAUDIOPLAYBACK: без звука сервер не создаёт в сеансе аудиоустройство.
+        // 0x200000 — INFO_AUDIOCAPTURE: без него Windows не публикует в сеансе устройство записи,
+        // и канал audin ей не нужен — микрофон планшета остался бы без получателя.
         val flags = 0x01 or 0x02 or (if (autoLogon) 0x08 else 0) or 0x10 or 0x20 or 0x40 or 0x100 or 0x10000 or
-            (if (audioSink == null) 0x80000 else 0)
+            (if (audioSink == null) 0x80000 else 0) or (if (audioSource != null) 0x200000 else 0)
         fun str(s: String) = s.toByteArray(Charsets.UTF_16LE)
         val d = str(if (autoLogon) domain else ""); val u = str(if (autoLogon) user else ""); val p = str(if (autoLogon) cfg.password else "")
         val w = ByteWriter()
@@ -876,6 +944,12 @@ class RdpClient(
         ByteWriter().u32le(0).u16le(0x8001).u16le(flags).u16le(x.coerceIn(0, deskW - 1)).u16le(y.coerceIn(0, deskH - 1)).toByteArray(),
     )
 
+    /** Боковая кнопка мыши (TS_POINTERX_EVENT): [button] — [PTRX_BACK] или [PTRX_FORWARD]. Возможность MOUSEX объявлена в capability ввода. */
+    fun sendMouseX(button: Int, down: Boolean, x: Int, y: Int) = enqueueInput(
+        ByteWriter().u32le(0).u16le(0x8002).u16le(button or if (down) PTR_DOWN else 0)
+            .u16le(x.coerceIn(0, deskW - 1)).u16le(y.coerceIn(0, deskH - 1)).toByteArray(),
+    )
+
     /** Синхронизация индикаторов: Scroll=1, Num=2, Caps=4. */
     fun sendToggleState(flags: Int) {
         if (flags == lastToggle) return
@@ -983,6 +1057,9 @@ class RdpClient(
 
     companion object {
         private const val TAG = "RDP"
+        /** Имя динамического канала камеры, анонсируемое серверу (любое, главное — без пробелов). */
+        /** Каналы устройств камер: «Camera0», «Camera1»… по порядку в [EcamCamera.catalog]. */
+        private const val ECAM_DEVICE_PREFIX = "Camera"
         private const val CHANNEL_CHUNK = 1600
         private const val POINTER_CACHE_SIZE = 20 // совпадает с размером кэша в Pointer Capability Set
         private const val POINTER_COLOR = 0
@@ -1000,6 +1077,10 @@ class RdpClient(
         const val PTR_MIDDLE = 0x4000
         const val PTR_WHEEL = 0x0200
         const val PTR_HWHEEL = 0x0400
+
+        // Боковые кнопки для sendMouseX: XBUTTON1 («назад» в браузерах и Проводнике) и XBUTTON2 («вперёд»)
+        const val PTRX_BACK = 0x0001
+        const val PTRX_FORWARD = 0x0002
     }
 }
 

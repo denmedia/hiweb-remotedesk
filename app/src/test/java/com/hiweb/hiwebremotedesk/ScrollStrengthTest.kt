@@ -7,25 +7,80 @@ import org.junit.Test
 
 class StrengthLevelsTest {
     @Test
-    fun middle_level_is_the_default_and_equals_one() {
+    fun default_is_one_hundred_percent_and_equals_one() {
+        assertEquals(100, StrengthLevels.DEFAULT)
         assertEquals(1f, StrengthLevels.factor(StrengthLevels.DEFAULT), 1e-6f)
-        assertEquals(100, StrengthLevels.percent(StrengthLevels.DEFAULT))
     }
 
     @Test
-    fun extreme_levels_are_half_and_double() {
+    fun extreme_values_are_half_and_double() {
         assertEquals(0.5f, StrengthLevels.factor(StrengthLevels.MIN), 1e-6f)
         assertEquals(2f, StrengthLevels.factor(StrengthLevels.MAX), 1e-6f)
-        assertEquals(50, StrengthLevels.percent(StrengthLevels.MIN))
-        assertEquals(200, StrengthLevels.percent(StrengthLevels.MAX))
+        assertEquals(StrengthLevels.factor(StrengthLevels.MIN), StrengthLevels.factor(-10), 0f)
+        assertEquals(StrengthLevels.factor(StrengthLevels.MAX), StrengthLevels.factor(999), 0f)
     }
 
     @Test
-    fun levels_grow_monotonically_and_out_of_range_is_clamped() {
-        val all = (StrengthLevels.MIN..StrengthLevels.MAX).map { StrengthLevels.factor(it) }
-        for (i in 1 until all.size) assertTrue(all[i] > all[i - 1])
-        assertEquals(StrengthLevels.factor(StrengthLevels.MIN), StrengthLevels.factor(-10), 0f)
-        assertEquals(StrengthLevels.factor(StrengthLevels.MAX), StrengthLevels.factor(99), 0f)
+    fun snap_gives_multiples_of_ten_inside_the_range() {
+        assertEquals(60, StrengthLevels.snap(59.46f))
+        assertEquals(100, StrengthLevels.snap(104f))
+        assertEquals(110, StrengthLevels.snap(105f))
+        assertEquals(StrengthLevels.MIN, StrengthLevels.snap(10f))
+        assertEquals(StrengthLevels.MAX, StrengthLevels.snap(300f))
+        for (p in StrengthLevels.MIN..StrengthLevels.MAX) assertEquals(0, StrengthLevels.snap(p.toFloat()) % StrengthLevels.STEP)
+    }
+
+    @Test
+    fun hundred_percent_is_the_owners_tuned_base() {
+        assertEquals(0.84f, StrengthLevels.inertiaFactor(100), 0.001f)
+        // Мышь: прежний уровень 2 из версии 3 (4 · 2^(-3/4) исходной единицы, на экране было 59%).
+        assertEquals(4f * Math.pow(2.0, -0.75).toFloat(), StrengthLevels.mouseFactor(100), 1e-5f)
+    }
+}
+
+class StrengthScaleMigrationTest {
+    @Test
+    fun the_tuned_mouse_level_becomes_one_hundred_percent() {
+        assertEquals(100, StrengthLevels.mouseFromLevel(2, 3))
+        assertEquals(80, StrengthLevels.mouseFromLevel(1, 3))
+        assertEquals(170, StrengthLevels.mouseFromLevel(5, 3))
+        assertEquals(StrengthLevels.MAX, StrengthLevels.mouseFromLevel(9, 3))
+    }
+
+    @Test
+    fun mouse_speed_is_preserved_within_rounding_for_every_version() {
+        // Фактическая скорость в исходных единицах: уровень · опорная величина версии.
+        val bases = mapOf(1 to 1f, 2 to 2f, 3 to 4f)
+        for ((version, base) in bases) {
+            for (level in 1..9) {
+                val before = base * Math.pow(2.0, (level - 5) / 4.0).toFloat()
+                val percent = StrengthLevels.mouseFromLevel(level, version)
+                if (percent == StrengthLevels.MIN || percent == StrengthLevels.MAX) continue // прижато к краю ползунка
+                val after = StrengthLevels.mouseFactor(percent)
+                assertTrue("v$version level $level: $before vs $after", Math.abs(after - before) / before <= 0.06f)
+            }
+        }
+    }
+
+    @Test
+    fun inertia_and_scroll_levels_keep_their_values() {
+        assertEquals(100, StrengthLevels.inertiaFromLevel(5, 2))
+        assertEquals(100, StrengthLevels.inertiaFromLevel(4, 1))
+        assertEquals(120, StrengthLevels.inertiaFromLevel(5, 1))
+        assertEquals(100, StrengthLevels.percentFromLevel(5))
+        assertEquals(StrengthLevels.MIN, StrengthLevels.percentFromLevel(1))
+        assertEquals(StrengthLevels.MAX, StrengthLevels.percentFromLevel(9))
+        assertEquals(80, StrengthLevels.percentFromLevel(4))
+    }
+
+    @Test
+    fun migrated_values_stay_inside_the_slider_and_on_the_step() {
+        for (version in 1..3) for (level in 1..9) {
+            for (p in listOf(StrengthLevels.mouseFromLevel(level, version), StrengthLevels.inertiaFromLevel(level, version), StrengthLevels.percentFromLevel(level))) {
+                assertTrue(p in StrengthLevels.MIN..StrengthLevels.MAX)
+                assertEquals(0, p % StrengthLevels.STEP)
+            }
+        }
     }
 }
 

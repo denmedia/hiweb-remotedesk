@@ -23,11 +23,26 @@ data class Device(
     val useNla: Boolean = true,
     /** Масштаб интерфейса Windows в процентах (100–300), применяется при подключении. */
     val scalePercent: Int = 100,
-    /** Сила прокрутки пальцами и сила её инерции (уровни 1–9, 5 — по умолчанию), отдельно для каждого ПК. */
-    val scrollLevel: Int = StrengthLevels.DEFAULT,
-    val inertiaLevel: Int = StrengthLevels.DEFAULT,
+    /** Сила прокрутки пальцами и сила её инерции, % (50–200 с шагом 10, 100 — по умолчанию), отдельно для каждого ПК. */
+    val scrollPercent: Int = StrengthLevels.DEFAULT,
+    val inertiaPercent: Int = StrengthLevels.DEFAULT,
+    /**
+     * Скорость перемещения физической (Bluetooth) мыши, % (50–200 с шагом 10, 100 — по умолчанию).
+     * Тачпад чехла идёт своим путём со своим ускорением и этой настройкой не затрагивается.
+     */
+    val mouseSpeedPercent: Int = StrengthLevels.DEFAULT,
+    /** Скорость прокрутки колёсиком физической мыши, % (50–200 с шагом 10; 100 — один щелчок колеса как у Windows). */
+    val mouseWheelPercent: Int = StrengthLevels.DEFAULT,
     /** Обмен файлами через буфер обмена: копирование на ПК (Ctrl+C) и с планшета с вставкой (Ctrl+V). */
     val fileTransfer: Boolean = true,
+    /** Микрофон планшета доступен Windows в сеансе (канал audin, устройство «Микрофон … (перенаправлено)»). */
+    val microphone: Boolean = false,
+    /** Камера планшета доступна программам Windows (канал rdpecam). */
+    val camera: Boolean = false,
+    /** Идентификаторы камер планшета (`CameraSource.catalog`), которые НЕ показываются Windows; остальные — показываются. */
+    val cameraOff: Set<String> = emptySet(),
+    /** Дополнительный поворот кадра камеры по часовой стрелке (0/90/180/270°) поверх автоматического; ключ — идентификатор камеры. */
+    val cameraRotation: Map<String, Int> = emptyMap(),
     /** Общий диск: папка планшета подключается к Windows как сетевой диск \\tsclient\имя. */
     val driveEnabled: Boolean = false,
     /** Адрес выбранной папки (дерево документов Android); без него диск не подключается. */
@@ -51,5 +66,8 @@ data class Device(
         val COLOR_DEPTHS = listOf(16, 24, 32)
         const val DEFAULT_COLOR_DEPTH = 16
         const val DEFAULT_DRIVE_NAME = "Tablet"
+
+        /** Допустимые дополнительные повороты кадра камеры, градусы по часовой стрелке. */
+        val CAMERA_ROTATIONS = listOf(0, 90, 180, 270)
     }
 }
