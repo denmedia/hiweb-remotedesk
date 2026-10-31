@@ -8,7 +8,9 @@ interface AudioSink {
 
 /**
  * Статический виртуальный канал «rdpsnd» (MS-RDPEA): звук Windows на устройстве.
- * Из форматов сервера предлагаются только несжатый PCM 16 бит (моно/стерео), поэтому декодеры не нужны.
+ * По умолчанию из форматов сервера принимается только несжатый PCM 16 бит (моно/стерео). С [compressed] клиент
+ * принимает ещё IMA/MS ADPCM и G.711 (см. [AudioCodecs]) и ставит их выше PCM: Windows выбирает формат из списка
+ * клиента, поэтому звук идёт сжатым, а на плеер он попадает уже разжатым в PCM.
  * Подтверждение блока уходит серверу после того, как [AudioSink] принял данные, — это и есть управление потоком.
  */
 internal class SoundChannel(
@@ -17,8 +19,10 @@ internal class SoundChannel(
     private val sink: AudioSink,
     private val clock: () -> Long = System::currentTimeMillis,
     private val log: (String) -> Unit = {},
+    /** Принимать сжатые форматы звука (настройка «Сжатие звука»). */
+    private val compressed: Boolean = false,
 ) {
-    private class Format(val channels: Int, val sampleRate: Int)
+    private class Format(val channels: Int, val sampleRate: Int, val decoder: AudioDecoder?)
 
     private class PendingWave(val timestamp: Int, val formatNo: Int, val blockNo: Int, val head: ByteArray)
 
@@ -93,24 +97,20 @@ internal class SoundChannel(
         r.skip(1)
         val serverVersion = r.u16le()
         r.skip(1)
+        val offered = ArrayList<WaveFormat>()
+        repeat(count) { offered += WaveFormat.read(r) }
+        // Порядок в ответе — предпочтение клиента, а номер формата в WaveInfo считается по ответу, а не по списку сервера.
+        // Сортировка устойчивая: внутри одного ранга сохраняется порядок сервера.
+        val chosen = offered.mapNotNull { f -> AudioCodecs.rank(f, compressed)?.let { it to f } }.sortedBy { it.first }.map { it.second }
         val accepted = ArrayList<Format>()
         val wire = ByteWriter()
-        repeat(count) {
-            val tag = r.u16le()
-            val channels = r.u16le()
-            val rate = r.u32le().toInt()
-            val avg = r.u32le()
-            val align = r.u16le()
-            val bits = r.u16le()
-            val extra = r.u16le()
-            val extraData = r.bytes(extra)
-            if (tag == WAVE_FORMAT_PCM && bits == 16 && (channels == 1 || channels == 2) && rate in 8000..48000) {
-                accepted += Format(channels, rate)
-                wire.u16le(tag).u16le(channels).u32le(rate).u32le(avg).u16le(align).u16le(bits).u16le(extra).bytes(extraData)
-            }
+        for (f in chosen) {
+            accepted += Format(f.channels, f.sampleRate, AudioCodecs.codec(f))
+            wire.bytes(f.toBytes())
         }
         formats = accepted
-        log("server formats=$count version=$serverVersion, accepted PCM=${accepted.size}")
+        log("server formats=$count version=$serverVersion: ${offered.joinToString()}")
+        log("accepted=${accepted.size} (сжатые=${accepted.count { it.decoder != null }}, compressed=$compressed)")
         val version = minOf(serverVersion, CLIENT_VERSION)
         val body = ByteWriter()
             .u32le(TSSNDCAPS_ALIVE or TSSNDCAPS_VOLUME).u32le(0xFFFFFFFFL).u32le(0).u16le(0)
@@ -133,7 +133,9 @@ internal class SoundChannel(
             val ts = (wave.timestamp + (clock() - started).toInt()) and 0xFFFF
             reply(SNDC_WAVECONFIRM, ByteWriter().u16le(ts).u8(wave.blockNo).u8(0).toByteArray())
         }
-        if (format == null || pcm.isEmpty()) confirm() else sink.play(format.sampleRate, format.channels, pcm, confirm)
+        // Разжатие — здесь, в потоке чтения сети: ADPCM и G.711 дешёвые, а плеер получает всегда обычный PCM.
+        val samples = if (format?.decoder == null) pcm else runCatching { format.decoder.decode(pcm) }.getOrDefault(ByteArray(0))
+        if (format == null || samples.isEmpty()) confirm() else sink.play(format.sampleRate, format.channels, samples, confirm)
     }
 
     private fun reply(type: Int, body: ByteArray) {
@@ -154,7 +156,6 @@ internal class SoundChannel(
 
         private const val TSSNDCAPS_ALIVE = 1
         private const val TSSNDCAPS_VOLUME = 2
-        private const val WAVE_FORMAT_PCM = 1
         private const val QUALITY_HIGH = 2
         private const val CLIENT_VERSION = 6
     }

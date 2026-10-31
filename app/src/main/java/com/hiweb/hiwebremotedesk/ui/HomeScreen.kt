@@ -367,6 +367,9 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                 r.action == "block" -> r.error.ifBlank { "Не удалось заблокировать ${r.cidr}" }
                 r.action == "unblock" && r.ok -> "Подсеть ${r.cidr} разблокирована"
                 r.action == "unblock" -> r.error.ifBlank { "Не удалось разблокировать ${r.cidr}" }
+                // Успех у этих команд виден по обновившемуся списку и настройкам; сказать нужно, только если агент отказал.
+                (r.action == "trust" || r.action == "untrust" || r.action == "settings") && !r.ok ->
+                    r.error.ifBlank { "Агент не принял команду" }
                 else -> null
             }
             if (text != null) snackbar.showSnackbar(text)
@@ -388,7 +391,11 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                     send(com.hiweb.hiwebremotedesk.agent.GuardHub.block(id, cidr, enableFirewall), "Подтвердите запрос Windows на ПК: $cidr")
                 },
                 onUnblock = { cidr -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.unblock(id, cidr), "Подтвердите запрос Windows на ПК: $cidr") },
-                onTrust = { ip -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.trust(id, ip), "Адрес $ip отмечен как свой") },
+                onTrust = { target -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.trust(id, target), "${com.hiweb.hiwebremotedesk.data.GuardText.cidr(target)} отправлен в белый список на ПК") },
+                onUntrust = { cidr -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.untrust(id, cidr), "${com.hiweb.hiwebremotedesk.data.GuardText.cidr(cidr)} убирается из белого списка на ПК") },
+                onConfigure = { mode, autoLearn, learnSubnet ->
+                    send(com.hiweb.hiwebremotedesk.agent.GuardHub.configure(id, mode, autoLearn, learnSubnet), "Настройки защиты отправлены")
+                },
                 onKeep = { threat -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.dismiss(id, threat), "Угроза оставлена без действий") },
                 onDismiss = { com.hiweb.hiwebremotedesk.data.GuardNavigation.open.value = null },
             )

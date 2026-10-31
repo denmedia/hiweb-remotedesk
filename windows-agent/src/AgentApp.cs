@@ -535,7 +535,10 @@ namespace HiWebAgent
             if (threatId != null) guardForm.ShowThreats(threatId);
         }
 
-        /// <summary>Команда устройства (сообщение guard): sync, block, unblock, trust, dismiss. Выполняется в потоке интерфейса.</summary>
+        /// <summary>
+        /// Команда устройства (сообщение guard): sync, block, unblock, trust, untrust, settings, dismiss. Выполняется в потоке
+        /// интерфейса. На trust/untrust/settings всегда приходит guard_result: ошибка нужна устройству, чтобы показать её.
+        /// </summary>
         void OnGuardCommand(Dictionary<string, object> msg, Action<Dictionary<string, object>> reply)
         {
             string action = Str(msg, "do");
@@ -556,7 +559,16 @@ namespace HiWebAgent
                     guard.Unblock(unblock, error => reply(GuardResult(action, unblock, error)));
                     break;
                 case "trust":
-                    guard.Trust(Str(msg, "ip"));
+                    // Адрес («ip», как раньше) или подсеть («cidr»).
+                    string trustTarget = Str(msg, "cidr") ?? Str(msg, "ip");
+                    reply(GuardResult(action, trustTarget, guard.Trust(trustTarget ?? "")));
+                    break;
+                case "untrust":
+                    string untrustTarget = Str(msg, "cidr") ?? Str(msg, "ip");
+                    reply(GuardResult(action, untrustTarget, guard.Untrust(untrustTarget)));
+                    break;
+                case "settings":
+                    reply(GuardResult(action, "", guard.Configure(Str(msg, "mode"), OptBool(msg, "autoLearn"), OptBool(msg, "learnSubnet"))));
                     break;
                 case "dismiss":
                     guard.Dismiss(Str(msg, "id"));
@@ -931,6 +943,13 @@ namespace HiWebAgent
         {
             object v;
             return msg.TryGetValue(key, out v) && v != null ? v.ToString() : null;
+        }
+
+        static bool? OptBool(Dictionary<string, object> msg, string key)
+        {
+            object v;
+            if (msg.TryGetValue(key, out v) && v is bool) return (bool)v;
+            return null;
         }
 
         static bool Bool(Dictionary<string, object> msg, string key, bool fallback)

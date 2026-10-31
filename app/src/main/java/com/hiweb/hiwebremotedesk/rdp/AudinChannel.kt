@@ -17,8 +17,9 @@ interface AudioSource {
 
 /**
  * Динамический канал «AUDIO_INPUT» (MS-RDPEAI): звук микрофона устройства уходит на ПК.
- * Поток односторонний — от клиента к серверу, поэтому Форматы, которые предлагает сервер, клиент
- * фильтрует до несжатого PCM 16 бит: кодировать в AAC/Opus не нужно, а Windows принимает PCM.
+ * Поток односторонний — от клиента к серверу. По умолчанию из форматов сервера принимается только несжатый PCM
+ * 16 бит; с [compressed] — ещё IMA/MS ADPCM и G.711 (см. [AudioCodecs]), и они ставятся выше PCM: сжатие
+ * делает сам клиент, поэтому поток в 4 раза (ADPCM) или вдвое (G.711) меньше.
  * Передача включается только по просьбе пользователя: канал открыт, форматы согласованы, но пока
  * микрофон выключен, в сеть ничего не уходит.
  * Раскладки PDU взяты из MS-RDPEAI и сверены с channels/audin в FreeRDP.
@@ -27,13 +28,18 @@ internal class AudinChannel(
     private val source: AudioSource,
     /** Отправляет сообщение динамического канала целиком; фрагментацию делает drdynvc. */
     private val log: (String) -> Unit = {},
+    /** Принимать сжатые форматы звука (настройка «Сжатие звука»). */
+    private val compressed: Boolean = false,
 ) : DvcHandler {
-    private class Format(val channels: Int, val sampleRate: Int, val bits: Int, val raw: ByteArray)
+    private class Format(val channels: Int, val sampleRate: Int, val bits: Int, val raw: ByteArray, val wave: WaveFormat)
 
     private var write: ((ByteArray) -> Unit)? = null
     private var formats = emptyList<Format>()
     private var current: Format? = null
     private var framesPerPacket = 0
+
+    /** Кодер текущего сжатого формата; у PCM его нет. Свой на каждый запуск захвата: ADPCM копит хвост блока. */
+    @Volatile private var encoder: AudioEncoder? = null
 
     /** Пользователь включил передачу; до прихода OPEN от сервера захват ждёт в [current]. */
     @Volatile private var enabled = false
@@ -105,25 +111,27 @@ internal class AudinChannel(
             log("недопустимое число форматов $count")
             return
         }
+        val offered = ArrayList<WaveFormat>()
+        repeat(count) { offered += WaveFormat.read(r) }
+        // Порядок в ответе — предпочтение клиента: сервер открывает поток по номеру формата из ответа.
+        // Сортировка устойчивая: внутри одного ранга сохраняется порядок сервера.
+        val chosen = offered.mapNotNull { f -> AudioCodecs.rank(f, compressed)?.let { it to f } }.sortedBy { it.first }.map { it.second }
         val accepted = ArrayList<Format>()
-        repeat(count) {
-            val tag = r.u16le()
-            val channels = r.u16le()
-            val rate = r.u32le().toInt()
-            r.u32le() // nAvgBytesPerSec
-            r.u16le() // nBlockAlign
-            val bits = r.u16le()
-            val extra = r.bytes(r.u16le())
-            val raw = ByteWriter()
-                .u16le(tag).u16le(channels).u32le(rate).u32le(rate.toLong() * channels * bits / 8)
-                .u16le(channels * bits / 8).u16le(bits).u16le(extra.size).bytes(extra).toByteArray()
-            if (tag == WAVE_FORMAT_PCM && bits == 16 && channels in 1..2 && rate in MIN_RATE..MAX_RATE) {
-                accepted += Format(channels, rate, bits, raw)
+        for (f in chosen) {
+            // PCM пересчитывается как раньше, у сжатых поля остаются теми, что прислал сервер.
+            val raw = if (f.tag == WAVE_FORMAT_PCM) {
+                ByteWriter()
+                    .u16le(f.tag).u16le(f.channels).u32le(f.sampleRate).u32le(f.sampleRate.toLong() * f.channels * f.bits / 8)
+                    .u16le(f.channels * f.bits / 8).u16le(f.bits).u16le(f.extra.size).bytes(f.extra).toByteArray()
+            } else {
+                f.toBytes()
             }
+            accepted += Format(f.channels, f.sampleRate, f.bits, raw, f)
         }
         formats = accepted
         current = null
-        log("предложено форматов $count, принято PCM ${accepted.size}")
+        log("предложено форматов $count: ${offered.joinToString()}")
+        log("принято ${accepted.size} (сжатых ${accepted.count { it.wave.tag != WAVE_FORMAT_PCM }}, compressed=$compressed)")
         // Сервер ждёт подтверждения приёма данных, а затем список согласованных форматов.
         reply(byteArrayOf(DATA_INCOMING.toByte()))
         val body = ByteWriter()
@@ -176,10 +184,14 @@ internal class AudinChannel(
         val format = current ?: return false
         if (closed) return false
         if (capturing) return true
+        encoder = AudioCodecs.codec(format.wave)
         val started = runCatching { source.start(format.sampleRate, format.channels) { pcm -> sendPcm(pcm) } }
             .getOrDefault(false)
         capturing = started
-        log(if (started) "микрофон включён: ${format.sampleRate} Гц, ${format.channels} кан." else "микрофон не запустился")
+        log(
+            if (started) "микрофон включён: ${format.sampleRate} Гц, ${format.channels} кан., формат ${format.wave}"
+            else "микрофон не запустился",
+        )
         if (!started) enabled = false
         return started
     }
@@ -188,16 +200,29 @@ internal class AudinChannel(
         if (!capturing) return
         capturing = false
         runCatching { source.stop() }
+        encoder = null
         log("микрофон выключен")
     }
 
-    /** Блок PCM уходит серверу частями по framesPerPacket кадров (так же делает FreeRDP). */
-    private fun sendPcm(pcm: ByteArray) {
+    /**
+     * Блок PCM уходит серверу частями по framesPerPacket кадров (так же делает FreeRDP). Сжатый формат сперва
+     * проходит кодер; его пакеты — целые блоки ADPCM или кадры G.711, а не отсчёты PCM.
+     */
+    private fun sendPcm(raw: ByteArray) {
         val format = current ?: return
         val out = write ?: return
         if (closed || !enabled) return
+        val enc = encoder
+        // Кодер сбрасывается при остановке захвата: запоздавший блок нельзя отправлять как PCM в сжатом формате.
+        if (enc == null && format.wave.tag != WAVE_FORMAT_PCM) return
+        val pcm = if (enc == null) raw else enc.encode(raw)
+        if (pcm.isEmpty()) return
         val frame = format.channels * format.bits / 8
-        val chunk = if (framesPerPacket > 0) framesPerPacket * frame else pcm.size
+        val chunk = when {
+            enc != null -> enc.packetBytes(framesPerPacket).let { if (it > 0) it else pcm.size }
+            framesPerPacket > 0 -> framesPerPacket * frame
+            else -> pcm.size
+        }
         if (chunk <= 0) return
         var off = 0
         do {
@@ -234,8 +259,6 @@ internal class AudinChannel(
         private const val RESULT_ERROR = 1L
 
         private const val WAVE_FORMAT_PCM = 1
-        private const val MIN_RATE = 8000
-        private const val MAX_RATE = 48000
         private const val MAX_FORMATS = 1000
 
         /** framesPerPacket больше этого не имеет смысла: это задержка в десятки секунд. */

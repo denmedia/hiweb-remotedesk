@@ -185,21 +185,22 @@ namespace HiWebAgent
     {
         public List<GuardEntry> Entries = new List<GuardEntry>();
         public List<Threat> Threats = new List<Threat>();
-        public bool State;                       // изменились заблокированные подсети, свои адреса или брандмауэр
+        public bool State;                       // изменились заблокированные подсети, белый список, настройки или брандмауэр
         public List<Threat> Announce = new List<Threat>();   // новые угрозы, о которых стоит сказать сразу
     }
 
     /// <summary>
     /// Защита RDP: журнал подключений к ПК, обнаружение подбора пароля и входов с неизвестных адресов
-    /// (<see cref="ThreatDetector"/>), блокировка подсетей через брандмауэр (<see cref="FirewallRules"/>).
+    /// (<see cref="ThreatDetector"/>), белый список знакомых адресов и подсетей (<see cref="Whitelist"/>, режим —
+    /// <see cref="GuardSettings"/>), блокировка подсетей через брандмауэр (<see cref="FirewallRules"/>).
     /// Все данные меняются только в потоке интерфейса; события журнала Windows из потока пула передаются туда через
-    /// [ui]. Журнал и угрозы хранятся в %LOCALAPPDATA%\HiWebAgent\guard.json: после перезапуска агента история на месте.
+    /// [ui]. Журнал, угрозы, список и настройки хранятся в %LOCALAPPDATA%\HiWebAgent\guard.json: после перезапуска
+    /// агента всё на месте.
     /// </summary>
     sealed class ConnectionGuard : IDisposable
     {
         const int MAX_ENTRIES = 500;
         const int MAX_THREATS = 100;
-        const int MAX_TRUSTED = 200;
         const int BATCH = 40;
         const long MERGE_MS = 10 * 60 * 1000;
         const long CATCH_UP_DEFAULT_MS = 24L * 60 * 60 * 1000;
@@ -213,8 +214,11 @@ namespace HiWebAgent
         readonly string path = Path.Combine(AgentInfo.InstallDir, "guard.json");
         readonly List<GuardEntry> entries = new List<GuardEntry>();
         readonly List<Threat> threats = new List<Threat>();
-        readonly List<string> trusted = new List<string>();
+        readonly Whitelist whitelist = new Whitelist();
+        readonly GuardSettings settings = new GuardSettings();
         readonly Dictionary<string, long> seen = new Dictionary<string, long>();
+        /// <summary>Записи списка, добавленные детектором с прошлого сообщения устройствам.</summary>
+        readonly List<string> learnedNow = new List<string>();
         readonly ThreatDetector detector;
         readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer();
         RdpEventSource source;
@@ -232,7 +236,7 @@ namespace HiWebAgent
         public ConnectionGuard(SynchronizationContext ui)
         {
             this.ui = ui;
-            detector = new ThreatDetector(IsTrusted, delegate { return trusted; }, delegate(string ip) { AddTrusted(ip); });
+            detector = new ThreatDetector(whitelist, settings, OnLearned);
             Load();
             foreach (Threat t in threats) detector.Remember(t);
             tick.Interval = 5000;
@@ -264,6 +268,27 @@ namespace HiWebAgent
             get { return new List<BlockedRange>(blocked); }
         }
 
+        /// <summary>Знакомые адреса и подсети (белый список).</summary>
+        public List<WhitelistEntry> WhitelistEntries
+        {
+            get { return whitelist.Entries; }
+        }
+
+        public string Mode
+        {
+            get { return settings.Mode; }
+        }
+
+        public bool AutoLearn
+        {
+            get { return settings.AutoLearn; }
+        }
+
+        public bool LearnSubnet
+        {
+            get { return settings.LearnSubnet; }
+        }
+
         /// <summary>Число угроз, по которым пользователь ещё ничего не решил.</summary>
         public int OpenThreats
         {
@@ -292,6 +317,7 @@ namespace HiWebAgent
             var update = new GuardUpdate();
             foreach (RawRdpEvent raw in source.ReadSince(from)) Ingest(raw, false, update);
             AddThreats(detector.Tick(now), update);
+            FlushLearned(update);
             Log.Write("guard: history from " + from + ", " + entries.Count + " entries, " + threats.Count + " threats");
             tick.Start();
             RefreshFirewall();
@@ -416,6 +442,20 @@ namespace HiWebAgent
             long now = PairedDevice.NowMs();
             foreach (Threat t in found)
             {
+                // Пока прежняя угроза по этой подсети ещё ждёт решения, новая тревога обновляет её, а не заводит вторую
+                // (атака идёт часами — уведомлять каждый час о том же незачем). Подбор после «адреса вне списка» — та же угроза, но серьёзнее.
+                Threat open = OpenThreatFor(t);
+                if (open != null)
+                {
+                    open.Rule = t.Rule;
+                    open.Time = t.Time;
+                    open.Ip = t.Ip;
+                    open.Count = t.Count;
+                    open.User = t.User;
+                    open.AfterFail = open.AfterFail || t.AfterFail;
+                    if (!update.Threats.Contains(open)) update.Threats.Add(open);
+                    continue;
+                }
                 threats.Add(t);
                 update.Threats.Add(t);
                 if (now - t.Time < ANNOUNCE_MAX_AGE_MS) update.Announce.Add(t);
@@ -424,10 +464,21 @@ namespace HiWebAgent
             if (threats.Count > MAX_THREATS) threats.RemoveRange(0, threats.Count - MAX_THREATS);
         }
 
+        Threat OpenThreatFor(Threat t)
+        {
+            foreach (Threat o in threats)
+            {
+                if (o.Status != Threat.StatusNew || o.Cidr != t.Cidr) continue;
+                if (o.Rule == t.Rule || o.Rule == Threat.Unlisted && t.Rule == Threat.BruteForce) return o;
+            }
+            return null;
+        }
+
         void OnTick()
         {
             var update = new GuardUpdate();
             AddThreats(detector.Tick(PairedDevice.NowMs()), update);
+            FlushLearned(update);
             Raise(update);
             if (unchecked(Environment.TickCount - lastFirewallRefresh) > FIREWALL_REFRESH_MS) RefreshFirewall();
             if (dirty) Save();
@@ -446,36 +497,95 @@ namespace HiWebAgent
 
         bool IsTrusted(string ip)
         {
-            return ip != null && trusted.Contains(ip);
+            return ip != null && whitelist.Contains(ip);
         }
 
-        void AddTrusted(string ip)
+        /// <summary>Адрес запомнен по подключению планшета (из потока детектора, внутри Ingest/OnTick).</summary>
+        void OnLearned(string cidr)
         {
-            if (ip == null || trusted.Contains(ip)) return;
-            trusted.Add(ip);
-            if (trusted.Count > MAX_TRUSTED) trusted.RemoveAt(0);
-            foreach (GuardEntry e in entries) if (e.Ip == ip) e.Trusted = true;
             dirty = true;
-            Log.Write("guard: trusted " + ip);
+            learnedNow.Add(cidr);
+            Log.Write("guard: whitelist +" + cidr + " (auto)");
         }
 
-        /// <summary>«Это я»: адрес считается своим, угрозы с него закрываются.</summary>
-        public void Trust(string ip)
+        /// <summary>
+        /// Пересчитывает у записей журнала признак «знакомый адрес» после изменения списка; изменившиеся записи
+        /// добавляет в [update], чтобы планшет увидел их обновлёнными.
+        /// </summary>
+        void RefreshEntryFlags(GuardUpdate update)
         {
-            string canonical = IpTools.Normalize(ip);
-            if (canonical == null) return;
+            foreach (GuardEntry e in entries)
+            {
+                bool now = IsTrusted(e.Ip);
+                if (e.Trusted == now) continue;
+                e.Trusted = now;
+                if (!update.Entries.Contains(e)) update.Entries.Add(e);
+            }
+        }
+
+        /// <summary>Сообщает об автоматически запомненных адресах и подтягивает записи журнала; зовётся после обработки событий.</summary>
+        void FlushLearned(GuardUpdate update)
+        {
+            if (learnedNow.Count == 0) return;
+            learnedNow.Clear();
+            RefreshEntryFlags(update);
+            update.State = true;
+        }
+
+        /// <summary>
+        /// «Это я» / ручное добавление: адрес или подсеть заносится в белый список, угрозы с него закрываются.
+        /// Возвращает null или текст ошибки (не адрес, подсеть слишком широкая, свой адрес).
+        /// </summary>
+        public string Trust(string text)
+        {
+            string cidr = whitelist.Add(text, WhitelistEntry.Manual, PairedDevice.NowMs());
+            if (cidr == null) return "Нельзя добавить «" + text + "»: нужен публичный адрес или подсеть не шире /16 (IPv6 — /48); адреса своей сети и так считаются своими";
             var update = new GuardUpdate();
-            AddTrusted(canonical);
-            foreach (GuardEntry e in entries) if (e.Ip == canonical) update.Entries.Add(e);
+            RefreshEntryFlags(update);
             foreach (Threat t in threats)
             {
-                if (t.Status != Threat.StatusNew || t.Ip != canonical) continue;
+                IPAddress ip;
+                if (t.Status != Threat.StatusNew || !IpTools.TryParse(t.Ip, out ip) || !IpTools.InCidr(ip, cidr)) continue;
                 t.Status = Threat.StatusTrusted;
                 update.Threats.Add(t);
             }
             update.State = true;
             dirty = true;
+            Log.Write("guard: whitelist +" + cidr + " (manual)");
             Raise(update);
+            return null;
+        }
+
+        /// <summary>Убирает адрес или подсеть из белого списка. Возвращает null или текст ошибки.</summary>
+        public string Untrust(string cidr)
+        {
+            if (!whitelist.Remove(cidr ?? "")) return "Такой записи в белом списке нет";
+            var update = new GuardUpdate();
+            RefreshEntryFlags(update);
+            update.State = true;
+            dirty = true;
+            Log.Write("guard: whitelist -" + cidr);
+            Raise(update);
+            return null;
+        }
+
+        /// <summary>
+        /// Меняет настройки защиты: режим и автоматическое занесение (null — не менять). Возвращает null или текст ошибки.
+        /// </summary>
+        public string Configure(string mode, bool? autoLearn, bool? learnSubnet)
+        {
+            if (mode != null && !GuardMode.IsValid(mode)) return "Неизвестный режим защиты";
+            bool changed = false;
+            if (mode != null && mode != settings.Mode) { settings.Mode = mode; changed = true; }
+            if (autoLearn.HasValue && autoLearn.Value != settings.AutoLearn) { settings.AutoLearn = autoLearn.Value; changed = true; }
+            if (learnSubnet.HasValue && learnSubnet.Value != settings.LearnSubnet) { settings.LearnSubnet = learnSubnet.Value; changed = true; }
+            if (!changed) return null;
+            var update = new GuardUpdate();
+            update.State = true;
+            dirty = true;
+            Log.Write("guard: mode " + settings.Mode + ", autoLearn " + settings.AutoLearn + ", learnSubnet " + settings.LearnSubnet);
+            Raise(update);
+            return null;
         }
 
         /// <summary>Угроза оставлена без действий: больше не беспокоит.</summary>
@@ -505,6 +615,12 @@ namespace HiWebAgent
             if (canonical == null)
             {
                 done("Эту подсеть блокировать нельзя");
+                return;
+            }
+            // Правило блокировки сильнее любых разрешающих: подсеть со знакомым адресом отрезала бы самого владельца.
+            if (whitelist.Overlaps(canonical))
+            {
+                done("В этой подсети есть адреса из белого списка — блокировать её нельзя. Уберите их из списка или заблокируйте отдельный адрес");
                 return;
             }
             ThreadPool.QueueUserWorkItem(delegate
@@ -615,7 +731,19 @@ namespace HiWebAgent
                 list.Add(o);
             }
             msg["blocked"] = list;
-            msg["trusted"] = new List<object>(trusted.ToArray());
+            msg["mode"] = settings.Mode;
+            msg["autoLearn"] = settings.AutoLearn;
+            msg["learnSubnet"] = settings.LearnSubnet;
+            var list2 = new List<object>();
+            foreach (WhitelistEntry w in whitelist.Entries)
+            {
+                var o = new Dictionary<string, object>();
+                o["cidr"] = w.Cidr;
+                o["src"] = w.Source;
+                o["ts"] = w.Time;
+                list2.Add(o);
+            }
+            msg["whitelist"] = list2;
             return msg;
         }
 
@@ -699,7 +827,19 @@ namespace HiWebAgent
                 var seenOut = new Dictionary<string, object>();
                 foreach (KeyValuePair<string, long> pair in seen) seenOut[pair.Key] = pair.Value;
                 root["seen"] = seenOut;
-                root["trusted"] = new List<object>(trusted.ToArray());
+                root["mode"] = settings.Mode;
+            root["autoLearn"] = settings.AutoLearn;
+            root["learnSubnet"] = settings.LearnSubnet;
+            var wl = new List<object>();
+            foreach (WhitelistEntry w in whitelist.Entries)
+            {
+                var o = new Dictionary<string, object>();
+                o["cidr"] = w.Cidr;
+                o["src"] = w.Source;
+                o["ts"] = w.Time;
+                wl.Add(o);
+            }
+            root["whitelist"] = wl;
                 var es = new List<object>();
                 foreach (GuardEntry e in entries)
                 {
@@ -755,7 +895,17 @@ namespace HiWebAgent
                 object seenRaw;
                 var seenIn = root.TryGetValue("seen", out seenRaw) ? seenRaw as Dictionary<string, object> : null;
                 if (seenIn != null) foreach (KeyValuePair<string, object> pair in seenIn) seen[pair.Key] = Convert.ToInt64(pair.Value);
-                foreach (object o in List(root, "trusted")) if (o != null) trusted.Add(o.ToString());
+                string mode = Text(root, "mode");
+                if (mode != null && GuardMode.IsValid(mode)) settings.Mode = mode;
+                if (root.ContainsKey("autoLearn")) settings.AutoLearn = Flag(root, "autoLearn");
+                settings.LearnSubnet = Flag(root, "learnSubnet");
+                foreach (object raw in List(root, "whitelist"))
+                {
+                    var o = raw as Dictionary<string, object>;
+                    if (o != null) whitelist.Load(Text(o, "cidr"), Text(o, "src"), Num(o, "ts"));
+                }
+                // Файл до белого списка: «свои адреса» были просто списком адресов, запомненных по подключению планшета.
+                foreach (object o in List(root, "trusted")) if (o != null) whitelist.Load(o.ToString(), WhitelistEntry.Auto, since);
                 foreach (object raw in List(root, "entries"))
                 {
                     var o = raw as Dictionary<string, object>;

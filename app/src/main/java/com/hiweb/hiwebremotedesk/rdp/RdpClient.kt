@@ -49,6 +49,10 @@ data class RdpConfig(
     val hardwareVideo: Boolean = false,
     /** Windows (а не GNOME) на другом конце графического конвейера: не предлагать версии 10+, см. [GfxChannel]. */
     val gfxClassic: Boolean = false,
+    /** Объявить Windows канал ввода касаниями и пером (RDPEI); пользоваться им или мышью, решает вызывающий. Только Windows. */
+    val touch: Boolean = false,
+    /** Принимать сжатые форматы звука (ADPCM, G.711) в rdpsnd и audin: звук Windows и микрофон идут в 2–4 раза меньшим потоком. */
+    val audioCompression: Boolean = false,
 )
 
 interface RdpListener {
@@ -86,6 +90,12 @@ interface RdpListener {
     /** Программа на ПК открыла или закрыла камеру устройства (канал rdpecam). Вызывается из потока RDP. */
     fun onCameraActive(active: Boolean) {}
 
+    /** Windows открыла (или закрыла) канал ввода касаниями; [pen] — сервер умеет и перо. Вызывается из потока RDP. */
+    fun onTouchChannel(ready: Boolean, pen: Boolean) {}
+
+    /** Координаты планшета начали или перестали уходить на ПК (канал location). Вызывается не из потока интерфейса. */
+    fun onLocationActive(active: Boolean) {}
+
     /** Соединение закрыто. [error] == null при штатном отключении. */
     fun onClosed(error: String?)
 }
@@ -112,6 +122,8 @@ class RdpClient(
     private val camera: EcamCamera? = null,
     /** Канал rdpdr нужен и без папки устройства: во время сеанса можно подключить диск через [attachDrive]. */
     private val attachableDrives: Boolean = false,
+    /** Если задан, координаты устройства можно передавать на ПК (канал location) через [setLocation]. */
+    private val locationSource: LocationSource? = null,
 ) {
     @Volatile private var socket: Socket? = null
     private lateinit var inp: InputStream
@@ -216,12 +228,50 @@ class RdpClient(
         return audin?.setEnabled(on) ?: true
     }
 
+    /** Пользователь включил геолокацию: запоминается и применяется к каналу location, когда Windows его откроет. */
+    @Volatile private var locationArmed = false
+    @Volatile private var location: LocationChannel? = null
+
+    /**
+     * Включает или выключает передачу координат устройства на ПК (канал location). Канал открывает Windows, поэтому
+     * включение работает и до его открытия. false — геолокация для сеанса не предусмотрена или источник не запустился.
+     */
+    fun setLocation(on: Boolean): Boolean {
+        if (locationSource == null) return false
+        locationArmed = on
+        return location?.setEnabled(on) ?: true
+    }
+
+    /** Координаты сейчас уходят на ПК (Windows открыла канал и источник работает). */
+    val locationActive: Boolean get() = location?.active == true
+
     /** Перечислитель камер текущего подключения: через него Windows узнаёт, какие камеры появились и пропали. */
     @Volatile private var ecam: EcamEnumerator? = null
 
     /** Набор камер планшета изменился (включение, выключение, настройки): Windows получает разницу. Можно звать из любого потока. */
     fun refreshCameras() {
         runCatching { inputExecutor.execute { runCatching { ecam?.refresh() } } }
+    }
+
+    /** Канал ввода касаниями текущего подключения (null — не объявлен). */
+    @Volatile private var rdpei: RdpeiChannel? = null
+
+    /** Windows открыла канал касаний и не приостановила ввод: пальцы можно отдавать ей как есть. */
+    val touchReady: Boolean get() = rdpei?.let { it.ready && !it.suspended } == true
+
+    /** Windows принимает ещё и перо. */
+    val penReady: Boolean get() = touchReady && rdpei?.penSupported == true
+
+    /** Кадры касаний пальцами (RDPEI); уходят в порядке поступления, как и остальной ввод. */
+    fun sendTouch(frames: List<TouchFrame>) {
+        val ch = rdpei ?: return
+        enqueueRaw { ch.sendTouch(frames) }
+    }
+
+    /** Кадры пера (RDPEI). */
+    fun sendPen(frames: List<PenFrame>) {
+        val ch = rdpei ?: return
+        enqueueRaw { ch.sendPen(frames) }
     }
 
     fun start() {
@@ -235,6 +285,7 @@ class RdpClient(
         stopFileChannels()
         audioSink?.stop()
         audioSource?.stop()
+        location?.release() ?: locationSource?.stop()
         camera?.stopAll()
         runCatching { socket?.close() }
     }
@@ -425,7 +476,7 @@ class RdpClient(
         driveChannelId = byName[DriveChannel.CHANNEL_NAME] ?: -1
         Log.i(TAG, "static channels: io=$ioChannel clip=$clipChannelId dvc=$dvcChannelId snd=$sndChannelId drive=$driveChannelId")
         if (sndChannelId > 0 && audioSink != null) {
-            sound = SoundChannel(send = { sendChannel(sndChannelId, it) }, sink = audioSink, log = { Log.i(TAG, "rdpsnd: $it") })
+            sound = SoundChannel(send = { sendChannel(sndChannelId, it) }, sink = audioSink, log = { Log.i(TAG, "rdpsnd: $it") }, compressed = cfg.audioCompression)
         }
         if (driveChannelId > 0 && (drive != null || attachableDrives)) {
             driveChannel = DriveChannel(
@@ -442,8 +493,31 @@ class RdpClient(
                 handlers = buildMap {
                     put(MouseCursorChannel.CHANNEL_NAME, MouseCursorChannel { listener.onCursor(it) })
                     putAll(dynamicChannels)
+                    if (cfg.touch) {
+                        // Windows сама открывает канал; пользоваться им или мышью, решает вид (см. touchReady).
+                        put(
+                            RdpeiChannel.CHANNEL_NAME,
+                            RdpeiChannel(
+                                log = { Log.i(TAG, "rdpei: $it") },
+                                onState = { ok, pen -> listener.onTouchChannel(ok, pen) },
+                            ).also { rdpei = it },
+                        )
+                    }
+                    if (locationSource != null) {
+                        put(
+                            LocationChannel.CHANNEL_NAME,
+                            LocationChannel(
+                                locationSource,
+                                log = { Log.i(TAG, "location: $it") },
+                                onState = { listener.onLocationActive(it) },
+                            ).also {
+                                location = it
+                                if (locationArmed) it.setEnabled(true)
+                            },
+                        )
+                    }
                     if (audioSource != null) {
-                        put(AudinChannel.CHANNEL_NAME, AudinChannel(audioSource, log = { Log.i(TAG, "audin: $it") }).also {
+                        put(AudinChannel.CHANNEL_NAME, AudinChannel(audioSource, log = { Log.i(TAG, "audin: $it") }, compressed = cfg.audioCompression).also {
                             audin = it
                             if (micArmed) it.setEnabled(true)
                         })
@@ -985,6 +1059,22 @@ class RdpClient(
                 val body = ByteWriter().u16le(1).u16le(0).bytes(event).toByteArray()
                 try {
                     sendData(0x1C, body)
+                } catch (_: Exception) {
+                    // обрыв обнаружит читающий поток
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+        }
+    }
+
+    /** Задание в очередь ввода: касания идут тем же потоком, что клавиши и мышь, и в том же порядке. */
+    private fun enqueueRaw(task: () -> Unit) {
+        if (!ready) return
+        try {
+            inputExecutor.execute {
+                if (!ready) return@execute
+                try {
+                    task()
                 } catch (_: Exception) {
                     // обрыв обнаружит читающий поток
                 }

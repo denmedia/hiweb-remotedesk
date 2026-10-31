@@ -99,6 +99,8 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
 
     fun save(device: Device) {
         repo.upsert(device)
+        // Слушатель агентов подстраивает набор портов под настройки ПК.
+        com.hiweb.hiwebremotedesk.agent.SwitchListenerService.startIfPaired(getApplication())
         refreshStatus()
     }
 
@@ -112,7 +114,7 @@ class HomeViewModel(app: Application) : AndroidViewModel(app) {
     fun powerViaSsh(device: Device, action: PowerAction, onResult: (SshPowerResult) -> Unit) {
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching { ssh.run(device.host, device.username, device.password, action) }
+                runCatching { ssh.run(device.host, device.username, device.password, action, device.sshPortNumber) }
                     .getOrElse { SshPowerResult.Failed(it.message ?: "Не удалось выполнить команду") }
             }
             onResult(result)

@@ -47,6 +47,32 @@ namespace HiWebAgent
         static extern bool GetCursorInfo(ref CursorInfo info);
 
         [DllImport("user32.dll")]
+        static extern IntPtr LoadCursor(IntPtr instance, IntPtr name);
+
+        // Стандартные курсоры Windows (IDC_*): описатель из GetCursorInfo у них совпадает с общим описателем LoadCursor.
+        static readonly IntPtr TextCursor = LoadCursor(IntPtr.Zero, new IntPtr(32513));
+        static readonly IntPtr[] DragCursors =
+        {
+            LoadCursor(IntPtr.Zero, new IntPtr(32515)), // перекрестие
+            LoadCursor(IntPtr.Zero, new IntPtr(32642)), // размер по диагонали ↘
+            LoadCursor(IntPtr.Zero, new IntPtr(32643)), // размер по диагонали ↙
+            LoadCursor(IntPtr.Zero, new IntPtr(32644)), // размер по горизонтали
+            LoadCursor(IntPtr.Zero, new IntPtr(32645)), // размер по вертикали
+            LoadCursor(IntPtr.Zero, new IntPtr(32646)), // перемещение
+        };
+
+        /// <summary>
+        /// Что делает курсор: <c>text</c> («I» — выделять текст), <c>drag</c> (размер, перемещение, перекрестие —
+        /// тянуть), иначе <c>arrow</c>. Планшет по этому решает, чем будет движение пера (прокрутка, выделение, перетаскивание).
+        /// </summary>
+        static string Kind(IntPtr cursor)
+        {
+            if (cursor == TextCursor) return "text";
+            foreach (IntPtr c in DragCursors) if (cursor == c) return "drag";
+            return "arrow";
+        }
+
+        [DllImport("user32.dll")]
         static extern bool GetIconInfo(IntPtr icon, out IconInfo info);
 
         [DllImport("user32.dll")]
@@ -180,6 +206,7 @@ namespace HiWebAgent
                         msg["h"] = h;
                         msg["hx"] = ii.HotX;
                         msg["hy"] = ii.HotY;
+                        msg["kind"] = Kind(cursor);
                         msg["png"] = Convert.ToBase64String(ms.ToArray());
                         return msg;
                     }

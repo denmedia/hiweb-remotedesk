@@ -31,9 +31,6 @@ class AgentPairing(context: Context) {
     fun forget(deviceId: String) = prefs.edit().remove(deviceId).apply()
 
     companion object {
-        /** UDP-порт, на котором планшет ждёт команду «Переключиться на Планшет». */
-        const val PORT = 47853
-
         fun mac(secret: ByteArray, text: String): String {
             val m = Mac.getInstance("HmacSHA256")
             m.init(SecretKeySpec(secret, "HmacSHA256"))

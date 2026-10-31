@@ -31,8 +31,8 @@ enum class AgentPower(val wire: String, val title: String, val question: String,
 data class AgentPresence(val version: String, val host: String, val power: Set<AgentPower>)
 
 /**
- * Агенты на ПК, подключившиеся к планшету по локальной сети (TCP [AgentPairing.PORT], сервер запускает
- * [SwitchListenerService]). Экран списка ПК показывает по [presence] кнопки питания через агента.
+ * Агенты на ПК, подключившиеся к планшету по локальной сети (TCP, порты — [com.hiweb.hiwebremotedesk.data.NetworkPorts.agentPorts],
+ * серверы запускает [SwitchListenerService]). Экран списка ПК показывает по [presence] кнопки питания через агента.
  */
 object AgentHub {
     private const val TAG = "Agent"
@@ -53,7 +53,7 @@ object AgentHub {
     }
 
     private val links = ConcurrentHashMap<String, Link>()
-    @Volatile private var server: ServerSocket? = null
+    private val servers = ConcurrentHashMap<Int, ServerSocket>()
     @Volatile private var onStatus: (String, JSONObject) -> Unit = { _, _ -> }
     @Volatile private var onScreen: (String, ByteArray) -> Unit = { _, _ -> }
     @Volatile private var onGuard: (String, JSONObject, Any, (JSONObject) -> Unit) -> Unit = { _, _, _, _ -> }
@@ -67,12 +67,14 @@ object AgentHub {
     }
 
     /**
-     * Принимает подключения агентов, пока сервер не остановлен [stop]. Блокирует поток. [onStatus] получает
+     * Принимает подключения агентов на порту [port], пока сервер не остановлен [stop] или [stopPort]. Блокирует поток;
+     * для каждого порта вызывается отдельно. [onStatus] получает
      * сообщения агентов о состоянии ПК (id ПК, сообщение), [onScreen] — расшифрованные снимки экрана для превью
      * (id ПК, JPEG), [onGuard] — сообщения защиты подключений (id ПК, сообщение, канал, способ ответить);
      * все вызываются в потоке связи.
      */
     fun serve(
+        port: Int,
         pairing: AgentPairing,
         knownDevice: (String) -> Boolean,
         onScreen: (String, ByteArray) -> Unit,
@@ -83,12 +85,12 @@ object AgentHub {
         this.onScreen = onScreen
         this.onGuard = onGuard
         val s = try {
-            ServerSocket().apply { reuseAddress = true; bind(java.net.InetSocketAddress(AgentPairing.PORT)) }
+            ServerSocket().apply { reuseAddress = true; bind(java.net.InetSocketAddress(port)) }
         } catch (e: Exception) {
-            Log.w(TAG, "cannot listen TCP ${AgentPairing.PORT}", e)
+            Log.w(TAG, "cannot listen TCP $port", e)
             return
         }
-        server = s
+        servers.put(port, s)?.let { runCatching { it.close() } }
         while (!s.isClosed) {
             val socket = try { s.accept() } catch (_: Exception) { break }
             Thread({ runCatching { session(socket, pairing, knownDevice) }.onFailure { Log.w(TAG, "agent link failed", it) } }, "agent-link").apply {
@@ -98,8 +100,13 @@ object AgentHub {
         }
     }
 
+    /** Перестаёт слушать порт; уже установленные связи остаются. */
+    fun stopPort(port: Int) {
+        servers.remove(port)?.let { runCatching { it.close() } }
+    }
+
     fun stop() {
-        runCatching { server?.close() }
+        servers.keys.toList().forEach(::stopPort)
         links.values.forEach { runCatching { it.socket.close() } }
     }
 

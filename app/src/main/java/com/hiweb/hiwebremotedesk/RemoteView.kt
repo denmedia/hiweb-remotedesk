@@ -20,9 +20,14 @@ import android.view.MotionEvent
 import android.view.PointerIcon
 import android.view.View
 import android.view.ViewConfiguration
+import com.hiweb.hiwebremotedesk.data.StylusButtonAction
+import com.hiweb.hiwebremotedesk.data.StylusMode
 import com.hiweb.hiwebremotedesk.rdp.CursorImage
+import com.hiweb.hiwebremotedesk.rdp.CursorKind
+import com.hiweb.hiwebremotedesk.rdp.PenFrame
 import com.hiweb.hiwebremotedesk.rdp.RdpClient
 import com.hiweb.hiwebremotedesk.rdp.RemoteCursor
+import com.hiweb.hiwebremotedesk.rdp.TouchFrame
 import kotlin.math.abs
 import kotlin.math.hypot
 import kotlin.math.min
@@ -339,11 +344,14 @@ class RemoteView(context: Context) : View(context) {
             }
             return
         }
-        if (captured && (!fingerInput || fingerCursorShown())) drawCursor(canvas)
+        if ((captured && (!fingerInput || fingerCursorShown())) || penInput) drawCursor(canvas)
     }
 
     /** Последним вводом был палец на экране, а не тачпад или мышь: курсор не рисуется, пока палец не в режиме перетаскивания. */
     private var fingerInput = false
+
+    /** Последним вводом было перо: курсор Windows рисуется всегда (системный указатель пером не показывается). */
+    private var penInput = false
     private var fingerCursorWasShown = false
 
     /**
@@ -365,8 +373,9 @@ class RemoteView(context: Context) : View(context) {
 
     /** Ввод тачпадом или мышью возвращает курсор. */
     private fun pointerInput() {
-        if (!fingerInput) return
+        if (!fingerInput && !penInput) return
         fingerInput = false
+        penInput = false
         postInvalidateOnAnimation()
     }
 
@@ -632,6 +641,13 @@ class RemoteView(context: Context) : View(context) {
         mouseWheelSpeed = speed
     }
 
+    private var stylusScrollSpeed = 1f
+
+    /** Скорость прокрутки пером поверх силы скролла пальцами (1 — как пальцем); применяется сразу. */
+    fun setStylusScrollSpeed(speed: Float) {
+        stylusScrollSpeed = speed
+    }
+
     /** Колесо физической мыши: ось колеса в щелчках, масштабируется настройкой скорости колёсика. */
     private fun mouseWheel(e: MotionEvent) {
         gestures.scrollNotches(true, e.getAxisValue(MotionEvent.AXIS_VSCROLL) * mouseWheelSpeed)
@@ -832,6 +848,12 @@ class RemoteView(context: Context) : View(context) {
         /** Через сколько палец, не сдвигаясь, даёт правую кнопку (долгое касание, как в iPadOS). */
         const val LONG_PRESS_MS = 500L
 
+        /** Сколько неподвижное перо над экраном считается «рядом» для отсечения ладони (hover-события идут, только пока оно движется). */
+        const val PEN_NEAR_MS = 3_000L
+
+        /** Порог сдвига пера, с которого касание перестаёт быть щелчком: меньше пальцевого, перо точнее. */
+        const val STYLUS_SLOP_DP = 4f
+
         /** Удержание клавиши сенсорной клавиатуры ПК: первый повтор через столько, дальше — с периодом KEY_REPEAT_MS. */
         const val KEY_REPEAT_DELAY_MS = 450L
         const val KEY_REPEAT_MS = 60L
@@ -908,24 +930,447 @@ class RemoteView(context: Context) : View(context) {
         if (!hasWindowFocus) {
             gestures.cancelAll()
             engine.cancel()
+            cancelNativeTouch()
         }
         applyCapture()
     }
 
     override fun onDetachedFromWindow() {
         dropLongPress()
+        removeCallbacks(stylusLongPress)
+        stylus.cancel()
         removeCallbacks(keyRepeat)
         touchGestures.cancel()
         gestures.cancelAll()
         engine.cancel()
+        cancelNativeTouch()
         super.onDetachedFromWindow()
     }
 
     private fun isMouse(e: MotionEvent) =
         e.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE || e.isFromSource(InputDevice.SOURCE_MOUSE) || e.isFromSource(InputDevice.SOURCE_TOUCHPAD)
 
+    private fun isStylus(e: MotionEvent) =
+        e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS || e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+
+    // ------------------------------------------------------------------ нативные касания Windows (RDPEI)
+
+    private val nativeOutput = object : NativeTouchOutput {
+        override fun touch(frames: List<TouchFrame>) { client?.sendTouch(frames) }
+        override fun pen(frames: List<PenFrame>) { client?.sendPen(frames) }
+    }
+    private val nativeTouch = NativeTouchEngine(nativeOutput)
+
+    /** Включён режим «нативное касание» (настройка ПК); работает, только когда Windows открыла канал ([nativeFinger]). */
+    private var nativeTouchWanted = false
+
+    /** Текущий жест пальцами идёт нативно: решается в начале жеста, чтобы он не менял путь на середине. */
+    private var nativeGesture = false
+
+    fun setNativeTouch(on: Boolean) {
+        if (on == nativeTouchWanted) return
+        nativeTouchWanted = on
+        // Начатое в прежнем режиме обрывается: Windows получает отмену, а имитация мыши отпускает кнопки.
+        cancelNativeTouch()
+        abortFingerEmulation()
+    }
+
+    /** Пальцы идут на ПК настоящими касаниями. */
+    private fun nativeFinger() = nativeTouchWanted && client?.touchReady == true
+
+    /** Что делает перо в нативном режиме (настройка ПК). */
+    private var stylusMode = StylusMode.PEN
+
+    fun setStylusMode(mode: StylusMode) {
+        if (mode == stylusMode) return
+        stylusMode = mode
+        // Начатое пером в прежнем режиме обрывается: Windows получает отмену, мышь отпускается.
+        removeCallbacks(stylusLongPress)
+        stylus.cancel()
+        cancelNativeTouch()
+    }
+
+    /** Перо идёт на ПК настоящим пером (сервер должен его поддерживать, иначе — мышь, как раньше). */
+    private fun nativePen() = nativeTouchWanted && stylusMode == StylusMode.PEN && client?.penReady == true
+
+    /** Перо идёт на ПК обычным касанием, как палец. */
+    private fun nativeStylusAsTouch() = nativeTouchWanted && stylusMode == StylusMode.TOUCH && client?.touchReady == true
+
+    /** Номера контактов пера не пересекаются с пальцами: ладонь и перо бывают на экране одновременно. */
+    private val stylusContactOffset = 1000
+
+    private fun cancelNativeTouch() {
+        removeCallbacks(nativeHold)
+        nativeGesture = false
+        if (nativeButtonHeld) {
+            // Кнопка пера была зажата («средняя» уходит мышью): её отпускание не должно потеряться.
+            nativeButtonHeld = false
+            if (stylusButtonAction == StylusButtonAction.MIDDLE) client?.sendMouse(RdpClient.PTR_MIDDLE, lastX.coerceAtLeast(0), lastY.coerceAtLeast(0))
+        }
+        nativeTouch.cancelAll(SystemClock.uptimeMillis())
+    }
+
+    /** Имитация мыши пальцем останавливается: таймеры, прокрутка и зажатая кнопка. */
+    private fun abortFingerEmulation() {
+        dropLongPress()
+        touchGestures.cancel()
+        gestures.cancelAll()
+        releaseLeft()
+        touchMode = TouchMode.IDLE
+    }
+
+    /** Координата рабочего стола под точкой вида, не дальше края картинки. */
+    private fun nativeX(x: Float) = remoteX(x).coerceIn(0, ((bitmap?.width ?: 1) - 1).coerceAtLeast(0))
+    private fun nativeY(y: Float) = remoteY(y).coerceIn(0, ((bitmap?.height ?: 1) - 1).coerceAtLeast(0))
+
+    /**
+     * Долгое касание в нативном режиме: контекстное меню по нему открывает сама Windows, но отклик под пальцем нужен
+     * сразу, поэтому планшет коротко вибрирует, когда единственный контакт продержался [LONG_PRESS_MS] почти без сдвига.
+     */
+    private val nativeHold = Runnable { performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
+    private var nativeHoldX = 0f
+    private var nativeHoldY = 0f
+
+    private fun startNativeHold(x: Float, y: Float) {
+        nativeHoldX = x
+        nativeHoldY = y
+        removeCallbacks(nativeHold)
+        postDelayed(nativeHold, LONG_PRESS_MS)
+    }
+
+    /** Контакт сдвинулся дальше порога [slop]: это уже не долгое касание. */
+    private fun moveNativeHold(x: Float, y: Float, slop: Float) {
+        if (hypot(x - nativeHoldX, y - nativeHoldY) > slop) removeCallbacks(nativeHold)
+    }
+
+    /** Пальцы целиком отдаются Windows: касание — это контакт, жесты разбирает она. */
+    private fun nativeFingerTouch(e: MotionEvent, idOffset: Int = 0) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> startNativeHold(e.x, e.y)
+            MotionEvent.ACTION_MOVE -> if (e.pointerCount == 1) moveNativeHold(e.x, e.y, touchSlop)
+            else -> removeCallbacks(nativeHold) // второй палец, отпускание, отмена
+        }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val i = e.actionIndex
+                nativeTouch.down(e.getPointerId(i) + idOffset, nativeX(e.getX(i)), nativeY(e.getY(i)), e.eventTime)
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (h in 0 until e.historySize) {
+                    nativeTouch.move(
+                        e.getHistoricalEventTime(h),
+                        List(e.pointerCount) { n ->
+                            NativePointer(e.getPointerId(n) + idOffset, nativeX(e.getHistoricalX(n, h)), nativeY(e.getHistoricalY(n, h)))
+                        },
+                    )
+                }
+                nativeTouch.move(
+                    e.eventTime,
+                    List(e.pointerCount) { n -> NativePointer(e.getPointerId(n) + idOffset, nativeX(e.getX(n)), nativeY(e.getY(n))) },
+                )
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val i = e.actionIndex
+                nativeTouch.up(e.getPointerId(i) + idOffset, nativeX(e.getX(i)), nativeY(e.getY(i)), e.eventTime)
+            }
+            MotionEvent.ACTION_CANCEL -> nativeTouch.cancelAll(e.eventTime)
+        }
+        nativeTouch.flush()
+    }
+
+    /** Кнопка пера (или ластик) как признак для Windows: у S Pen кнопка приходит как STYLUS_PRIMARY или SECONDARY. */
+    private fun nativePenBarrel(e: MotionEvent) =
+        e.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY) != 0
+
+    /** Кнопка пера была нажата в прошлом событии (для краёв нажатия и отпускания у действий не-«правой» кнопки). */
+    private var nativeButtonHeld = false
+
+    /**
+     * Что уйдёт Windows в признаках пера: (кнопка, ластик). «Правая кнопка» — кнопка пера как есть; «ластик» — перо
+     * перевёрнуто на время нажатия; остальные действия кнопку Windows не отдают, а выполняются здесь по краю нажатия.
+     */
+    private fun nativeButtons(e: MotionEvent): Pair<Boolean, Boolean> {
+        val held = nativePenBarrel(e)
+        val down = held && !nativeButtonHeld
+        val up = !held && nativeButtonHeld
+        nativeButtonHeld = held
+        val toolEraser = e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+        return when (stylusButtonAction) {
+            StylusButtonAction.RIGHT -> held to toolEraser
+            StylusButtonAction.ERASER -> false to (toolEraser || held)
+            StylusButtonAction.MIDDLE -> {
+                if (down || up) client?.sendMouse(RdpClient.PTR_MIDDLE or (if (down) RdpClient.PTR_DOWN else 0), remoteX(e.x), remoteY(e.y))
+                false to toolEraser
+            }
+            StylusButtonAction.SNIP, StylusButtonAction.UNDO -> {
+                if (down) runStylusAction()
+                false to toolEraser
+            }
+        }
+    }
+
+    /** Наклон пера из событий Android; [h] — номер исторической точки или -1 для текущей. */
+    private fun penTilt(e: MotionEvent, h: Int = -1): IntArray =
+        if (h < 0) PenTilt.fromAndroid(e.getAxisValue(MotionEvent.AXIS_TILT), e.getAxisValue(MotionEvent.AXIS_ORIENTATION))
+        else PenTilt.fromAndroid(
+            e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, h), e.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, h),
+        )
+
+    /**
+     * Перо над экраном и на нём — настоящим пером: наведение, касание с нажимом и наклоном, кнопка, ластик. Курсор
+     * Windows (его форму и скрытие присылает агент) рисуется здесь же в точке пера: по RDP сервер положение курсора
+     * не присылает, а настоящее перо Windows двигает курсор само.
+     */
+    private fun nativePenEvent(e: MotionEvent) {
+        val (barrel, eraser) = nativeButtons(e)
+        if (e.actionMasked != MotionEvent.ACTION_HOVER_EXIT && e.actionMasked != MotionEvent.ACTION_CANCEL) {
+            lastX = nativeX(e.x)
+            lastY = nativeY(e.y)
+            cursorX = lastX.toFloat()
+            cursorY = lastY.toFloat()
+            fingerInput = false
+            penInput = true
+        }
+        // Придержанное на месте перо — долгое касание: отклик вибрацией, как у пальца.
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> startNativeHold(e.x, e.y)
+            MotionEvent.ACTION_MOVE -> moveNativeHold(e.x, e.y, STYLUS_SLOP_DP * resources.displayMetrics.density)
+            else -> removeCallbacks(nativeHold)
+        }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_EXIT -> nativeTouch.penLeave(e.eventTime)
+            MotionEvent.ACTION_CANCEL -> nativeTouch.penCancel(e.eventTime)
+            MotionEvent.ACTION_UP -> {
+                // Перо поднято, но остаётся в зоне наведения: дальше придут HOVER-события.
+                nativeTouch.pen(e.eventTime, nativeX(e.x), nativeY(e.y), false, 0f, barrel, eraser)
+            }
+            MotionEvent.ACTION_MOVE, MotionEvent.ACTION_DOWN -> {
+                for (h in 0 until e.historySize) {
+                    val t = penTilt(e, h)
+                    nativeTouch.pen(
+                        e.getHistoricalEventTime(h), nativeX(e.getHistoricalX(h)), nativeY(e.getHistoricalY(h)),
+                        true, e.getHistoricalPressure(h), barrel, eraser, t[0], t[1],
+                    )
+                }
+                val t = penTilt(e)
+                nativeTouch.pen(e.eventTime, nativeX(e.x), nativeY(e.y), true, e.pressure, barrel, eraser, t[0], t[1])
+            }
+            else -> {
+                val t = penTilt(e)
+                nativeTouch.pen(e.eventTime, nativeX(e.x), nativeY(e.y), false, 0f, barrel, eraser, t[0], t[1])
+            }
+        }
+        nativeTouch.flush()
+        postInvalidateOnAnimation()
+    }
+
+    // ------------------------------------------------------------------ перо Samsung (S Pen)
+
+    private val stylusOutput = object : StylusOutput {
+        override fun move(x: Float, y: Float) {
+            touchX = x
+            touchY = y
+            this@RemoteView.move(x, y)
+        }
+
+        override fun press(x: Float, y: Float) = pressLeft(x, y)
+        override fun release() = releaseLeft()
+        override fun tap(x: Float, y: Float, time: Long) = this@RemoteView.tap(x, y, time)
+
+        override fun scroll(time: Long, dx: Float, dy: Float) =
+            gestures.touchScroll(
+                time, dy / TOUCH_PX_PER_NOTCH * stylusScrollSpeed, -dx / TOUCH_PX_PER_NOTCH * stylusScrollSpeed,
+            )
+
+        override fun scrollRelease(time: Long) {
+            gestures.scrollRelease(time)
+            ensureFling()
+        }
+
+        override fun scrollEnd() = gestures.scrollEnd()
+    }
+    private val stylus = StylusEngine(stylusOutput, STYLUS_SLOP_DP * resources.displayMetrics.density).also {
+        it.cursorKind = { (remoteCursor as? CursorImage)?.kind ?: CursorKind.ARROW }
+    }
+    private val stylusLongPress = Runnable {
+        if (stylus.longPress()) performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+    }
+
+    /** Перо подняли с нажатой кнопкой: пока её не отпустят, нажатие в наведении повторно правой кнопкой не считается. */
+    private var stylusButtonLatched = false
+
+    /** Кнопка пера (у S Pen она одна) нажата; Android отдаёт её как STYLUS_PRIMARY, а в старых версиях — как SECONDARY. */
+    private fun stylusButton(e: MotionEvent): Boolean {
+        val held = e.buttonState and (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY) != 0
+        if (!held) stylusButtonLatched = false
+        return held && !stylusButtonLatched
+    }
+
+    private var stylusButtonAction = StylusButtonAction.RIGHT
+
+    /** Что делает кнопка пера; применяется сразу. */
+    fun setStylusButtonAction(action: StylusButtonAction) {
+        if (action == stylusButtonAction) return
+        // Зажатая кнопка отпускается по прежнему действию.
+        stylusButtons(false, cursorX * scale + offX, cursorY * scale + offY)
+        cancelNativeTouch()
+        stylusButtonAction = action
+    }
+
+    private var palmRejection = true
+
+    /** Игнорировать новые касания пальцем, пока перо над экраном или на нём. */
+    fun setPalmRejection(on: Boolean) {
+        palmRejection = on
+    }
+
+    /** Перо в зоне действия экрана (над ним или на нём) и когда его в последний раз видели. */
+    private var penNear = false
+    private var penNearAt = 0L
+
+    /** Текущая серия касаний пальца отброшена как ладонь. */
+    private var ignoringFinger = false
+
+    private fun trackPen(e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_EXIT, MotionEvent.ACTION_CANCEL -> penNear = false
+            else -> {
+                penNear = true
+                penNearAt = SystemClock.uptimeMillis()
+            }
+        }
+    }
+
+    /** Перо рядом: hover-события идут, пока оно движется, поэтому неподвижное перо считается рядом [PEN_NEAR_MS]. */
+    private fun penNearNow() = penNear && SystemClock.uptimeMillis() - penNearAt < PEN_NEAR_MS
+
+    private fun stylusCombo(vararg keys: Pair<Int, Boolean>) {
+        keys.forEach { (code, ext) -> client?.sendKey(code, ext, true) }
+        keys.reversed().forEach { (code, ext) -> client?.sendKey(code, ext, false) }
+    }
+
+    /** Действия кнопки пера, которые выполняются одним нажатием: фрагмент экрана и отмена. */
+    private fun runStylusAction() {
+        when (stylusButtonAction) {
+            StylusButtonAction.SNIP ->
+                if (desktop == DesktopProfile.GNOME) stylusCombo(0x37 to true)
+                else stylusCombo(0x5B to true, 0x2A to false, 0x1F to false)
+            StylusButtonAction.UNDO -> stylusCombo(0x1D to false, 0x2C to false)
+            else -> {}
+        }
+    }
+
+    /**
+     * Нажатие кнопки пера, пришедшее клавишей (`KEYCODE_STYLUS_BUTTON_*`, так Samsung может отдавать кнопку, когда перо вдали
+     * от экрана): выполняется действие кнопки одним нажатием — щелчок правой или средней кнопкой в точке курсора либо
+     * сочетание клавиш; ластик клавишей не передать.
+     */
+    fun stylusButtonKey(down: Boolean) {
+        if (!down) return
+        val x = lastX.coerceAtLeast(0)
+        val y = lastY.coerceAtLeast(0)
+        when (stylusButtonAction) {
+            StylusButtonAction.RIGHT -> { client?.sendMouse(RdpClient.PTR_RIGHT or RdpClient.PTR_DOWN, x, y); client?.sendMouse(RdpClient.PTR_RIGHT, x, y) }
+            StylusButtonAction.MIDDLE -> { client?.sendMouse(RdpClient.PTR_MIDDLE or RdpClient.PTR_DOWN, x, y); client?.sendMouse(RdpClient.PTR_MIDDLE, x, y) }
+            StylusButtonAction.SNIP, StylusButtonAction.UNDO -> runStylusAction()
+            StylusButtonAction.ERASER -> {}
+        }
+    }
+
+    private var stylusActionHeld = false
+
+    /**
+     * Кнопка пера в режиме мыши в точке пера: правая (и «ластик») либо средняя кнопка мыши на время нажатия, фрагмент
+     * экрана и отмена — одним действием по нажатию. Левая кнопка мыши от касания здесь не пересылается.
+     */
+    private fun stylusButtons(held: Boolean, x: Float, y: Float) {
+        val rx = remoteX(x)
+        val ry = remoteY(y)
+        when (stylusButtonAction) {
+            StylusButtonAction.RIGHT, StylusButtonAction.ERASER -> applyButtons(if (held) MotionEvent.BUTTON_SECONDARY else 0, rx, ry)
+            StylusButtonAction.MIDDLE -> applyButtons(if (held) MotionEvent.BUTTON_TERTIARY else 0, rx, ry)
+            StylusButtonAction.SNIP, StylusButtonAction.UNDO -> if (held && !stylusActionHeld) runStylusAction()
+        }
+        stylusActionHeld = held
+    }
+
+    private fun stylusActive() {
+        fingerInput = false
+        penInput = true
+    }
+
+    /** Перо над экраном: курсор идёт за ним, кнопка пера — правая кнопка мыши. */
+    private fun stylusHover(e: MotionEvent) {
+        stylusActive()
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_EXIT -> stylusButtons(false, e.x, e.y)
+            else -> {
+                move(e.x, e.y)
+                stylusButtons(stylusButton(e), e.x, e.y)
+            }
+        }
+        postInvalidateOnAnimation()
+    }
+
+    /** Касание пером: щелчок, прокрутка, выделение и перетаскивание ([StylusEngine]); кнопка пера — правая кнопка. */
+    private fun stylusTouch(e: MotionEvent) {
+        stylusActive()
+        val held = stylusButton(e)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val suppressed = gestures.flingSpeed >= FLING_TAP_GUARD
+                gestures.stopFling()
+                postDelayed(stylusLongPress, LONG_PRESS_MS)
+                stylus.down(e.x, e.y, held, suppressed)
+                stylusButtons(held, e.x, e.y)
+            }
+            MotionEvent.ACTION_UP -> {
+                removeCallbacks(stylusLongPress)
+                stylus.up(e.eventTime)
+                stylusButtons(false, e.x, e.y)
+                stylusButtonLatched = held
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(stylusLongPress)
+                stylus.cancel()
+                stylusButtons(false, e.x, e.y)
+                stylusButtonLatched = held
+            }
+            else -> {
+                // MOVE и нажатие/отпускание кнопки при касании.
+                stylus.buttonChanged(held)
+                stylus.move(e.x, e.y, e.eventTime)
+                if (stylus.touching) stylusButtons(held, e.x, e.y)
+            }
+        }
+        postInvalidateOnAnimation()
+    }
+
+    override fun onResolvePointerIcon(event: MotionEvent, pointerIndex: Int): PointerIcon? =
+        if (isStylus(event)) PointerIcon.getSystemIcon(context, PointerIcon.TYPE_NULL) else super.onResolvePointerIcon(event, pointerIndex)
+
     override fun onGenericMotionEvent(e: MotionEvent): Boolean {
         if (handleGesture(e)) return true
+        if (isStylus(e)) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_EXIT,
+                MotionEvent.ACTION_BUTTON_PRESS, MotionEvent.ACTION_BUTTON_RELEASE,
+                -> {
+                    trackPen(e)
+                    if (nativePen()) {
+                        nativePenEvent(e)
+                    } else if (nativeStylusAsTouch()) {
+                        // Касание не знает наведения: пока перо над экраном, на ПК ничего не уходит.
+                    } else {
+                        // Режим сменился, пока перо было над экраном: Windows надо сообщить, что настоящее перо ушло.
+                        if (nativeTouch.penActive) { nativeTouch.penCancel(e.eventTime); nativeTouch.flush() }
+                        stylusHover(e)
+                    }
+                    return true
+                }
+                else -> return super.onGenericMotionEvent(e)
+            }
+        }
         if (!isMouse(e)) return super.onGenericMotionEvent(e)
         pointerInput()
         when (e.actionMasked) {
@@ -942,6 +1387,24 @@ class RemoteView(context: Context) : View(context) {
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (handleGesture(e)) return true
+        if (isStylus(e)) {
+            trackPen(e)
+            // Без пакетирования Android доставляет каждую точку пера сразу: линия на ПК ровнее и с меньшей задержкой.
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) requestUnbufferedDispatch(e)
+            if (nativePen()) {
+                nativePenEvent(e)
+            } else if (nativeStylusAsTouch()) {
+                nativeFingerTouch(e, stylusContactOffset)
+            } else {
+                if (nativeTouch.penActive) { nativeTouch.penCancel(e.eventTime); nativeTouch.flush() }
+                stylusTouch(e)
+            }
+            return true
+        }
+        if (penInput) {
+            penInput = false
+            postInvalidateOnAnimation()
+        }
         if (isMouse(e)) {
             pointerInput()
             move(e.x, e.y)
@@ -952,7 +1415,19 @@ class RemoteView(context: Context) : View(context) {
             }
             return true
         }
+        // Ладонь руки с пером: пока перо рядом, новое касание пальцем отбрасывается целиком (до отрыва).
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) ignoringFinger = palmRejection && penNearNow()
+        if (ignoringFinger) {
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) ignoringFinger = false
+            return true
+        }
         fingerInput = true
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) nativeGesture = nativeFinger()
+        if (nativeGesture) {
+            nativeFingerTouch(e)
+            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) nativeGesture = false
+            return true
+        }
         fingerTouch(e)
         refreshFingerCursor()
         return true

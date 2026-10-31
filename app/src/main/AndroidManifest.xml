@@ -17,6 +17,12 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Камера планшета в программах Windows (канал rdpecam), только по желанию пользователя -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Геолокация планшета в программах Windows (канал location); спрашивается при включении кнопкой в сеансе.
+         Оба права объявлены: с Android 12 пользователь может выдать только примерное местоположение. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Координаты продолжают идти на ПК, пока сеанс свёрнут (служба сеанса получает тип «location» при выданном праве) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
     <!-- Сенсорный экран не обязателен: приложение работает и с мышью/клавиатурой -->
     <uses-feature
@@ -60,7 +66,7 @@
         <service
             android:name=".SessionService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|location">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps an open remote desktop (RDP) session alive while the app is minimized" />

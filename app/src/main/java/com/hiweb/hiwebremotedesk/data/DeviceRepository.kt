@@ -75,10 +75,13 @@ class DeviceRepository private constructor(private val context: Context) {
                     .put("inertia_pct", d.inertiaPercent)
                     .put("mouse_pct", d.mouseSpeedPercent)
                     .put("wheel_pct", d.mouseWheelPercent)
+                    .put("stylus_pct", d.stylusScrollPercent)
                     .put("files", d.fileTransfer)
                     .put("h264", d.hardwareVideo)
                     .put("win_gfx", d.windowsGfx)
                     .put("mic", d.microphone)
+                    .put("snd_comp", d.audioCompression)
+                    .put("loc", d.location)
                     .put("cam", d.camera)
                     .put("cam_off", JSONArray(d.cameraOff.toList()))
                     .put("cam_rot", JSONObject(d.cameraRotation.mapValues { it.value }))
@@ -87,7 +90,13 @@ class DeviceRepository private constructor(private val context: Context) {
                     .put("drive_name", d.driveName)
                     .put("drive_ro", d.driveReadOnly)
                     .put("depth", d.colorDepth)
-                    .put("wol_mac", d.wakeMac),
+                    .put("wol_mac", d.wakeMac)
+                    .put("agent_port", d.agentPort ?: 0)
+                    .put("ssh_port", d.sshPort ?: 0)
+                    .put("native_touch", d.nativeTouch ?: JSONObject.NULL)
+                    .put("stylus_mode", d.stylusMode.name)
+                    .put("stylus_btn", d.stylusButton.name)
+                    .put("palm", d.palmRejection),
             )
         }
         prefs.edit().putString("list", arr.toString()).apply()
@@ -146,10 +155,13 @@ class DeviceRepository private constructor(private val context: Context) {
                     inertiaPercent = o.optInt("inertia_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
                     mouseSpeedPercent = o.optInt("mouse_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
                     mouseWheelPercent = o.optInt("wheel_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
+                    stylusScrollPercent = o.optInt("stylus_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
                     fileTransfer = o.optBoolean("files", true),
                     hardwareVideo = o.optBoolean("h264", true),
                     windowsGfx = o.optBoolean("win_gfx", false),
                     microphone = o.optBoolean("mic", false),
+                    audioCompression = o.optBoolean("snd_comp", false),
+                    location = o.optBoolean("loc", false),
                     camera = o.optBoolean("cam", false),
                     cameraOff = o.optJSONArray("cam_off")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet(),
                     cameraRotation = o.optJSONObject("cam_rot")?.let { r ->
@@ -161,6 +173,12 @@ class DeviceRepository private constructor(private val context: Context) {
                     driveReadOnly = o.optBoolean("drive_ro", false),
                     colorDepth = o.optInt("depth", Device.DEFAULT_COLOR_DEPTH).takeIf { it in Device.COLOR_DEPTHS } ?: Device.DEFAULT_COLOR_DEPTH,
                     wakeMac = o.optString("wol_mac"),
+                    agentPort = o.optInt("agent_port", 0).takeIf { it in NetworkPorts.AGENT_RANGE && it != NetworkPorts.AGENT_DEFAULT },
+                    sshPort = o.optInt("ssh_port", 0).takeIf { it in NetworkPorts.SSH_RANGE && it != NetworkPorts.SSH_DEFAULT },
+                    nativeTouch = if (o.has("native_touch") && !o.isNull("native_touch")) o.optBoolean("native_touch") else null,
+                    stylusMode = runCatching { StylusMode.valueOf(o.optString("stylus_mode")) }.getOrDefault(StylusMode.PEN),
+                    stylusButton = runCatching { StylusButtonAction.valueOf(o.optString("stylus_btn")) }.getOrDefault(StylusButtonAction.RIGHT),
+                    palmRejection = o.optBoolean("palm", true),
                 )
             }
         }.getOrDefault(emptyList())

@@ -22,7 +22,7 @@ data class GuardResult(val deviceId: String, val action: String, val cidr: Strin
  * Защита подключений к ПК на стороне планшета: принимает сообщения агента (`guard_state`, `conn`, `threat`,
  * `guard_result`) по обоим каналам связи — по локальной сети ([AgentHub]) и из сеанса RDP ([AgentLink]),
  * складывает их в [GuardStore], показывает уведомления об угрозах ([GuardNotifications]) и отправляет агенту
- * команды (заблокировать подсеть, «это я», оставить). Протокол — windows-agent/PROTOCOL.md.
+ * команды (заблокировать подсеть, «это я», оставить, белый список и режим защиты). Протокол — windows-agent/PROTOCOL.md.
  */
 object GuardHub {
     private const val TAG = "Guard"
@@ -109,8 +109,26 @@ object GuardHub {
     fun unblock(deviceId: String, cidr: String): Boolean =
         command(deviceId, JSONObject().put("t", "guard").put("do", "unblock").put("cidr", cidr))
 
-    fun trust(deviceId: String, ip: String): Boolean =
-        command(deviceId, JSONObject().put("t", "guard").put("do", "trust").put("ip", ip))
+    /**
+     * «Это я» / занести в белый список: один адрес («ip» — так понимают и агенты до 1.9.5) или подсеть («cidr»).
+     * Итог придёт сообщением `guard_result` (ошибка — недопустимая запись).
+     */
+    fun trust(deviceId: String, target: String): Boolean {
+        val cmd = JSONObject().put("t", "guard").put("do", "trust")
+        return command(deviceId, if (target.contains('/')) cmd.put("cidr", target) else cmd.put("ip", target))
+    }
+
+    fun untrust(deviceId: String, cidr: String): Boolean =
+        command(deviceId, JSONObject().put("t", "guard").put("do", "untrust").put("cidr", cidr))
+
+    /** Режим защиты и автоматическое занесение адресов планшета; null — не менять. Новое состояние придёт в `guard_state`. */
+    fun configure(deviceId: String, mode: String? = null, autoLearn: Boolean? = null, learnSubnet: Boolean? = null): Boolean {
+        val cmd = JSONObject().put("t", "guard").put("do", "settings")
+        mode?.let { cmd.put("mode", it) }
+        autoLearn?.let { cmd.put("autoLearn", it) }
+        learnSubnet?.let { cmd.put("learnSubnet", it) }
+        return command(deviceId, cmd)
+    }
 
     fun dismiss(deviceId: String, threatId: String): Boolean =
         command(deviceId, JSONObject().put("t", "guard").put("do", "dismiss").put("id", threatId))

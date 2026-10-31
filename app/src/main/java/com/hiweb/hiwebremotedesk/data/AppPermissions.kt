@@ -38,6 +38,11 @@ enum class AppPermission(
         "Камеры планшета как веб-камеры в программах Windows (Teams, браузер и др.).",
         Manifest.permission.CAMERA,
     ),
+    LOCATION(
+        "Местоположение",
+        "Передача координат планшета в программы Windows (карты, погода, поиск рядом). Включается кнопкой «Геолокация» в сеансе.",
+        Manifest.permission.ACCESS_FINE_LOCATION,
+    ),
     OVERLAY(
         "Поверх других приложений",
         "Команда «Переключиться на Планшет» из меню HiWeb Agent сразу открывает сеанс, без нажатия на уведомление.",
@@ -88,6 +93,10 @@ object AppPermissions {
     fun isGranted(context: Context, p: AppPermission): Boolean = when (p) {
         AppPermission.NOTIFICATIONS, AppPermission.MICROPHONE, AppPermission.CAMERA ->
             context.checkSelfPermission(p.runtime!!) == PackageManager.PERMISSION_GRANTED
+        // Достаточно и примерного местоположения: сетевой датчик работает с ним.
+        AppPermission.LOCATION ->
+            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         AppPermission.OVERLAY -> Settings.canDrawOverlays(context)
         AppPermission.FULL_SCREEN ->
             Build.VERSION.SDK_INT < 34 || context.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
@@ -119,7 +128,7 @@ object AppPermissions {
         return when (p) {
             AppPermission.NOTIFICATIONS ->
                 Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
-            AppPermission.MICROPHONE, AppPermission.CAMERA -> appDetailsIntent(context)
+            AppPermission.MICROPHONE, AppPermission.CAMERA, AppPermission.LOCATION -> appDetailsIntent(context)
             AppPermission.OVERLAY -> Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, pkg)
             // Страницы «Мышь» у Samsung напрямую не открыть: ведём в главную страницу настроек, там поиск.
             AppPermission.MOUSE_BUTTONS -> Intent(Settings.ACTION_SETTINGS)

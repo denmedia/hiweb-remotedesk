@@ -154,6 +154,15 @@ namespace HiWebAgent
             return canonical + "/" + prefix;
         }
 
+        /// <summary>Подсети пересекаются: одна целиком лежит в другой (границы подсетей всегда вложены).</summary>
+        public static bool Overlaps(string a, string b)
+        {
+            IPAddress netA, netB;
+            int prefixA, prefixB;
+            if (!TryParseCidr(a, out netA, out prefixA) || !TryParseCidr(b, out netB, out prefixB)) return false;
+            return InCidr(netA, b) || InCidr(netB, a);
+        }
+
         public static bool InCidr(IPAddress ip, string cidr)
         {
             IPAddress net;
@@ -197,11 +206,172 @@ namespace HiWebAgent
         public string User;
     }
 
-    /// <summary>Подозрительная активность: подбор пароля или вход с неизвестного адреса.</summary>
+    /// <summary>Режим защиты: как относиться к адресам, которых нет в списке знакомых.</summary>
+    static class GuardMode
+    {
+        /// <summary>Тревога при подборе пароля (несколько неудач подряд) и при входе, к которому не подключился планшет.</summary>
+        public const string Normal = "normal";
+
+        /// <summary>
+        /// Белый список: знакомые — только адреса и подсети из списка (и своя сеть). Любая попытка с остального интернета —
+        /// тревога с первой же неудачи, вход с неизвестного адреса — тревога, даже если планшет подключился, пока адрес
+        /// не занесён в список (автоматически или вручную).
+        /// </summary>
+        public const string Whitelist = "whitelist";
+
+        public static bool IsValid(string mode)
+        {
+            return mode == Normal || mode == Whitelist;
+        }
+    }
+
+    /// <summary>Настройки защиты, которые меняет пользователь: режим и то, что запоминается само.</summary>
+    sealed class GuardSettings
+    {
+        public string Mode = GuardMode.Normal;
+
+        /// <summary>Адрес, с которого вошёл планшет (канал HiWeb::Agent открылся сразу после входа), заносится в список сам.</summary>
+        public bool AutoLearn = true;
+
+        /// <summary>Заносить сразу всю подсеть адреса (/24, IPv6 — /64), а не один адрес: удобно, когда провайдер меняет адрес в пределах подсети.</summary>
+        public bool LearnSubnet;
+
+        public bool WhitelistMode
+        {
+            get { return Mode == GuardMode.Whitelist; }
+        }
+    }
+
+    /// <summary>Запись списка знакомых адресов: адрес («1.2.3.4/32») или подсеть.</summary>
+    sealed class WhitelistEntry
+    {
+        public const string Manual = "manual";
+        public const string Auto = "auto";
+
+        public string Cidr;
+        public string Source;     // Manual — добавлено пользователем, Auto — запомнено по подключению планшета
+        public long Time;         // мс Unix
+    }
+
+    /// <summary>
+    /// Список знакомых адресов и подсетей («белый список»). Свои адреса (частные сети, петля и т. п.) в него не заносятся —
+    /// они знакомы всегда. Подсети не шире /16 (IPv6 — /48), как и при блокировке: список не должен открыть «весь интернет».
+    /// </summary>
+    sealed class Whitelist
+    {
+        public const int MaxEntries = 200;
+
+        readonly List<WhitelistEntry> entries = new List<WhitelistEntry>();
+
+        public List<WhitelistEntry> Entries
+        {
+            get { return new List<WhitelistEntry>(entries); }
+        }
+
+        public int Count
+        {
+            get { return entries.Count; }
+        }
+
+        public bool Contains(string ip)
+        {
+            IPAddress parsed;
+            return IpTools.TryParse(ip, out parsed) && Contains(parsed);
+        }
+
+        public bool Contains(IPAddress ip)
+        {
+            foreach (WhitelistEntry e in entries) if (IpTools.InCidr(ip, e.Cidr)) return true;
+            return false;
+        }
+
+        /// <summary>Запись списка, содержащая точно эту подсеть, или null.</summary>
+        public WhitelistEntry Find(string cidr)
+        {
+            foreach (WhitelistEntry e in entries) if (e.Cidr == cidr) return e;
+            return null;
+        }
+
+        /// <summary>В списке есть адреса из этой подсети (или она сама лежит в записи списка): блокировать её нельзя.</summary>
+        public bool Overlaps(string cidr)
+        {
+            foreach (WhitelistEntry e in entries) if (IpTools.Overlaps(cidr, e.Cidr)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Добавляет адрес или подсеть. Возвращает каноническую запись или null, если это не адрес/подсеть, подсеть слишком
+        /// широка или адрес из своей сети. Повторное добавление не плодит записей; ручное добавление закрепляет автоматическую.
+        /// </summary>
+        public string Add(string text, string source, long time)
+        {
+            string cidr = IpTools.NormalizeBlock(text);
+            if (cidr == null) return null;
+            WhitelistEntry existing = Find(cidr);
+            if (existing != null)
+            {
+                if (source == WhitelistEntry.Manual) existing.Source = WhitelistEntry.Manual;
+                return cidr;
+            }
+            var e = new WhitelistEntry();
+            e.Cidr = cidr;
+            e.Source = source;
+            e.Time = time;
+            entries.Add(e);
+            if (entries.Count > MaxEntries) DropOldest();
+            return cidr;
+        }
+
+        /// <summary>Запоминает адрес, с которого вошёл планшет: сам адрес или (при [wholeSubnet]) его подсеть.</summary>
+        public string Learn(IPAddress ip, bool wholeSubnet, long time)
+        {
+            return Add(wholeSubnet ? IpTools.Subnet(ip) : IpTools.Single(ip), WhitelistEntry.Auto, time);
+        }
+
+        public bool Remove(string cidr)
+        {
+            string canonical = IpTools.NormalizeBlock(cidr) ?? cidr;
+            return entries.RemoveAll(delegate(WhitelistEntry e) { return e.Cidr == canonical; }) > 0;
+        }
+
+        /// <summary>При переполнении уходит самая старая автоматическая запись, а если таких нет — самая старая вообще.</summary>
+        void DropOldest()
+        {
+            int drop = -1;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                bool better = drop < 0
+                    || entries[i].Source == WhitelistEntry.Auto && entries[drop].Source != WhitelistEntry.Auto
+                    || entries[i].Source == entries[drop].Source && entries[i].Time < entries[drop].Time;
+                if (better) drop = i;
+            }
+            if (drop >= 0) entries.RemoveAt(drop);
+        }
+
+        /// <summary>Загрузка из файла: уже проверенные записи, без ограничений на размер (его проверит <see cref="Add"/> позже).</summary>
+        public void Load(string cidr, string source, long time)
+        {
+            string canonical = IpTools.NormalizeBlock(cidr);
+            if (canonical == null || Find(canonical) != null) return;
+            var e = new WhitelistEntry();
+            e.Cidr = canonical;
+            e.Source = source == WhitelistEntry.Manual ? WhitelistEntry.Manual : WhitelistEntry.Auto;
+            e.Time = time;
+            entries.Add(e);
+        }
+    }
+
+    /// <summary>Подозрительная активность: подбор пароля, вход с неизвестного адреса, обращение с адреса вне белого списка.</summary>
     sealed class Threat
     {
         public const string BruteForce = "bruteforce";
         public const string UnknownLogon = "unknown_logon";
+
+        /// <summary>Режим белого списка: неудачная попытка входа с адреса, которого в списке нет (даже первая).</summary>
+        public const string Unlisted = "unlisted";
+
+        /// <summary>Режим белого списка без автоматического занесения: вход с нового адреса, с которого подключился и планшет.</summary>
+        public const string NewAddress = "new_address";
 
         public const string StatusNew = "new";
         public const string StatusBlocked = "blocked";
@@ -223,15 +393,21 @@ namespace HiWebAgent
     /// Правила подозрительности. События подаются по времени возрастания (<see cref="Feed"/>); время берётся из самих
     /// событий, поэтому одни и те же правила работают и на живом потоке, и на истории журнала при запуске агента.
     ///
+    /// Всегда (свои адреса — локальная сеть — и адреса из белого списка не в счёт):
     /// 1) Подбор пароля: <see cref="FailThreshold"/> неудачных попыток за <see cref="WindowMs"/> с одной подсети
-    ///    (/24 или /64: боты меняют адрес внутри подсети). Свои адреса и адреса, с которых планшет уже входил, не в счёт.
+    ///    (/24 или /64: боты меняют адрес внутри подсети).
     /// 2) Вход с неизвестного адреса: успешный вход, после которого за <see cref="LogonGraceMs"/> планшет не открыл
-    ///    канал HiWeb::Agent. Если открыл — адрес запоминается как свой (<see cref="learn"/>).
+    ///    канал HiWeb::Agent. Если открыл — адрес запоминается в списке (при <see cref="GuardSettings.AutoLearn"/>).
+    /// В режиме белого списка (<see cref="GuardSettings.WhitelistMode"/>) строже:
+    /// 3) Любая неудачная попытка с адреса вне списка — тревога сразу (<see cref="Threat.Unlisted"/>), не дожидаясь порога;
+    ///    дойдя до порога, она становится подбором пароля.
+    /// 4) Вход, к которому подключился планшет, но автоматическое занесение выключено, — <see cref="Threat.NewAddress"/>:
+    ///    адрес надо занести в список вручную.
     /// Об одном и том же источнике повторно сообщается не чаще раза в <see cref="RealertMs"/>.
     /// </summary>
     sealed class ThreatDetector
     {
-        public const int FailThreshold = 5;
+        public const int FailThreshold = 3;
         public const long WindowMs = 10 * 60 * 1000;
         public const long RealertMs = 60 * 60 * 1000;
         public const long LogonGraceMs = 30 * 1000;
@@ -240,19 +416,20 @@ namespace HiWebAgent
         const long TABLET_SLACK_MS = 5 * 1000;
         const long HISTORY_MS = 24 * 60 * 60 * 1000;
 
-        readonly Func<string, bool> isTrusted;
-        readonly Func<IEnumerable<string>> trustedList;
-        readonly Action<string> learn;
+        readonly Whitelist whitelist;
+        readonly GuardSettings settings;
+        readonly Action<string> learned;
         readonly Dictionary<string, List<long>> fails = new Dictionary<string, List<long>>();
         readonly Dictionary<string, long> lastAlert = new Dictionary<string, long>();
         readonly List<RdpEvent> pending = new List<RdpEvent>();
         readonly List<long> tabletOpens = new List<long>();
 
-        public ThreatDetector(Func<string, bool> isTrusted, Func<IEnumerable<string>> trustedList, Action<string> learn)
+        /// <param name="learned">Вызывается после того, как адрес запомнен в списке (получает запись списка); может быть null.</param>
+        public ThreatDetector(Whitelist whitelist, GuardSettings settings, Action<string> learned)
         {
-            this.isTrusted = isTrusted;
-            this.trustedList = trustedList;
-            this.learn = learn;
+            this.whitelist = whitelist;
+            this.settings = settings;
+            this.learned = learned;
         }
 
         /// <summary>
@@ -286,7 +463,7 @@ namespace HiWebAgent
             if (!IpTools.TryParse(e.Ip, out ip) || IpTools.IsLocal(ip)) return result;
             if (e.Kind == GuardKind.Fail)
             {
-                if (isTrusted(ip.ToString())) return result;
+                if (whitelist.Contains(ip)) return result;
                 string subnet = IpTools.Subnet(ip);
                 List<long> list;
                 if (!fails.TryGetValue(subnet, out list))
@@ -297,13 +474,14 @@ namespace HiWebAgent
                 list.Add(e.Time);
                 list.RemoveAll(delegate(long t) { return t < e.Time - HISTORY_MS; });
                 int count = CountIn(list, e.Time);
-                if (count >= FailThreshold)
+                string rule = count >= FailThreshold ? Threat.BruteForce : settings.WhitelistMode ? Threat.Unlisted : null;
+                if (rule != null)
                 {
-                    Threat t = Raise(Threat.BruteForce, ip, e.Time, count, e.User, false);
+                    Threat t = Raise(rule, ip, e.Time, count, e.User, false);
                     if (t != null) result.Add(t);
                 }
             }
-            else if (e.Kind == GuardKind.Logon && !isTrusted(ip.ToString()))
+            else if (e.Kind == GuardKind.Logon && !whitelist.Contains(ip))
             {
                 pending.Add(e);
             }
@@ -319,15 +497,25 @@ namespace HiWebAgent
                 RdpEvent e = pending[i];
                 if (now - e.Time < LogonGraceMs) continue;
                 pending.RemoveAt(i);
-                if (TabletOpenedNear(e.Time))
-                {
-                    learn(e.Ip);
-                    continue;
-                }
                 IPAddress ip;
-                if (!IpTools.TryParse(e.Ip, out ip) || isTrusted(ip.ToString())) continue;
+                if (!IpTools.TryParse(e.Ip, out ip) || whitelist.Contains(ip)) continue;
                 List<long> list;
                 int recent = fails.TryGetValue(IpTools.Subnet(ip), out list) ? CountIn(list, e.Time) : 0;
+                if (TabletOpenedNear(e.Time))
+                {
+                    if (settings.AutoLearn)
+                    {
+                        string cidr = whitelist.Learn(ip, settings.LearnSubnet, e.Time);
+                        if (cidr != null && learned != null) learned(cidr);
+                        continue;
+                    }
+                    // Планшет подключился, но адреса в списке нет и сам он туда не попадёт: в обычном режиме это не повод
+                    // для тревоги, в режиме белого списка — вопрос «занести?».
+                    if (!settings.WhitelistMode) continue;
+                    Threat known = Raise(Threat.NewAddress, ip, e.Time, recent, e.User, recent > 0);
+                    if (known != null) result.Add(known);
+                    continue;
+                }
                 Threat t = Raise(Threat.UnknownLogon, ip, e.Time, recent, e.User, recent > 0);
                 if (t != null) result.Add(t);
             }
@@ -335,16 +523,11 @@ namespace HiWebAgent
             return result;
         }
 
-        /// <summary>Что предлагать заблокировать: подсеть, а если в ней есть свой адрес — только сам адрес.</summary>
+        /// <summary>Что предлагать заблокировать: подсеть, а если в ней есть знакомый адрес — только сам адрес.</summary>
         public string OfferedBlock(IPAddress ip)
         {
             string subnet = IpTools.Subnet(ip);
-            foreach (string t in trustedList())
-            {
-                IPAddress known;
-                if (IpTools.TryParse(t, out known) && IpTools.InCidr(known, subnet)) return IpTools.Single(ip);
-            }
-            return subnet;
+            return whitelist.Overlaps(subnet) ? IpTools.Single(ip) : subnet;
         }
 
         Threat Raise(string rule, IPAddress ip, long time, int count, string user, bool afterFail)

@@ -34,7 +34,7 @@ data class GuardEntry(
     }
 }
 
-/** Подозрительная активность, найденная агентом: подбор пароля или вход с неизвестного адреса. */
+/** Подозрительная активность, найденная агентом: подбор пароля, вход с неизвестного адреса, обращение с адреса вне белого списка. */
 data class GuardThreat(
     val id: String,
     val time: Long,
@@ -53,6 +53,12 @@ data class GuardThreat(
     companion object {
         const val BRUTEFORCE = "bruteforce"
         const val UNKNOWN_LOGON = "unknown_logon"
+
+        /** Режим белого списка: неудачная попытка входа с адреса, которого в списке нет (даже первая). */
+        const val UNLISTED = "unlisted"
+
+        /** Режим белого списка без автоматического занесения: вход с нового адреса, с которого подключился и планшет. */
+        const val NEW_ADDRESS = "new_address"
         const val STATUS_NEW = "new"
         const val STATUS_BLOCKED = "blocked"
         const val STATUS_TRUSTED = "trusted"
@@ -62,12 +68,31 @@ data class GuardThreat(
 
 data class GuardBlocked(val cidr: String, val enabled: Boolean)
 
-/** Состояние защиты на ПК: брандмауэр, заблокированные подсети, адреса, признанные своими. */
+/** Запись белого списка на ПК: адрес или подсеть; [manual] — добавлена пользователем, иначе запомнена по подключению планшета. */
+data class GuardWhitelistEntry(val cidr: String, val manual: Boolean, val time: Long = 0L)
+
+/**
+ * Состояние защиты на ПК: брандмауэр, заблокированные подсети, режим и белый список знакомых адресов и подсетей.
+ * [mode] = null — агент старше 1.9.5, белого списка не знает (настройки в приложении скрыты).
+ */
 data class GuardState(
     val firewallOn: Boolean = true,
     val blocked: List<GuardBlocked> = emptyList(),
-    val trusted: List<String> = emptyList(),
-)
+    val mode: String? = null,
+    /** Запоминать адрес, с которого вошёл планшет. */
+    val autoLearn: Boolean = true,
+    /** Запоминать сразу всю подсеть, а не один адрес. */
+    val learnSubnet: Boolean = false,
+    val whitelist: List<GuardWhitelistEntry> = emptyList(),
+) {
+    val supportsWhitelist: Boolean get() = mode != null
+    val whitelistMode: Boolean get() = mode == MODE_WHITELIST
+
+    companion object {
+        const val MODE_NORMAL = "normal"
+        const val MODE_WHITELIST = "whitelist"
+    }
+}
 
 /** Всё, что планшет знает о защите одного ПК. [announced] — угрозы, о которых уже было уведомление. */
 data class GuardData(
@@ -117,14 +142,24 @@ object GuardJournal {
 object GuardText {
     fun time(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(Date(ms))
 
-    fun threatTitle(t: GuardThreat): String =
-        if (t.rule == GuardThreat.BRUTEFORCE) "Подбор пароля по RDP" else "Вход по RDP с неизвестного адреса"
+    fun threatTitle(t: GuardThreat): String = when (t.rule) {
+        GuardThreat.BRUTEFORCE -> "Подбор пароля по RDP"
+        GuardThreat.UNLISTED -> "Попытка входа с адреса вне белого списка"
+        GuardThreat.NEW_ADDRESS -> "Вход с нового адреса: занести в белый список?"
+        else -> "Вход по RDP с неизвестного адреса"
+    }
 
     fun threatText(t: GuardThreat): String {
         if (t.rule == GuardThreat.BRUTEFORCE) {
             return "${t.count} неудачных попыток входа за 10 минут с ${t.ip} (подсеть ${t.cidr})"
         }
+        if (t.rule == GuardThreat.UNLISTED) {
+            return "Неудачных попыток входа за 10 минут: ${t.count}. Адрес ${t.ip} (подсеть ${t.cidr}) не входит в белый список"
+        }
         val who = t.user.ifBlank { "Кто-то" }
+        if (t.rule == GuardThreat.NEW_ADDRESS) {
+            return "$who вошёл в сеанс с ${t.ip}, планшет к сеансу подключился. Адреса нет в белом списке; если это вы, занесите его."
+        }
         val base = "$who вошёл в сеанс с ${t.ip}, но планшет к сеансу не подключился."
         return if (t.afterFail) "$base Перед этим было ${t.count} неудачных попыток входа — пароль могли подобрать!" else base
     }
@@ -143,6 +178,23 @@ object GuardText {
         }
     }
 
+    /** Подсеть адреса для белого списка: /24 для IPv4 и /64 для IPv6 (границу и запись приводит к канону агент). */
+    fun subnetOf(ip: String): String = if (ip.contains(':')) "$ip/64" else "$ip/24"
+
+    /** Запись белого списка для показа: у одного адреса длину «/32» и «/128» не показываем. */
+    fun cidr(cidr: String): String = cidr.removeSuffix("/32").removeSuffix("/128")
+
+    /** Запись в поле ввода похожа на адрес или подсеть (окончательно проверяет агент). */
+    fun looksLikeAddress(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        val v4 = Regex("""\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?""")
+        val v6 = Regex("""[0-9A-Fa-f:.]+(/\d{1,3})?""")
+        return v4.matches(t) || (t.contains(':') && v6.matches(t))
+    }
+
+    fun whitelistSource(manual: Boolean): String = if (manual) "добавлен вручную" else "запомнен по подключению планшета"
+
     /** Адрес записи для подписи: у записей приложения его нет. */
     fun entryAddress(e: GuardEntry): String = when {
         e.fromApp -> ""
@@ -151,12 +203,13 @@ object GuardText {
         else -> e.ip
     }
 
-    /** Запись заслуживает внимания: попытки с чужого адреса. */
-    fun entrySuspicious(e: GuardEntry): Boolean = e.kind == GuardEntry.FAIL && !e.local && !e.trusted
+    /** Запись заслуживает внимания: попытки с чужого адреса, а в режиме белого списка — и входы с него. */
+    fun entrySuspicious(e: GuardEntry, whitelistMode: Boolean = false): Boolean =
+        (e.kind == GuardEntry.FAIL || whitelistMode && e.kind == GuardEntry.LOGON) && !e.local && !e.trusted
 
     fun statusText(status: String): String = when (status) {
         GuardThreat.STATUS_BLOCKED -> "заблокировано"
-        GuardThreat.STATUS_TRUSTED -> "свой адрес"
+        GuardThreat.STATUS_TRUSTED -> "в белом списке"
         GuardThreat.STATUS_DISMISSED -> "оставлено"
         else -> "требует решения"
     }

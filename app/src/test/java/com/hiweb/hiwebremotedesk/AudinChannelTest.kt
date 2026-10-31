@@ -186,4 +186,50 @@ class AudinChannelTest {
         channel.onMessage(openPdu(320, 0))
         assertEquals(44100 to 1, startedFormat)
     }
+
+    private fun imaFormat(channels: Int, rate: Int, align: Int) =
+        ByteWriter().u16le(0x11).u16le(channels).u32le(rate).u32le(rate * 2).u16le(align).u16le(4).u16le(2).bytes(byteArrayOf(0, 0)).toByteArray()
+
+    @Test
+    fun without_option_compressed_formats_are_not_accepted() {
+        startSession(imaFormat(1, 16000, 256), pcmFormat(1, 16000))
+        assertEquals(1L, ByteReader(formatsReply[1], 1).u32le())
+    }
+
+    @Test
+    fun compressed_formats_come_first_and_microphone_is_sent_as_whole_blocks() {
+        val ch = AudinChannel(source, compressed = true)
+        ch.onOpen { sent += it }
+        ch.onMessage(ByteWriter().u8(0x01).u32le(2).toByteArray())
+        sent.clear()
+        ch.onMessage(formatsPdu(pcmFormat(1, 16000), imaFormat(1, 16000, 256)))
+        val r = ByteReader(sent[1], 1)
+        assertEquals(2L, r.u32le())
+        r.u32le()
+        assertEquals(0x11, r.u16le()) // IMA ADPCM — под номером 0, выше PCM
+        assertEquals(1, ByteReader(sent[1], 1 + 4 + 4 + 20).u16le()) // PCM — под номером 1
+
+        ch.setEnabled(true)
+        ch.onMessage(openPdu(0, 0))
+        assertEquals(16000 to 1, startedFormat)
+        sent.clear()
+        // Блок ADPCM — 505 кадров (1010 байт PCM). 640 байт блока не дают, 1280 — дают один блок в 256 байт.
+        feed!!.invoke(ByteArray(640))
+        assertTrue(sent.isEmpty())
+        feed!!.invoke(ByteArray(640))
+        assertEquals(listOf(0x05, 0x06), sent.map { it[0].toInt() })
+        assertEquals(1 + 256, sent[1].size)
+        // Остаток 270 байт ждёт следующего вызова.
+        sent.clear()
+        feed!!.invoke(ByteArray(1280))
+        assertEquals(listOf(0x05, 0x06), sent.map { it[0].toInt() })
+
+        // Сервер сменил формат на PCM: кодера больше нет, блоки идут как раньше.
+        ch.onMessage(formatChangePdu(1))
+        sent.clear()
+        feed!!.invoke(ByteArray(160) { 7 })
+        assertEquals(listOf(0x05, 0x06), sent.map { it[0].toInt() })
+        assertEquals(161, sent[1].size)
+        assertArrayEquals(ByteArray(160) { 7 }, ByteReader(sent[1], 1).bytes(160))
+    }
 }

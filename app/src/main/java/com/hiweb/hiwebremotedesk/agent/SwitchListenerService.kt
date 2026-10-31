@@ -15,20 +15,24 @@ import com.hiweb.hiwebremotedesk.MainActivity
 import com.hiweb.hiwebremotedesk.R
 import com.hiweb.hiwebremotedesk.RemoteActivity
 import com.hiweb.hiwebremotedesk.data.DeviceRepository
+import com.hiweb.hiwebremotedesk.data.NetworkPorts
 import com.hiweb.hiwebremotedesk.data.PcStateStore
 import com.hiweb.hiwebremotedesk.data.ThumbnailStore
 import org.json.JSONObject
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
+import java.util.concurrent.ConcurrentHashMap
 
 /**
- * Ждёт команду «Переключиться на Планшет» от HiWeb Agent по локальной сети (UDP [AgentPairing.PORT]).
+ * Ждёт команду «Переключиться на Планшет» от HiWeb Agent по локальной сети (UDP) и принимает его подключения (TCP).
+ * Порты — стандартный и заданные в настройках ПК ([NetworkPorts.agentPorts]); набор подстраивается при каждом запуске службы.
  * Работает, только пока хотя бы один ПК привязан к агенту. Подлинную команду подтверждает и открывает
  * сеанс этого ПК ([SwitchLauncher]).
  */
 class SwitchListenerService : Service() {
-    @Volatile private var socket: DatagramSocket? = null
+    private val udpSockets = ConcurrentHashMap<Int, DatagramSocket>()
+    private val tcpPorts = ConcurrentHashMap.newKeySet<Int>()
     private var multicastLock: WifiManager.MulticastLock? = null
     private val command = SwitchCommand()
 
@@ -52,19 +56,34 @@ class SwitchListenerService : Service() {
             setReferenceCounted(false)
             acquire()
         }
-        Thread(::listen, "switch-listener").apply { isDaemon = true }.start()
-        // Агенты на ПК сами подключаются сюда по TCP: так список ПК знает, где доступны команды питания.
+        syncPorts()
+    }
+
+    /** Открывает недостающие порты и закрывает те, что больше не нужны ни одному ПК. */
+    @Synchronized
+    private fun syncPorts() {
         val repo = DeviceRepository.get(this)
+        val wanted = NetworkPorts.agentPorts(repo.devices.value)
+        udpSockets.keys.filter { it !in wanted }.forEach { udpSockets.remove(it)?.let { s -> runCatching { s.close() } } }
+        tcpPorts.filter { it !in wanted }.forEach { tcpPorts.remove(it); AgentHub.stopPort(it) }
         val pairing = AgentPairing(this)
         val thumbnails = ThumbnailStore.get(this)
-        Thread({
-            AgentHub.serve(
-                pairing,
-                knownDevice = { repo.get(it) != null },
-                onScreen = { pc, jpeg -> runCatching { thumbnails.saveJpeg(pc, jpeg) } },
-                onGuard = { pc, msg, link, reply -> runCatching { GuardHub.onMessage(this, pc, msg, link, reply) }.onFailure { Log.w(TAG, "guard message failed", it) } },
-            ) { pc, msg -> PcStateStore.get(this).report(pc, msg) }
-        }, "agent-server").apply { isDaemon = true }.start()
+        for (port in wanted) {
+            if (!udpSockets.containsKey(port)) Thread({ listen(port) }, "switch-listener-$port").apply { isDaemon = true }.start()
+            // Агенты на ПК сами подключаются сюда по TCP: так список ПК знает, где доступны команды питания.
+            if (tcpPorts.add(port)) {
+                Thread({
+                    AgentHub.serve(
+                        port,
+                        pairing,
+                        knownDevice = { repo.get(it) != null },
+                        onScreen = { pc, jpeg -> runCatching { thumbnails.saveJpeg(pc, jpeg) } },
+                        onGuard = { pc, msg, link, reply -> runCatching { GuardHub.onMessage(this, pc, msg, link, reply) }.onFailure { Log.w(TAG, "guard message failed", it) } },
+                    ) { pc, msg -> PcStateStore.get(this).report(pc, msg) }
+                    tcpPorts.remove(port)
+                }, "agent-server-$port").apply { isDaemon = true }.start()
+            }
+        }
     }
 
     /**
@@ -81,29 +100,30 @@ class SwitchListenerService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!AgentPairing(this).hasAny()) stopSelf()
+        if (!AgentPairing(this).hasAny()) stopSelf() else syncPorts()
         return START_STICKY
     }
 
     override fun onDestroy() {
-        runCatching { socket?.close() }
+        udpSockets.values.forEach { runCatching { it.close() } }
+        udpSockets.clear()
         AgentHub.stop()
         runCatching { multicastLock?.release() }
         super.onDestroy()
     }
 
-    private fun listen() {
+    private fun listen(port: Int) {
         val s = try {
             DatagramSocket(null).apply {
                 reuseAddress = true
                 broadcast = true
-                bind(InetSocketAddress(AgentPairing.PORT))
+                bind(InetSocketAddress(port))
             }
         } catch (e: Exception) {
-            Log.w(TAG, "cannot bind UDP ${AgentPairing.PORT}", e)
+            Log.w(TAG, "cannot bind UDP $port", e)
             return
         }
-        socket = s
+        udpSockets.put(port, s)?.let { runCatching { it.close() } }
         val buffer = ByteArray(2048)
         while (!s.isClosed) {
             val packet = DatagramPacket(buffer, buffer.size)

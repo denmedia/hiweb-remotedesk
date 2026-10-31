@@ -10,6 +10,32 @@ sealed interface RemoteCursor {
 }
 
 /**
+ * Что делает курсор под указателем, по его форме: от этого зависит, как перо Samsung превратит движение в ПК
+ * ([StylusEngine]). Форму сообщает только HiWeb Agent (поле `kind` сообщения `cursor`); у серверных курсоров и без
+ * агента всегда [ARROW].
+ */
+enum class CursorKind {
+    /** Стрелка и всё прочее: движение пера — прокрутка. */
+    ARROW,
+
+    /** Текстовый курсор «I»: движение пера — выделение текста. */
+    TEXT,
+
+    /** Курсоры размера и перемещения, перекрестие: движение пера — перетаскивание (границы окон, разделители, столбцы). */
+    DRAG,
+    ;
+
+    companion object {
+        /** Значение поля `kind` из сообщения агента; неизвестное — [ARROW]. */
+        fun parse(name: String?): CursorKind = when (name) {
+            "text" -> TEXT
+            "drag" -> DRAG
+            else -> ARROW
+        }
+    }
+}
+
+/**
  * Форма курсора Windows. [argb] — цветные пиксели (сверху вниз), [invert] — пиксели, которые на ПК
  * инвертируют фон (например, текстовый курсор «I»); null, если таких нет.
  */
@@ -20,6 +46,7 @@ class CursorImage(
     val hotY: Int,
     val argb: IntArray,
     val invert: BooleanArray?,
+    val kind: CursorKind = CursorKind.ARROW,
 ) : RemoteCursor
 
 object PointerDecoder {

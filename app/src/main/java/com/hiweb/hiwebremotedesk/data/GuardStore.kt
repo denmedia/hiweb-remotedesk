@@ -101,13 +101,22 @@ object GuardJson {
 
     fun state(o: JSONObject): GuardState {
         val blocked = o.optJSONArray("blocked")
-        val trusted = o.optJSONArray("trusted")
+        val whitelist = o.optJSONArray("whitelist")
         return GuardState(
             firewallOn = o.optBoolean("fw", true),
             blocked = (0 until (blocked?.length() ?: 0)).mapNotNull { i ->
                 blocked!!.optJSONObject(i)?.let { b -> GuardBlocked(b.optString("cidr"), b.optBoolean("on", true)) }
             },
-            trusted = (0 until (trusted?.length() ?: 0)).map { trusted!!.optString(it) },
+            // Агент старше 1.9.5 поля «mode» не шлёт: белого списка у него нет.
+            mode = if (o.has("mode")) o.optString("mode", GuardState.MODE_NORMAL) else null,
+            autoLearn = o.optBoolean("autoLearn", true),
+            learnSubnet = o.optBoolean("learnSubnet", false),
+            whitelist = (0 until (whitelist?.length() ?: 0)).mapNotNull { i ->
+                whitelist!!.optJSONObject(i)?.let { w ->
+                    val cidr = w.optString("cidr").ifEmpty { return@let null }
+                    GuardWhitelistEntry(cidr, w.optString("src") == "manual", w.optLong("ts"))
+                }
+            },
         )
     }
 
@@ -130,7 +139,14 @@ object GuardJson {
         d.state?.let { s ->
             val blocked = JSONArray()
             s.blocked.forEach { blocked.put(JSONObject().put("cidr", it.cidr).put("on", it.enabled)) }
-            o.put("state", JSONObject().put("fw", s.firewallOn).put("blocked", blocked).put("trusted", JSONArray(s.trusted)))
+            val whitelist = JSONArray()
+            s.whitelist.forEach {
+                whitelist.put(JSONObject().put("cidr", it.cidr).put("src", if (it.manual) "manual" else "auto").put("ts", it.time))
+            }
+            val state = JSONObject().put("fw", s.firewallOn).put("blocked", blocked)
+            // Без «mode» (старый агент) поле не пишем: после загрузки с диска поддержка белого списка не появится из ниоткуда.
+            s.mode?.let { state.put("mode", it) }
+            o.put("state", state.put("autoLearn", s.autoLearn).put("learnSubnet", s.learnSubnet).put("whitelist", whitelist))
         }
         return o
     }

@@ -56,9 +56,12 @@ import androidx.compose.material.icons.outlined.DesktopAccessDisabled
 import androidx.compose.material.icons.outlined.Keyboard
 import androidx.compose.material.icons.outlined.KeyboardHide
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.LocationOff
+import androidx.compose.material.icons.outlined.LocationOn
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.MicOff
 import androidx.compose.material.icons.outlined.Mouse
+import androidx.compose.material.icons.outlined.PanTool
 import androidx.compose.material.icons.outlined.ScreenRotation
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SystemUpdate
@@ -113,6 +116,8 @@ import com.hiweb.hiwebremotedesk.agent.SwitchListenerService
 import com.hiweb.hiwebremotedesk.agent.PcNotification
 import com.hiweb.hiwebremotedesk.agent.PcNotifications
 import com.hiweb.hiwebremotedesk.data.StrengthLevels
+import com.hiweb.hiwebremotedesk.data.StylusButtonAction
+import com.hiweb.hiwebremotedesk.data.StylusMode
 import com.hiweb.hiwebremotedesk.data.Device
 import com.hiweb.hiwebremotedesk.data.DeviceRepository
 import com.hiweb.hiwebremotedesk.data.LocalFiles
@@ -226,6 +231,148 @@ class RemoteActivity : ComponentActivity() {
         if (granted) setMic(true) else {
             micHint = "Без разрешения на микрофон передача звука невозможна"
             handler.postDelayed({ micHint = null }, 6_000)
+        }
+    }
+
+    // Геолокация планшета в сеансе: передача включается вручную (и сама, если уже выдано разрешение) и гаснет вместе с сеансом.
+    /** Передача включена пользователем (кнопка «Геолокация»); координаты идут, когда Windows откроет канал — см. [locationActive]. */
+    private var locationOn by mutableStateOf(false)
+
+    /** Windows открыла канал location и координаты уходят на ПК. */
+    private var locationActive by mutableStateOf(false)
+    private var locationHint by mutableStateOf<String?>(null)
+    private var locationSource: TabletLocation? = null
+    /** Опцию включили кнопкой, а не в настройках ПК: после выдачи разрешения нужно переподключиться, чтобы канал появился. */
+    private var locationReconnect = false
+    private val requestLocation = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        val reconnect = locationReconnect
+        locationReconnect = false
+        when {
+            result.values.none { it } -> showLocationHint("Без разрешения на местоположение передача координат невозможна")
+            reconnect -> connect(quiet = true)
+            else -> setLocation(true)
+        }
+    }
+
+    private fun hasLocationPermission() = locationSource?.hasPermission()
+        ?: (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
+            checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+
+    private fun showLocationHint(text: String, ms: Long = 8_000) {
+        locationHint = text
+        handler.removeCallbacks(clearLocationHint)
+        handler.postDelayed(clearLocationHint, ms)
+    }
+
+    private val clearLocationHint = Runnable { locationHint = null }
+
+    /**
+     * Включает и выключает передачу координат планшета на ПК. Канал открывает Windows, поэтому включение «взводится» и
+     * срабатывает при его открытии; разрешение Android спрашивается при первом включении.
+     */
+    private fun setLocation(on: Boolean) {
+        val c = client ?: return
+        if (on) {
+            if (!hasLocationPermission()) {
+                requestLocation.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION))
+                return
+            }
+            if (!c.setLocation(true)) {
+                showLocationHint(
+                    "Геолокация недоступна: включите «Геолокация планшета» в настройках устройства и переподключитесь " +
+                        "(для Ubuntu перенаправление не поддерживается) или включите местоположение в настройках Android",
+                )
+                return
+            }
+            locationOn = true
+            locationHint = null
+        } else {
+            c.setLocation(false)
+            locationOn = false
+            locationActive = false
+        }
+        // Служба сеанса получает тип «location» только при включённой передаче: иначе Android не отдаст координаты свёрнутому приложению.
+        if (powerAction == null && state == SessionState.Connected) SessionService.start(this, device.id, device.name, location = locationOn)
+    }
+
+    /** Кнопка «Геолокация» в панели и переключатель в настройках сеанса. */
+    private fun toggleLocation() {
+        if (!device.location) {
+            // Опция выключена: кнопка включает её для этого ПК и переподключает сеанс (канал объявляется только при подключении).
+            if (device.os != OsType.WINDOWS) {
+                showLocationHint("Геолокация передаётся только в Windows", 6_000)
+                return
+            }
+            device = device.copy(location = true)
+            DeviceRepository.get(this).update(device.id) { it.copy(location = true) }
+            if (hasLocationPermission()) {
+                showLocationHint("Геолокация включена для этого ПК, сеанс переподключается", 6_000)
+                connect(quiet = true)
+            } else {
+                locationReconnect = true
+                requestLocation.launch(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION))
+            }
+            return
+        }
+        setLocation(!locationOn)
+    }
+
+    // Нативное управление Windows (касания и перо RDPEI вместо имитации мыши): режим ПК, готовность канала и подсказка.
+    /** Режим включён (Device.nativeTouch == true); работает, только когда [touchChannelReady]. */
+    private var nativeTouchOn by mutableStateOf(false)
+
+    /** Windows открыла канал касаний в этом подключении. */
+    private var touchChannelReady by mutableStateOf(false)
+    private var touchHint by mutableStateOf<String?>(null)
+
+    private fun showTouchHint(text: String, ms: Long = 8_000) {
+        touchHint = text
+        handler.removeCallbacks(clearTouchHint)
+        handler.postDelayed(clearTouchHint, ms)
+    }
+
+    private val clearTouchHint = Runnable { touchHint = null }
+
+    /** Включает или выключает нативное управление для этого ПК: действует сразу и запоминается. */
+    private fun setNativeTouch(on: Boolean) {
+        nativeTouchOn = on
+        device = device.copy(nativeTouch = on)
+        remoteView.setNativeTouch(on)
+        DeviceRepository.get(this).update(device.id) { it.copy(nativeTouch = on) }
+    }
+
+    /** Что делает перо в нативном режиме: действует сразу и запоминается для этого ПК. */
+    private fun setStylusMode(mode: StylusMode) {
+        if (mode == device.stylusMode) return
+        device = device.copy(stylusMode = mode)
+        remoteView.setStylusMode(mode)
+        DeviceRepository.get(this).update(device.id) { it.copy(stylusMode = mode) }
+    }
+
+    /** Действие кнопки пера: действует сразу и запоминается для этого ПК. */
+    private fun setStylusButton(action: StylusButtonAction) {
+        if (action == device.stylusButton) return
+        device = device.copy(stylusButton = action)
+        remoteView.setStylusButtonAction(action)
+        DeviceRepository.get(this).update(device.id) { it.copy(stylusButton = action) }
+    }
+
+    /** Отсечение ладони при пере: действует сразу и запоминается для этого ПК. */
+    private fun setPalmRejection(on: Boolean) {
+        if (on == device.palmRejection) return
+        device = device.copy(palmRejection = on)
+        remoteView.setPalmRejection(on)
+        DeviceRepository.get(this).update(device.id) { it.copy(palmRejection = on) }
+    }
+
+    /** Переключатель в меню и настройках сеанса. Если Windows канал не открыла, режим включается, но работает мышь — об этом подсказка. */
+    private fun toggleNativeTouch() {
+        val on = !nativeTouchOn
+        setNativeTouch(on)
+        when {
+            !on -> showTouchHint("Пальцы и перо управляют ПК как мышь (имитация)")
+            !touchChannelReady -> showTouchHint("Windows не открыла канал касаний: пока пальцы работают как мышь")
+            else -> showTouchHint("Пальцы и перо передаются Windows как настоящие касания")
         }
     }
 
@@ -412,7 +559,7 @@ class RemoteActivity : ComponentActivity() {
         return AgentLink(android.os.Build.MODEL, appVersion, object : AgentLink.Listener {
             override fun onAgentHello(version: String, notificationAccess: String) {
                 // Передаём агенту ключ для команды «Переключиться на Планшет» и начинаем её ждать.
-                agent?.sendPairing(device.id, AgentPairing(this@RemoteActivity).secretFor(device.id))
+                agent?.sendPairing(device.id, AgentPairing(this@RemoteActivity).secretFor(device.id), device.agentPortNumber)
                 runOnUiThread {
                     SwitchListenerService.startIfPaired(this@RemoteActivity)
                     if (!android.provider.Settings.canDrawOverlays(this@RemoteActivity) && !uiPrefs.getBoolean("overlay_asked", false)) {
@@ -679,7 +826,13 @@ class RemoteActivity : ComponentActivity() {
         remoteView.setScrollSettings(StrengthLevels.factor(device.scrollPercent), StrengthLevels.inertiaFactor(device.inertiaPercent))
         remoteView.setMouseSpeed(StrengthLevels.mouseFactor(device.mouseSpeedPercent))
         remoteView.setMouseWheelSpeed(StrengthLevels.factor(device.mouseWheelPercent))
+        remoteView.setStylusScrollSpeed(StrengthLevels.factor(device.stylusScrollPercent))
         remoteView.setDesktopProfile(if (device.os == OsType.UBUNTU) DesktopProfile.GNOME else DesktopProfile.WINDOWS)
+        nativeTouchOn = device.os == OsType.WINDOWS && device.nativeTouch == true
+        remoteView.setNativeTouch(nativeTouchOn)
+        remoteView.setStylusMode(device.stylusMode)
+        remoteView.setStylusButtonAction(device.stylusButton)
+        remoteView.setPalmRejection(device.palmRejection)
         captureOn = uiPrefs.getBoolean("tp_capture", true)
         if (uiPrefs.getBoolean("tp_cal", false)) {
             remoteView.touchpadAxes = TouchpadAxes(
@@ -879,7 +1032,10 @@ class RemoteActivity : ComponentActivity() {
             gfx = device.os == OsType.UBUNTU || device.windowsGfx,
             hardwareVideo = device.hardwareVideo,
             gfxClassic = device.os == OsType.WINDOWS,
+            touch = device.os == OsType.WINDOWS,
+            audioCompression = device.audioCompression,
         )
+        touchChannelReady = false
         agentInstalling = false
         agentVersion = null
         val link = createAgentLink()
@@ -929,7 +1085,7 @@ class RemoteActivity : ComponentActivity() {
                     // Планшет могли повернуть, пока шло подключение.
                     settleOrientation(afterReady = true)
                     if (powerAction == null) {
-                        SessionService.start(this@RemoteActivity, device.id, device.name)
+                        SessionService.start(this@RemoteActivity, device.id, device.name, location = locationOn)
                         askNotificationPermission()
                         // Повторные подключения при повороте экрана — тот же сеанс: в журнал он попадает один раз.
                         if (!sessionLogged) {
@@ -967,6 +1123,26 @@ class RemoteActivity : ComponentActivity() {
                 if (seq == sessionSeq) runOnUiThread { cameraOn = active }
             }
 
+            override fun onLocationActive(active: Boolean) {
+                runOnUiThread { if (seq == sessionSeq) locationActive = active }
+            }
+
+            override fun onTouchChannel(ready: Boolean, pen: Boolean) {
+                runOnUiThread {
+                    if (seq != sessionSeq) return@runOnUiThread
+                    touchChannelReady = ready
+                    // Первое подключение к этому ПК: Windows открыла канал касаний — включаем нативное управление сами.
+                    if (ready && device.nativeTouch == null && !isFinishing) {
+                        setNativeTouch(true)
+                        showTouchHint(
+                            "Включено нативное управление Windows: пальцы${if (pen) " и перо" else ""} передаются как настоящие касания. " +
+                                "Вернуть мышь — меню «⋮» → «Касание».",
+                            12_000,
+                        )
+                    }
+                }
+            }
+
             override fun onClosed(error: String?) {
                 runOnUiThread {
                     // Прежний клиент закрыт ради переподключения (поворот): сеанс продолжается в новом.
@@ -993,7 +1169,13 @@ class RemoteActivity : ComponentActivity() {
             // Микрофон и камера — только там, где Windows ждёт перенаправление: у Ubuntu этих каналов нет.
             audioSource = if (device.microphone && device.os == OsType.WINDOWS) MicSource() else null,
             camera = if (device.camera && device.os == OsType.WINDOWS && hasCameraPermission()) CameraSource(this, device.cameraOff, device.cameraRotation).also { cameraSource = it } else null,
+            locationSource = if (device.location && device.os == OsType.WINDOWS) TabletLocation(this).also { locationSource = it } else null,
         )
+        if (!(device.location && device.os == OsType.WINDOWS)) locationSource = null
+        // Windows открывает канал геолокации сама, поэтому при включённой настройке и выданном разрешении передача взводится
+        // сразу; без разрешения его спросит кнопка «Геолокация».
+        locationActive = false
+        locationOn = device.location && device.os == OsType.WINDOWS && hasLocationPermission() && c.setLocation(true)
         // Windows открывает канал микрофона сама, когда программа начинает запись, — кнопку «Микрофон»
         // успеть нажать до этого нельзя, поэтому при включённой настройке передача взводится сразу.
         micOn = device.microphone && device.os == OsType.WINDOWS && hasMicPermission() && c.setMicrophone(true)
@@ -1065,9 +1247,27 @@ class RemoteActivity : ComponentActivity() {
      * клавиатуры скан-код всегда есть, даже если приложение открыло экранную.
      */
     private fun handleKeyEvent(e: KeyEvent): Boolean {
+        if (stylusButtonAsKey(e)) return true
         if (mouseButtonAsKey(e)) return true
         val virtual = e.scanCode == 0 || e.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD
         return if (imeOn && virtual) forwardImeKey(e) else forwardKey(e)
+    }
+
+    /**
+     * Кнопка S Pen, пришедшая клавишей (`KEYCODE_STYLUS_BUTTON_*`, Android 14+): так её может отдать система, когда перо
+     * не над экраном, а на связи по Bluetooth. Выполняется действие кнопки пера ([RemoteView.stylusButtonKey]); жесты в
+     * воздухе (Air Actions) этим путём не приходят — им нужен Samsung S Pen Remote SDK. Каждое событие пишется в журнал
+     * (тег Input), по нему видно, что планшет реально присылает.
+     */
+    private fun stylusButtonAsKey(e: KeyEvent): Boolean {
+        val c = client
+        if (c == null || !c.isReady || state != SessionState.Connected) return false
+        if (e.keyCode !in KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY..KeyEvent.KEYCODE_STYLUS_BUTTON_TAIL) return false
+        if (e.action == KeyEvent.ACTION_DOWN && e.repeatCount == 0) {
+            android.util.Log.i("Input", "stylus key ${KeyEvent.keyCodeToString(e.keyCode)} scan=${e.scanCode} source=0x${e.source.toString(16)} device=${e.device?.name}")
+        }
+        if (!lockedCover && e.repeatCount == 0) remoteView.stylusButtonKey(e.action == KeyEvent.ACTION_DOWN)
+        return true
     }
 
     /**
@@ -1449,17 +1649,24 @@ class RemoteActivity : ComponentActivity() {
         finish()
     }
 
-    /** Новая сила прокрутки, инерции, скорость мыши и её колёсика действуют сразу и запоминаются для этого ПК. */
-    private fun applyInputLevels(scroll: Int, inertia: Int, mouse: Int, wheel: Int) {
+    /** Новая сила прокрутки, инерции, скорость мыши, её колёсика и прокрутки пером действуют сразу и запоминаются для этого ПК. */
+    private fun applyInputLevels(scroll: Int, inertia: Int, mouse: Int, wheel: Int, stylus: Int) {
         if (scroll == device.scrollPercent && inertia == device.inertiaPercent && mouse == device.mouseSpeedPercent &&
-            wheel == device.mouseWheelPercent
+            wheel == device.mouseWheelPercent && stylus == device.stylusScrollPercent
         ) return
-        device = device.copy(scrollPercent = scroll, inertiaPercent = inertia, mouseSpeedPercent = mouse, mouseWheelPercent = wheel)
+        device = device.copy(
+            scrollPercent = scroll, inertiaPercent = inertia, mouseSpeedPercent = mouse, mouseWheelPercent = wheel,
+            stylusScrollPercent = stylus,
+        )
         remoteView.setScrollSettings(StrengthLevels.factor(scroll), StrengthLevels.inertiaFactor(inertia))
         remoteView.setMouseSpeed(StrengthLevels.mouseFactor(mouse))
         remoteView.setMouseWheelSpeed(StrengthLevels.factor(wheel))
+        remoteView.setStylusScrollSpeed(StrengthLevels.factor(stylus))
         DeviceRepository.get(this).update(device.id) {
-            it.copy(scrollPercent = scroll, inertiaPercent = inertia, mouseSpeedPercent = mouse, mouseWheelPercent = wheel)
+            it.copy(
+                scrollPercent = scroll, inertiaPercent = inertia, mouseSpeedPercent = mouse, mouseWheelPercent = wheel,
+                stylusScrollPercent = stylus,
+            )
         }
     }
 
@@ -1568,6 +1775,8 @@ class RemoteActivity : ComponentActivity() {
 
             if (state == SessionState.Connected) powerStatus?.let { PowerBanner(it) }
             if (state == SessionState.Connected) micHint?.let { MicBanner(it, phone) }
+            if (state == SessionState.Connected) locationHint?.let { HintBanner(Icons.Outlined.LocationOff, it, phone) }
+            if (state == SessionState.Connected) touchHint?.let { HintBanner(Icons.Outlined.PanTool, it, phone) }
             if (state == SessionState.Connected) {
                 cameraHint?.let { CameraBanner(it, phone, onGrant = { requestCamera.launch(android.Manifest.permission.CAMERA) }.takeIf { !hasCameraPermission() }) }
             }
@@ -1674,6 +1883,14 @@ class RemoteActivity : ComponentActivity() {
                             active = cameraShared,
                         ) { toggleCamera(); onBusy() }
                     }
+                    // Включённая, но неактивная кнопка: ждём, пока Windows запросит местоположение (канал открывает она).
+                    if (device.os == OsType.WINDOWS) {
+                        BarIcon(
+                            if (locationOn) Icons.Outlined.LocationOn else Icons.Outlined.LocationOff,
+                            when { locationActive -> "Геолокация передаётся"; locationOn -> "Геолокация: ждём Windows"; else -> "Геолокация" },
+                            active = locationOn,
+                        ) { toggleLocation(); onBusy() }
+                    }
                     BarIcon(Icons.Outlined.Window, "Win") { tapWinKey(); onCollapse() }
                     // Пока на ПК агент старее вложенного в приложение, кнопка всегда на виду (подсвечена).
                     if (agentUpdateAvailable()) {
@@ -1703,6 +1920,9 @@ class RemoteActivity : ComponentActivity() {
             BarMenuItem(Icons.Outlined.ScreenRotation, "Повернуть", act { rotateSession() })
             if (capturedByTouchpad) {
                 BarMenuItem(Icons.Outlined.TouchApp, if (captureOn) "Жесты: ПК" else "Жесты: планшет", act { toggleCapture() })
+            }
+            if (device.os == OsType.WINDOWS) {
+                BarMenuItem(Icons.Outlined.PanTool, if (nativeTouchOn) "Касание: Windows" else "Касание: мышь", act { toggleNativeTouch() })
             }
             BarMenuItem(Icons.Outlined.Lock, "Ctrl+Alt+Del", act { sendCtrlAltEnd() })
             // На планшете с чехлом Alt+Tab есть на самой клавиатуре; без неё переключать окна иначе нечем.
@@ -1898,7 +2118,11 @@ class RemoteActivity : ComponentActivity() {
         var inertia by remember { mutableStateOf(device.inertiaPercent.toFloat()) }
         var mouse by remember { mutableStateOf(device.mouseSpeedPercent.toFloat()) }
         var wheel by remember { mutableStateOf(device.mouseWheelPercent.toFloat()) }
-        fun apply() = applyInputLevels(StrengthLevels.snap(scroll), StrengthLevels.snap(inertia), StrengthLevels.snap(mouse), StrengthLevels.snap(wheel))
+        var stylusScroll by remember { mutableStateOf(device.stylusScrollPercent.toFloat()) }
+        fun apply() = applyInputLevels(
+            StrengthLevels.snap(scroll), StrengthLevels.snap(inertia), StrengthLevels.snap(mouse), StrengthLevels.snap(wheel),
+            StrengthLevels.snap(stylusScroll),
+        )
 
         Box(
             Modifier.fillMaxSize().background(Color(0x66000000))
@@ -1914,6 +2138,50 @@ class RemoteActivity : ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             Text("Настройки сеанса", color = TextPrimary, fontSize = 18.sp)
+            if (device.os == OsType.WINDOWS) {
+                SettingSwitch(
+                    "Нативное касание Windows",
+                    if (nativeTouchOn && !touchChannelReady) "Windows не открыла канал касаний: пока пальцы работают как мышь."
+                    else "Пальцы и перо передаются Windows как настоящие касания; жесты, прокрутку и сенсорную клавиатуру ведёт она. Выключено: имитация мыши с жестами приложения.",
+                    nativeTouchOn,
+                ) { toggleNativeTouch() }
+                if (nativeTouchOn) {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Перо S Pen", color = TextPrimary, fontSize = 15.sp)
+                        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            StylusMode.entries.forEach { mode ->
+                                RotationButton(mode.title, device.stylusMode == mode) { setStylusMode(mode) }
+                            }
+                        }
+                        Text(
+                            when (device.stylusMode) {
+                                StylusMode.MOUSE -> "Наведение водит курсор, кнопка пера — правая кнопка мыши, движение по экрану — жесты по форме курсора."
+                                StylusMode.TOUCH -> "Перо передаётся Windows обычным касанием, как палец; наведения, нажима и кнопки нет."
+                                StylusMode.PEN -> "Настоящее перо Windows: наведение, нажим, кнопка и ластик. Если ПК перо не принимает, работает как мышь."
+                            },
+                            color = TextSecondary, fontSize = 12.sp,
+                        )
+                    }
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("Кнопка пера S Pen", color = TextPrimary, fontSize = 15.sp)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    StylusButtonAction.entries.forEach { action ->
+                        RotationButton(action.title, device.stylusButton == action) { setStylusButton(action) }
+                    }
+                }
+                Text(
+                    "Что делает кнопка на пере. «Ластик» работает в режиме «Перо Windows», в режиме мыши это правая кнопка. " +
+                        "«Фрагмент экрана» — Win+Shift+S (на Ubuntu — Print).",
+                    color = TextSecondary, fontSize = 12.sp,
+                )
+            }
+            SettingSwitch(
+                "Игнорировать ладонь",
+                "Пока перо над экраном или на нём, новые касания пальцем не передаются на ПК.",
+                device.palmRejection,
+            ) { setPalmRejection(!device.palmRejection) }
             StrengthSlider(
                 title = "Сила скролла",
                 hint = "Прокрутка двумя пальцами на тачпаде и сенсорном экране.",
@@ -1938,11 +2206,24 @@ class RemoteActivity : ComponentActivity() {
                 value = wheel,
                 onChange = { wheel = it; apply() },
             )
+            StrengthSlider(
+                title = "Скорость прокрутки пером",
+                hint = "Прокрутка пером S Pen по экрану; 100% — как пальцем (с учётом силы скролла).",
+                value = stylusScroll,
+                onChange = { stylusScroll = it; apply() },
+            )
             if (capturedByTouchpad) {
                 SettingSwitch("Жесты тачпада — на ПК", "Выключено: жесты обрабатывает планшет.", captureOn) { toggleCapture() }
             }
             if (device.microphone) {
                 SettingSwitch("Микрофон планшета", "Передавать звук с микрофона на ПК.", micOn) { toggleMic() }
+            }
+            if (device.location) {
+                SettingSwitch(
+                    "Геолокация планшета",
+                    if (locationActive) "Координаты передаются Windows." else "Передавать координаты планшета на ПК: программы Windows получат их как от датчика местоположения.",
+                    locationOn,
+                ) { toggleLocation() }
             }
             if (device.camera) {
                 SettingSwitch("Камера планшета", "Показать камеры планшета программам Windows.", cameraShared) { toggleCamera() }

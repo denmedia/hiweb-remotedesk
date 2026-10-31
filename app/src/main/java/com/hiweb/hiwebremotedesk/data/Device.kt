@@ -8,6 +8,38 @@ enum class OsType(val title: String, val defaultPort: Int) {
     UBUNTU("Ubuntu", 3390),
 }
 
+/**
+ * Как перо S Pen работает в нативном режиме Windows ([Device.nativeTouch]); без нативного режима перо всегда как мышь.
+ */
+enum class StylusMode(val title: String) {
+    /** Мышь: наведение водит курсор, кнопка пера — правая кнопка, движение — жесты по форме курсора. */
+    MOUSE("Мышь"),
+
+    /** Как палец: перо передаётся Windows обычным касанием (без наведения, нажима и кнопки). */
+    TOUCH("Касание пальцем"),
+
+    /** Настоящее перо Windows с наведением, нажимом и кнопкой (если сервер его принимает, иначе — мышь). */
+    PEN("Перо Windows"),
+}
+
+/** Что делает кнопка на пере S Pen (одинаково в режимах «мышь» и «перо Windows»; ластик — только в «перо Windows»). */
+enum class StylusButtonAction(val title: String) {
+    /** Правая кнопка мыши; у настоящего пера Windows — кнопка пера (в программах она обычно открывает меню). */
+    RIGHT("Правая кнопка"),
+
+    /** Перевернутое перо (ластик) на время нажатия; в режиме мыши работает как правая кнопка. */
+    ERASER("Ластик"),
+
+    /** Средняя кнопка мыши. */
+    MIDDLE("Средняя кнопка"),
+
+    /** Снимок фрагмента экрана: Win+Shift+S на Windows, Print на Ubuntu. */
+    SNIP("Фрагмент экрана"),
+
+    /** Отмена (Ctrl+Z). */
+    UNDO("Отмена"),
+}
+
 data class Device(
     val id: String,
     val name: String,
@@ -33,6 +65,8 @@ data class Device(
     val mouseSpeedPercent: Int = StrengthLevels.DEFAULT,
     /** Скорость прокрутки колёсиком физической мыши, % (50–200 с шагом 10; 100 — один щелчок колеса как у Windows). */
     val mouseWheelPercent: Int = StrengthLevels.DEFAULT,
+    /** Скорость прокрутки пером S Pen, % (50–200 с шагом 10) поверх силы скролла пальцами: 100 — как пальцем. */
+    val stylusScrollPercent: Int = StrengthLevels.DEFAULT,
     /** Обмен файлами через буфер обмена: копирование на ПК (Ctrl+C) и с планшета с вставкой (Ctrl+V). */
     val fileTransfer: Boolean = true,
     /**
@@ -48,6 +82,17 @@ data class Device(
     val windowsGfx: Boolean = false,
     /** Микрофон планшета доступен Windows в сеансе (канал audin, устройство «Микрофон … (перенаправлено)»). */
     val microphone: Boolean = false,
+    /**
+     * Сжатие звука: клиент принимает от сервера IMA/MS ADPCM и G.711 (звук ПК на планшет) и сам сжимает ими микрофон.
+     * Поток в 2–4 раза меньше, качество чуть ниже; нужно для медленного канала. Применяется при следующем подключении.
+     */
+    val audioCompression: Boolean = false,
+    /**
+     * Геолокация планшета доступна Windows в сеансе (канал location, MS-RDPEL): программы на ПК (карты, погода, браузер)
+     * получают координаты планшета как от датчика местоположения. Передача включается кнопкой «Геолокация» в панели сеанса
+     * и при старте сеанса взводится сама, если выдано разрешение Android.
+     */
+    val location: Boolean = false,
     /** Камера планшета доступна программам Windows (канал rdpecam). */
     val camera: Boolean = false,
     /** Идентификаторы камер планшета (`CameraSource.catalog`), которые НЕ показываются Windows; остальные — показываются. */
@@ -65,7 +110,30 @@ data class Device(
     val colorDepth: Int = DEFAULT_COLOR_DEPTH,
     /** MAC-адрес проводной сетевой карты для пробуждения по сети; пусто — не будить. Агент заполняет сам. */
     val wakeMac: String = "",
+    /**
+     * Порт планшета для HiWeb Agent этого ПК; null — стандартный [NetworkPorts.AGENT_DEFAULT]. Меняется, только если
+     * агент подключается к планшету через проброс портов на роутере.
+     */
+    val agentPort: Int? = null,
+    /** Порт SSH на Ubuntu (питание); null — стандартный [NetworkPorts.SSH_DEFAULT]. */
+    val sshPort: Int? = null,
+    /**
+     * Нативное управление Windows пальцами и пером (касания RDPEI вместо имитации мыши): жесты разбирает сама Windows.
+     * null — ещё не определено: при первом подключении, если Windows открыла канал касаний, значение становится true.
+     * Только для Windows.
+     */
+    val nativeTouch: Boolean? = null,
+    /** Поведение пера в нативном режиме ([nativeTouch]); по умолчанию — настоящее перо Windows. */
+    val stylusMode: StylusMode = StylusMode.PEN,
+    /** Действие кнопки пера. */
+    val stylusButton: StylusButtonAction = StylusButtonAction.RIGHT,
+    /** Пока перо над экраном или на нём, новые касания пальцем (ладонь) игнорируются. */
+    val palmRejection: Boolean = true,
 ) {
+    val agentPortNumber: Int get() = agentPort ?: NetworkPorts.AGENT_DEFAULT
+
+    val sshPortNumber: Int get() = sshPort ?: NetworkPorts.SSH_DEFAULT
+
     val hasCredentials: Boolean get() = username.isNotBlank() && password.isNotEmpty()
 
     val canWake: Boolean get() = WakeOnLan.parseMac(wakeMac) != null

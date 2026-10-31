@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
@@ -51,6 +52,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.hiweb.hiwebremotedesk.data.NetworkPorts
 import com.hiweb.hiwebremotedesk.data.OsDetector
 import com.hiweb.hiwebremotedesk.data.WakeOnLan
 import androidx.compose.runtime.getValue
@@ -74,6 +76,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 import com.hiweb.hiwebremotedesk.data.StrengthLevels
+import com.hiweb.hiwebremotedesk.data.StylusButtonAction
+import com.hiweb.hiwebremotedesk.data.StylusMode
 import com.hiweb.hiwebremotedesk.data.Device
 import com.hiweb.hiwebremotedesk.data.FoundHost
 import com.hiweb.hiwebremotedesk.data.OsType
@@ -139,10 +143,17 @@ fun DeviceEditDialog(
     var inertiaPercent by remember { mutableStateOf((device?.inertiaPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var mouseSpeedPercent by remember { mutableStateOf((device?.mouseSpeedPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var mouseWheelPercent by remember { mutableStateOf((device?.mouseWheelPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var stylusScrollPercent by remember { mutableStateOf((device?.stylusScrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var fileTransfer by remember { mutableStateOf(device?.fileTransfer ?: true) }
     var hardwareVideo by remember { mutableStateOf(device?.hardwareVideo ?: true) }
     var windowsGfx by remember { mutableStateOf(device?.windowsGfx ?: false) }
+    var nativeTouch by remember { mutableStateOf(device?.nativeTouch) }
+    var stylusMode by remember { mutableStateOf(device?.stylusMode ?: StylusMode.PEN) }
+    var stylusButton by remember { mutableStateOf(device?.stylusButton ?: StylusButtonAction.RIGHT) }
+    var palmRejection by remember { mutableStateOf(device?.palmRejection ?: true) }
     var microphone by remember { mutableStateOf(device?.microphone ?: false) }
+    var audioCompression by remember { mutableStateOf(device?.audioCompression ?: false) }
+    var location by remember { mutableStateOf(device?.location ?: false) }
     var camera by remember { mutableStateOf(device?.camera ?: false) }
     val cameraOff = remember { mutableStateListOf<String>().apply { addAll(device?.cameraOff.orEmpty()) } }
     val cameraRotation = remember { mutableStateMapOf<String, Int>().apply { putAll(device?.cameraRotation.orEmpty()) } }
@@ -151,6 +162,8 @@ fun DeviceEditDialog(
     var driveName by remember { mutableStateOf(device?.driveName ?: Device.DEFAULT_DRIVE_NAME) }
     var driveReadOnly by remember { mutableStateOf(device?.driveReadOnly ?: false) }
     var wakeMac by remember { mutableStateOf(device?.wakeMac ?: "") }
+    var agentPort by remember { mutableStateOf(device?.agentPort?.toString() ?: "") }
+    var sshPort by remember { mutableStateOf(device?.sshPort?.toString() ?: "") }
     val wakeMacError = wakeMac.isNotBlank() && WakeOnLan.parseMac(wakeMac) == null
     var tried by remember { mutableStateOf(false) }
     // Ручной выбор имеет приоритет: после него автоопределение больше не меняет систему и порт.
@@ -198,11 +211,14 @@ fun DeviceEditDialog(
     val hostError = tried && host.isBlank()
     val portError = tried && (portNum == null || portNum !in 1..65535)
     val driveError = tried && driveEnabled && driveUri == null
+    // Порт агента есть только у Windows, порт SSH — только у Ubuntu; скрытое поле сохранению не мешает.
+    val agentPortOk = os != OsType.WINDOWS || NetworkPorts.isValid(agentPort, NetworkPorts.AGENT_RANGE)
+    val sshPortOk = os != OsType.UBUNTU || NetworkPorts.isValid(sshPort, NetworkPorts.SSH_RANGE)
+    val netError = wakeMacError || !agentPortOk || !sshPortOk
 
-    // Вкладка «Устройства» — только для Windows; при смене системы выбранная вкладка может исчезнуть.
-    val tabs = EditTab.entries.filter { it != EditTab.MEDIA || os == OsType.WINDOWS }
+    val tabs = EditTab.entries
     var tab by remember { mutableStateOf(EditTab.MAIN) }
-    val currentTab = if (tab in tabs) tab else EditTab.MAIN
+    val currentTab = tab
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -219,8 +235,8 @@ fun DeviceEditDialog(
                 ) {
                     tabs.forEach { t ->
                         val bad = when (t) {
-                            EditTab.MAIN -> hostError || portError || wakeMacError
-                            EditTab.FILES -> driveError
+                            EditTab.MAIN -> hostError || portError || (tried && netError)
+                            EditTab.DEVICES -> driveError
                             else -> false
                         }
                         Tab(
@@ -287,17 +303,6 @@ fun DeviceEditDialog(
                                 colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
                             )
                             PasswordField(pass, { pass = it }, modifier = Modifier.fillMaxWidth())
-                            OutlinedTextField(
-                                wakeMac, { wakeMac = it.trim().take(17) }, label = { Text("MAC-адрес для пробуждения по сети") }, singleLine = true,
-                                isError = wakeMacError, placeholder = { Text("00:1A:2B:3C:4D:5E") },
-                                supportingText = {
-                                    Text(
-                                        if (wakeMacError) "Неверный MAC-адрес"
-                                        else "Спящий или выключенный ПК будится при подключении (Wake-on-LAN). HiWeb Agent заполняет адрес сам.",
-                                    )
-                                },
-                                colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
-                            )
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
                                     Text("Проверка подлинности NLA", color = TextPrimary, fontSize = 15.sp)
@@ -309,6 +314,47 @@ fun DeviceEditDialog(
                                 }
                                 Switch(checked = useNla, onCheckedChange = { useNla = it })
                             }
+                            if (os == OsType.WINDOWS) {
+                                OutlinedTextField(
+                                    agentPort, { agentPort = it.filter(Char::isDigit).take(5) }, label = { Text("Порт агента HiWeb") }, singleLine = true,
+                                    isError = tried && !agentPortOk, placeholder = { Text(NetworkPorts.AGENT_DEFAULT.toString()) },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    supportingText = {
+                                        Text(
+                                            if (tried && !agentPortOk) "Допустимы порты ${NetworkPorts.AGENT_RANGE.first}–${NetworkPorts.AGENT_RANGE.last}"
+                                            else "Порт на планшете, к которому подключается агент. Менять его нужно только при «пробросе портов» на роутере " +
+                                                "для доступа вне локальной сети, иначе оставьте поле пустым. Агент узнаёт новый порт при следующем подключении к ПК.",
+                                        )
+                                    },
+                                    colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                            if (os == OsType.UBUNTU) {
+                                OutlinedTextField(
+                                    sshPort, { sshPort = it.filter(Char::isDigit).take(5) }, label = { Text("Порт SSH") }, singleLine = true,
+                                    isError = tried && !sshPortOk, placeholder = { Text(NetworkPorts.SSH_DEFAULT.toString()) },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                    supportingText = {
+                                        Text(
+                                            if (tried && !sshPortOk) "Допустимы порты ${NetworkPorts.SSH_RANGE.first}–${NetworkPorts.SSH_RANGE.last}"
+                                            else "Нужен для выключения и перезагрузки Ubuntu. Менять его нужно только если SSH на ПК слушает другой порт " +
+                                                "или проброшен на роутере под другим номером, иначе оставьте поле пустым.",
+                                        )
+                                    },
+                                    colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                            OutlinedTextField(
+                                wakeMac, { wakeMac = it.trim().take(17) }, label = { Text("MAC-адрес для пробуждения по сети") }, singleLine = true,
+                                isError = wakeMacError, placeholder = { Text("00:1A:2B:3C:4D:5E") },
+                                supportingText = {
+                                    Text(
+                                        if (wakeMacError) "Неверный MAC-адрес"
+                                        else "Спящий или выключенный ПК будится при подключении (Wake-on-LAN). HiWeb Agent заполняет адрес сам.",
+                                    )
+                                },
+                                colors = fieldColors(), modifier = Modifier.fillMaxWidth(),
+                            )
                             Text(if (os == OsType.UBUNTU) "Ubuntu · RDP" else "Windows · RDP", color = TextSecondary, fontSize = 12.sp)
                             if (onResetCertificate != null && device?.certSha256 != null) {
                                 TextButton(onClick = { onResetCertificate(); onDismiss() }) { Text("Сбросить доверие к сертификату", color = TextSecondary) }
@@ -381,6 +427,97 @@ fun DeviceEditDialog(
                                     Switch(checked = hardwareVideo, onCheckedChange = { hardwareVideo = it })
                                 }
                             }
+                            if (os == OsType.WINDOWS) {
+                                Column {
+                                    Text("Касание экрана", color = TextPrimary, fontSize = 15.sp)
+                                    Row(
+                                        Modifier.horizontalScroll(rememberScrollState()),
+                                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        listOf<Pair<Boolean?, String>>(null to "Авто", true to "Нативное", false to "Мышь").forEach { (value, label) ->
+                                            Row(
+                                                Modifier.selectable(selected = nativeTouch == value, role = Role.RadioButton, onClick = { nativeTouch = value }),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                RadioButton(
+                                                    selected = nativeTouch == value, onClick = null,
+                                                    colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextSecondary),
+                                                )
+                                                Text(label, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.padding(start = 4.dp, end = 10.dp, top = 8.dp, bottom = 8.dp))
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        "Нативное: пальцы и перо передаются Windows как настоящие касания (RDPEI), жесты и прокрутку ведёт она; " +
+                                            "ползунки силы скролла и инерции на них не действуют. Мышь: приложение имитирует мышь и свои жесты. " +
+                                            "Авто: при первом подключении, если Windows принимает касания, включается нативное. Переключается и в сеансе.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                            }
+                            if (os == OsType.WINDOWS) {
+                                Column {
+                                    Text("Перо S Pen в нативном режиме", color = TextPrimary, fontSize = 15.sp)
+                                    Row(
+                                        Modifier.horizontalScroll(rememberScrollState()),
+                                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        StylusMode.entries.forEach { mode ->
+                                            Row(
+                                                Modifier.selectable(selected = stylusMode == mode, role = Role.RadioButton, onClick = { stylusMode = mode }),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                RadioButton(
+                                                    selected = stylusMode == mode, onClick = null,
+                                                    colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextSecondary),
+                                                )
+                                                Text(mode.title, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.padding(start = 4.dp, end = 10.dp, top = 8.dp, bottom = 8.dp))
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        "Мышь: наведение водит курсор, кнопка пера — правая кнопка, жесты по форме курсора. Касание пальцем: перо идёт " +
+                                            "обычным касанием без наведения, нажима и кнопки. Перо Windows: наведение, нажим, кнопка и ластик (если ПК " +
+                                            "перо принимает, иначе — мышь). Без нативного режима перо всегда как мышь. Меняется и в сеансе.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                            }
+                            Column {
+                                Text("Кнопка пера S Pen", color = TextPrimary, fontSize = 15.sp)
+                                Row(
+                                    Modifier.horizontalScroll(rememberScrollState()),
+                                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    StylusButtonAction.entries.forEach { action ->
+                                        Row(
+                                            Modifier.selectable(selected = stylusButton == action, role = Role.RadioButton, onClick = { stylusButton = action }),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                        ) {
+                                            RadioButton(
+                                                selected = stylusButton == action, onClick = null,
+                                                colors = RadioButtonDefaults.colors(selectedColor = Accent, unselectedColor = TextSecondary),
+                                            )
+                                            Text(action.title, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.padding(start = 4.dp, end = 10.dp, top = 8.dp, bottom = 8.dp))
+                                        }
+                                    }
+                                }
+                                Text(
+                                    "Что делает кнопка на пере. «Ластик» работает в режиме «Перо Windows», в режиме мыши это правая кнопка. " +
+                                        "«Фрагмент экрана» — Win+Shift+S (на Ubuntu — Print). Меняется и в сеансе.",
+                                    color = TextSecondary, fontSize = 12.sp,
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("Игнорировать ладонь", color = TextPrimary, fontSize = 15.sp)
+                                    Text(
+                                        "Пока перо над экраном или на нём, новые касания пальцем не передаются на ПК.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
+                                }
+                                Switch(checked = palmRejection, onCheckedChange = { palmRejection = it })
+                            }
                             StrengthSlider(
                                 title = "Сила скролла",
                                 hint = "Скорость прокрутки двумя пальцами на тачпаде и сенсорном экране. Применяется при следующем подключении.",
@@ -405,65 +542,98 @@ fun DeviceEditDialog(
                                 value = mouseWheelPercent,
                                 onChange = { mouseWheelPercent = it },
                             )
+                            StrengthSlider(
+                                title = "Скорость прокрутки пером",
+                                hint = "Прокрутка пером S Pen по экрану; 100% — как пальцем (с учётом силы скролла). Применяется при следующем подключении.",
+                                value = stylusScrollPercent,
+                                onChange = { stylusScrollPercent = it },
+                            )
                         }
-                        EditTab.MEDIA -> {
+                        EditTab.DEVICES -> {
+                            SectionTitle("Звук")
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
-                                    Text("Микрофон планшета", color = TextPrimary, fontSize = 15.sp)
+                                    Text("Сжатие звука", color = TextPrimary, fontSize = 15.sp)
                                     Text(
-                                        "Windows увидит микрофон планшета как устройство записи «перенаправлено». Передача включается " +
-                                            "кнопкой «Микрофон» в меню сеанса, чтобы звук не записывался незаметно.",
+                                        "Звук ПК и микрофон передаются сжатыми (ADPCM, G.711) — поток в 2–4 раза меньше, " +
+                                            "полезно при медленной связи. Качество чуть ниже. Если ПК не предложит " +
+                                            "подходящего формата, звук идёт как обычно. Применяется при следующем подключении.",
                                         color = TextSecondary, fontSize = 12.sp,
                                     )
                                 }
-                                Switch(checked = microphone, onCheckedChange = { microphone = it })
+                                Switch(checked = audioCompression, onCheckedChange = { audioCompression = it })
                             }
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Column(Modifier.weight(1f)) {
-                                    Text("Камера планшета", color = TextPrimary, fontSize = 15.sp)
-                                    Text(
-                                        "В программах Windows (Zoom, Teams, браузер, «Камера») появятся камеры планшета: " +
-                                            "каждая — отдельным устройством, 720p. Передаёт кадры та программа, которая открыла камеру. " +
-                                            "Применяется при следующем подключении.",
-                                        color = TextSecondary, fontSize = 12.sp,
-                                    )
-                                }
-                                Switch(checked = camera, onCheckedChange = { camera = it })
-                            }
-                            if (camera) {
-                                val cameras = remember { runCatching { CameraSource(context).catalog() }.getOrDefault(emptyList()) }
-                                if (cameras.isEmpty()) {
-                                    Text("На этом устройстве камер не найдено.", color = TextSecondary, fontSize = 12.sp)
-                                }
-                                cameras.forEach { (id, title) ->
-                                    val shared = id !in cameraOff
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Text(title, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
-                                        Switch(
-                                            checked = shared,
-                                            onCheckedChange = { if (it) cameraOff.remove(id) else if (id !in cameraOff) cameraOff.add(id) },
+                            if (os == OsType.WINDOWS) {
+                                SectionTitle("Микрофон, камера и геолокация")
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Микрофон планшета", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            "Windows увидит микрофон планшета как устройство записи «перенаправлено». Передача включается " +
+                                                "кнопкой «Микрофон» в меню сеанса, чтобы звук не записывался незаметно.",
+                                            color = TextSecondary, fontSize = 12.sp,
                                         )
                                     }
-                                    if (shared) {
-                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            Text("Поворот", color = TextSecondary, fontSize = 12.sp)
-                                            val current = cameraRotation[id] ?: 0
-                                            Device.CAMERA_ROTATIONS.forEach { degrees ->
-                                                RotationButton("$degrees°", current == degrees) {
-                                                    if (degrees == 0) cameraRotation.remove(id) else cameraRotation[id] = degrees
+                                    Switch(checked = microphone, onCheckedChange = { microphone = it })
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Камера планшета", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            "В программах Windows (Zoom, Teams, браузер, «Камера») появятся камеры планшета: " +
+                                                "каждая — отдельным устройством, 720p. Передаёт кадры та программа, которая открыла камеру. " +
+                                                "Применяется при следующем подключении.",
+                                            color = TextSecondary, fontSize = 12.sp,
+                                        )
+                                    }
+                                    Switch(checked = camera, onCheckedChange = { camera = it })
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Геолокация планшета", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            "Программы Windows (карты, погода, браузер) получат координаты планшета как от датчика " +
+                                                "местоположения. В Windows должен быть включён доступ к местоположению. Передача " +
+                                                "включается кнопкой «Геолокация» в панели сеанса. Применяется при следующем подключении.",
+                                            color = TextSecondary, fontSize = 12.sp,
+                                        )
+                                    }
+                                    Switch(checked = location, onCheckedChange = { location = it })
+                                }
+                                if (camera) {
+                                    val cameras = remember { runCatching { CameraSource(context).catalog() }.getOrDefault(emptyList()) }
+                                    if (cameras.isEmpty()) {
+                                        Text("На этом устройстве камер не найдено.", color = TextSecondary, fontSize = 12.sp)
+                                    }
+                                    cameras.forEach { (id, title) ->
+                                        val shared = id !in cameraOff
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(title, color = TextPrimary, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                                            Switch(
+                                                checked = shared,
+                                                onCheckedChange = { if (it) cameraOff.remove(id) else if (id !in cameraOff) cameraOff.add(id) },
+                                            )
+                                        }
+                                        if (shared) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Text("Поворот", color = TextSecondary, fontSize = 12.sp)
+                                                val current = cameraRotation[id] ?: 0
+                                                Device.CAMERA_ROTATIONS.forEach { degrees ->
+                                                    RotationButton("$degrees°", current == degrees) {
+                                                        if (degrees == 0) cameraRotation.remove(id) else cameraRotation[id] = degrees
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    Text(
+                                        "Поворот добавляется к автоматическому по часовой стрелке: если картинка в программе на ПК " +
+                                            "перевёрнута, выберите 180°.",
+                                        color = TextSecondary, fontSize = 12.sp,
+                                    )
                                 }
-                                Text(
-                                    "Поворот добавляется к автоматическому по часовой стрелке: если картинка в программе на ПК " +
-                                        "перевёрнута, выберите 180°.",
-                                    color = TextSecondary, fontSize = 12.sp,
-                                )
                             }
-                        }
-                        EditTab.FILES -> {
+                            SectionTitle("Файлы")
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f)) {
                                     Text("Файлы через буфер обмена", color = TextPrimary, fontSize = 15.sp)
@@ -520,11 +690,12 @@ fun DeviceEditDialog(
         confirmButton = {
             TextButton(onClick = {
                 tried = true
-                val mainOk = host.isNotBlank() && portNum != null && portNum in 1..65535 && !wakeMacError
+                val mainOk = host.isNotBlank() && portNum != null && portNum in 1..65535
+                val netOk = !netError
                 val filesOk = !(driveEnabled && driveUri == null)
                 // Ошибка может быть на вкладке, которой сейчас не видно, — переходим к ней.
-                if (!mainOk) tab = EditTab.MAIN else if (!filesOk) tab = EditTab.FILES
-                if (mainOk && filesOk) {
+if (!mainOk || !netOk) tab = EditTab.MAIN else if (!filesOk) tab = EditTab.DEVICES
+                if (mainOk && netOk && filesOk) {
                     onSave(
                         (device ?: Device(newId(), "", "")).copy(
                             name = name.ifBlank { host },
@@ -540,10 +711,17 @@ fun DeviceEditDialog(
                             inertiaPercent = StrengthLevels.snap(inertiaPercent),
                             mouseSpeedPercent = StrengthLevels.snap(mouseSpeedPercent),
                             mouseWheelPercent = StrengthLevels.snap(mouseWheelPercent),
+                            stylusScrollPercent = StrengthLevels.snap(stylusScrollPercent),
                             fileTransfer = fileTransfer,
                             hardwareVideo = hardwareVideo,
                             windowsGfx = windowsGfx,
+                            nativeTouch = if (os == OsType.WINDOWS) nativeTouch else null,
+                            stylusMode = stylusMode,
+                            stylusButton = stylusButton,
+                            palmRejection = palmRejection,
                             microphone = microphone,
+                            audioCompression = audioCompression,
+                            location = location,
                             camera = camera,
                             cameraOff = cameraOff.toSet(),
                             cameraRotation = cameraRotation.toMap(),
@@ -552,6 +730,8 @@ fun DeviceEditDialog(
                             driveName = driveName.ifBlank { Device.DEFAULT_DRIVE_NAME },
                             driveReadOnly = driveReadOnly,
                             wakeMac = WakeOnLan.parseMac(wakeMac)?.let(WakeOnLan::formatMac).orEmpty(),
+                            agentPort = NetworkPorts.parse(agentPort, NetworkPorts.AGENT_RANGE, NetworkPorts.AGENT_DEFAULT),
+                            sshPort = NetworkPorts.parse(sshPort, NetworkPorts.SSH_RANGE, NetworkPorts.SSH_DEFAULT),
                             // При смене адреса закреплённый сертификат больше не актуален.
                             certSha256 = if (device != null && device.host == host && device.port == portNum) device.certSha256 else null,
                         ),
@@ -671,12 +851,20 @@ fun DiscoveryDialog(
     )
 }
 
-/** Вкладки формы устройства. */
+/**
+ * Вкладки формы устройства. Мелкие группы настроек (адрес, порты и пробуждение; микрофон с камерой и файлы) собраны
+ * по смыслу в одну вкладку, а не размазаны по вкладке на два-три поля.
+ */
 private enum class EditTab(val title: String) {
     MAIN("Подключение"),
     DISPLAY("Экран и ввод"),
-    MEDIA("Устройства"),
-    FILES("Файлы"),
+    DEVICES("Устройства и файлы"),
+}
+
+/** Подзаголовок раздела внутри вкладки. */
+@Composable
+private fun SectionTitle(text: String) {
+    Text(text, color = Accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 6.dp))
 }
 
 /** Кнопка выбора поворота камеры: выбранная залита цветом акцента. */

@@ -3,6 +3,7 @@ package com.hiweb.hiwebremotedesk.agent
 import android.graphics.BitmapFactory
 import android.util.Log
 import com.hiweb.hiwebremotedesk.rdp.CursorImage
+import com.hiweb.hiwebremotedesk.rdp.CursorKind
 import com.hiweb.hiwebremotedesk.rdp.DvcHandler
 import com.hiweb.hiwebremotedesk.rdp.RemoteCursor
 import org.json.JSONObject
@@ -151,13 +152,13 @@ class AgentLink(
 
     /**
      * Передаёт агенту, как позвать планшет, когда тот не подключён: идентификатор ПК в приложении,
-     * ключ подписи команд, UDP-порт и текущие адреса планшета. Канал RDP зашифрован TLS.
+     * ключ подписи команд, порт ([port]: TCP для связи агента и UDP для команды) и текущие адреса планшета. Канал RDP зашифрован TLS.
      */
-    fun sendPairing(pcId: String, secret: ByteArray) {
+    fun sendPairing(pcId: String, secret: ByteArray, port: Int) {
         val ips = org.json.JSONArray()
         AgentPairing.localAddresses().forEach { ips.put(it) }
         send(
-            JSONObject().put("t", "pair").put("pc", pcId).put("device", deviceName).put("port", AgentPairing.PORT)
+            JSONObject().put("t", "pair").put("pc", pcId).put("device", deviceName).put("port", port)
                 .put("ips", ips).put("secret", java.util.Base64.getEncoder().encodeToString(secret)),
         )
     }
@@ -172,7 +173,7 @@ class AgentLink(
         val cursor = CursorImage(
             bmp.width, bmp.height,
             msg.optInt("hx").coerceIn(0, bmp.width - 1), msg.optInt("hy").coerceIn(0, bmp.height - 1),
-            argb, null,
+            argb, null, CursorKind.parse(msg.optString("kind")),
         )
         bmp.recycle()
         return cursor
