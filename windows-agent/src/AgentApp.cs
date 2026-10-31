@@ -77,6 +77,10 @@ namespace HiWebAgent
         bool tabletForeground = true;
         // Старые версии приложения не сообщают о клавиатуре: считаем, что она есть.
         bool tabletKeyboard = true;
+        // Режим сенсорной клавиатуры Windows по кнопке в приложении (поле kbmode сообщения keyboard): "auto" — по полю ввода
+        // и только без физической клавиатуры (так было всегда, его же ждут старые приложения), "show" — открыта и остаётся,
+        // "hide" — скрыта.
+        string tabletKbMode = "auto";
         int? battery;
         bool charging;
 
@@ -85,6 +89,9 @@ namespace HiWebAgent
             WindowsFormsSynchronizationContext.AutoInstall = true;
             if (SynchronizationContext.Current == null) SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
             ui = SynchronizationContext.Current;
+            // Тема окон и меню (светлая/тёмная по настройке Windows) — до создания любых окон.
+            Theme.Init();
+            Ui.StyleMenu(menu);
 
             statusItem.Enabled = false;
             forwardItem.CheckOnClick = true;
@@ -242,6 +249,7 @@ namespace HiWebAgent
             channel = opened;
             tabletForeground = true;
             tabletKeyboard = true;
+            tabletKbMode = "auto";
             opened.MessageReceived += text => ui.Post(delegate { OnMessage(opened, text); }, null);
             opened.Closed += () => ui.Post(delegate { OnClosed(opened); }, null);
             opened.Start();
@@ -270,6 +278,7 @@ namespace HiWebAgent
             battery = null;
             tabletForeground = true;
             tabletKeyboard = true;
+            tabletKbMode = "auto";
             connectTimer.Interval = FAST_RETRY_MS;
             Log.Write("channel closed");
             pcStatus.TabletSession = false;
@@ -299,6 +308,8 @@ namespace HiWebAgent
                     break;
                 case "keyboard":
                     tabletKeyboard = Bool(msg, "physical", true);
+                    tabletKbMode = Str(msg, "kbmode");
+                    if (tabletKbMode != "show" && tabletKbMode != "hide") tabletKbMode = "auto";
                     break;
                 case "pair":
                     SavePairing(msg);
@@ -332,7 +343,10 @@ namespace HiWebAgent
         /// <summary>Сенсорная клавиатура нужна, пока планшет без клавиатуры показывает этот сеанс.</summary>
         void UpdateTouchKeyboard()
         {
-            touchKeyboard.Active = channel != null && !tabletKeyboard && tabletForeground && touchItem.Checked;
+            // «Показана» не зависит ни от физической клавиатуры, ни от пункта меню агента: так выбрал владелец на планшете.
+            touchKeyboard.Mode = tabletKbMode;
+            bool wanted = tabletKbMode == "show" || (tabletKbMode == "auto" && !tabletKeyboard && touchItem.Checked);
+            touchKeyboard.Active = channel != null && tabletForeground && wanted;
         }
 
         /// <summary>Где сенсорная клавиатура: планшет повторяет нажатие клавиши при долгом касании внутри неё.</summary>
@@ -870,7 +884,7 @@ namespace HiWebAgent
 
         void UninstallFromMenu()
         {
-            var answer = MessageBox.Show(
+            var answer = ThemedBox.Show(
                 "Удалить " + AgentInfo.Product + " с этого компьютера?\nУстановить заново можно кнопкой в приложении на планшете.",
                 AgentInfo.Product, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (answer != DialogResult.Yes) return;
@@ -881,7 +895,7 @@ namespace HiWebAgent
             catch (Exception e)
             {
                 Log.Write("uninstall: " + e);
-                MessageBox.Show("Не удалось удалить: " + e.Message, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                ThemedBox.Show("Не удалось удалить: " + e.Message, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
             ExitThread();

@@ -59,18 +59,18 @@ namespace HiWebAgent
     /// Окно защиты: угрозы с кнопками «Заблокировать подсеть» / «Это я» / «Оставить», журнал подключений и список
     /// заблокированных подсетей. Блокировка и разблокировка спрашивают права администратора (UAC).
     /// </summary>
-    sealed class GuardForm : Form
+    sealed class GuardForm : ThemedForm
     {
         readonly ConnectionGuard guard;
-        readonly TabControl tabs = new TabControl();
-        readonly ListView threatList = new ListView();
-        readonly ListView entryList = new ListView();
-        readonly ListView blockedList = new ListView();
+        readonly SegmentTabs tabs = new SegmentTabs();
+        readonly ThemedList threatList = new ThemedList();
+        readonly ThemedList entryList = new ThemedList();
+        readonly ThemedList blockedList = new ThemedList();
         readonly Label firewallNote = new Label();
-        readonly Button blockButton;
-        readonly Button trustButton;
-        readonly Button dismissButton;
-        readonly Button unblockButton;
+        readonly PillButton blockButton;
+        readonly PillButton trustButton;
+        readonly PillButton dismissButton;
+        readonly PillButton unblockButton;
         bool busy;
 
         public GuardForm(ConnectionGuard guard)
@@ -78,80 +78,97 @@ namespace HiWebAgent
             this.guard = guard;
             Text = "Защита подключений — " + AgentInfo.Product;
             StartPosition = FormStartPosition.CenterScreen;
-            MinimizeBox = false;
-            ShowIcon = false;
-            ClientSize = new Size(760, 440);
-            MinimumSize = new Size(620, 340);
-            Font = SystemFonts.MessageBoxFont;
+            ClientSize = new Size(Ui.Px(this, 820), Ui.Px(this, 500));
+            MinimumSize = new Size(Ui.Px(this, 680), Ui.Px(this, 400));
+            Padding = new Padding(Ui.Px(this, 20), Ui.Px(this, 16), Ui.Px(this, 20), Ui.Px(this, 16));
 
-            Setup(threatList, new[] { "Время", "Что произошло", "Адрес", "Решение" }, new[] { 130, 360, 120, 120 });
-            Setup(entryList, new[] { "Время", "Событие", "Адрес", "" }, new[] { 130, 300, 140, 100 });
-            Setup(blockedList, new[] { "Подсеть", "Состояние" }, new[] { 260, 200 });
+            Setup(threatList, new[] { "Время", "Что произошло", "Адрес", "Решение" }, new[] { 140, 380, 120, 130 });
+            Setup(entryList, new[] { "Время", "Событие", "Адрес", "" }, new[] { 140, 320, 150, 110 });
+            Setup(blockedList, new[] { "Подсеть", "Состояние" }, new[] { 260, 260 });
             threatList.SelectedIndexChanged += delegate { UpdateButtons(); };
             blockedList.SelectedIndexChanged += delegate { UpdateButtons(); };
-            tabs.SelectedIndexChanged += delegate { UpdateButtons(); };
             entryList.DoubleClick += delegate { TrustSelectedEntry(); };
+            tabs.Items = new[] { "Угрозы", "Журнал подключений", "Заблокировано" };
+            tabs.SelectedIndexChanged += delegate { ShowPage(); UpdateButtons(); };
 
-            AddTab("Угрозы", threatList);
-            AddTab("Журнал подключений", entryList);
-            AddTab("Заблокировано", blockedList);
-            tabs.Dock = DockStyle.Fill;
+            var card = new Card();
+            card.Dock = DockStyle.Fill;
+            card.Controls.Add(threatList);
+            card.Controls.Add(entryList);
+            card.Controls.Add(blockedList);
+
+            var header = MakeLabel("Защита подключений", false);
+            header.Font = new Font(Font.FontFamily, Font.Size * 1.65f, FontStyle.Bold, Font.Unit);
+            header.Dock = DockStyle.Top;
+            header.Height = Ui.Px(this, 36);
+
+            var tabsRow = new Panel();
+            tabsRow.Dock = DockStyle.Top;
+            tabsRow.BackColor = Color.Transparent;
+            tabs.Location = new Point(0, 0);
+            tabsRow.Controls.Add(tabs);
+            // Высота таблетки зависит от шрифта, который окно передаёт после добавления.
+            tabs.SizeChanged += delegate { tabsRow.Height = tabs.Height + Ui.Px(this, 10); };
+            tabsRow.Height = tabs.Height + Ui.Px(this, 10);
 
             firewallNote.Dock = DockStyle.Bottom;
             firewallNote.AutoSize = false;
-            firewallNote.Height = 44;
-            firewallNote.Padding = new Padding(10, 6, 10, 4);
-            firewallNote.ForeColor = Color.FromArgb(190, 50, 30);
+            firewallNote.Height = Ui.Px(this, 44);
+            firewallNote.Padding = new Padding(0, Ui.Px(this, 6), 0, 0);
+            firewallNote.BackColor = Color.Transparent;
 
-            var buttons = new FlowLayoutPanel();
-            buttons.Dock = DockStyle.Bottom;
-            buttons.FlowDirection = FlowDirection.LeftToRight;
-            buttons.AutoSize = true;
-            buttons.Padding = new Padding(8);
-            buttons.WrapContents = false;
-            blockButton = MakeButton("Заблокировать подсеть…", delegate { BlockSelected(); });
-            trustButton = MakeButton("Это я", delegate { TrustSelected(); });
-            dismissButton = MakeButton("Оставить", delegate { DismissSelected(); });
-            unblockButton = MakeButton("Разблокировать…", delegate { UnblockSelected(); });
-            buttons.Controls.Add(blockButton);
-            buttons.Controls.Add(trustButton);
-            buttons.Controls.Add(dismissButton);
-            buttons.Controls.Add(unblockButton);
-            buttons.Controls.Add(new Label { AutoSize = false, Width = 30 });
-            buttons.Controls.Add(MakeButton("Закрыть", delegate { Close(); }));
+            var bar = new ButtonBar();
+            blockButton = new PillButton("Заблокировать подсеть…", PillKind.Danger, "\uE72E", delegate { BlockSelected(); });
+            trustButton = new PillButton("Это я", PillKind.Primary, "\uE8FB", delegate { TrustSelected(); });
+            dismissButton = new PillButton("Оставить", PillKind.Normal, null, delegate { DismissSelected(); });
+            unblockButton = new PillButton("Разблокировать…", PillKind.Primary, "\uE785", delegate { UnblockSelected(); });
+            var closeButton = new PillButton("Закрыть", PillKind.Normal, null, delegate { Close(); });
+            foreach (PillButton b in new[] { blockButton, trustButton, dismissButton, unblockButton })
+            {
+                bar.LeftFlow.Controls.Add(b);
+            }
+            bar.RightFlow.Controls.Add(closeButton);
 
-            Controls.Add(tabs);
+            // Порядок добавления задаёт порядок стыковки: последний добавленный прижимается к краю первым.
+            Controls.Add(card);
+            Controls.Add(Spacer(DockStyle.Bottom, 8));
             Controls.Add(firewallNote);
-            Controls.Add(buttons);
+            Controls.Add(bar);
+            Controls.Add(Spacer(DockStyle.Top, 4));
+            Controls.Add(tabsRow);
+            Controls.Add(header);
+            CancelButton = closeButton;
+            ShowPage();
             RefreshAll();
         }
 
-        static void Setup(ListView list, string[] titles, int[] widths)
+        Control Spacer(DockStyle dock, int height)
         {
-            list.View = View.Details;
-            list.FullRowSelect = true;
-            list.MultiSelect = false;
-            list.HideSelection = false;
+            var p = new Panel();
+            p.Dock = dock;
+            p.Height = Ui.Px(this, height);
+            p.BackColor = Color.Transparent;
+            return p;
+        }
+
+        void Setup(ThemedList list, string[] titles, int[] widths)
+        {
             list.Dock = DockStyle.Fill;
-            for (int i = 0; i < titles.Length; i++) list.Columns.Add(titles[i], widths[i]);
+            list.FillColumn = titles.Length > 2 ? 1 : 0;
+            for (int i = 0; i < titles.Length; i++) list.Columns.Add(titles[i], Ui.Px(this, widths[i]));
         }
 
-        void AddTab(string title, Control content)
+        /// <summary>Показывает список выбранной вкладки (остальные скрыты).</summary>
+        void ShowPage()
         {
-            var page = new TabPage(title);
-            page.Controls.Add(content);
-            tabs.TabPages.Add(page);
+            threatList.Visible = tabs.SelectedIndex == 0;
+            entryList.Visible = tabs.SelectedIndex == 1;
+            blockedList.Visible = tabs.SelectedIndex == 2;
         }
 
-        static Button MakeButton(string text, EventHandler click)
+        protected override void OnThemeChanged()
         {
-            var b = new Button();
-            b.Text = text;
-            b.AutoSize = true;
-            b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            b.Padding = new Padding(8, 2, 8, 2);
-            b.Click += click;
-            return b;
+            RefreshAll();
         }
 
         /// <summary>Открывает вкладку с угрозами и выделяет нужную (по щелчку на уведомлении — самую свежую нерешённую).</summary>
@@ -182,8 +199,8 @@ namespace HiWebAgent
                 item.SubItems.Add(t.Cidr);
                 item.SubItems.Add(GuardText.StatusText(t.Status));
                 item.Tag = t.Id;
-                if (t.Status == Threat.StatusNew) item.ForeColor = Color.FromArgb(190, 50, 30);
-                else item.ForeColor = SystemColors.GrayText;
+                if (t.Status == Threat.StatusNew) item.ForeColor = Theme.P.Danger;
+                else item.ForeColor = Theme.P.Muted;
                 threatList.Items.Add(item);
             }
             threatList.EndUpdate();
@@ -200,8 +217,8 @@ namespace HiWebAgent
                 item.SubItems.Add(e.Ip);
                 item.SubItems.Add(e.Local ? "своя сеть" : e.Trusted ? "свой адрес" : "");
                 item.Tag = e.Ip;
-                if (e.Kind == GuardKind.Fail && !e.Local && !e.Trusted) item.ForeColor = Color.FromArgb(190, 50, 30);
-                else if (e.Local || e.Trusted) item.ForeColor = SystemColors.GrayText;
+                if (e.Kind == GuardKind.Fail && !e.Local && !e.Trusted) item.ForeColor = Theme.P.Danger;
+                else if (e.Local || e.Trusted) item.ForeColor = Theme.P.Muted;
                 entryList.Items.Add(item);
             }
             entryList.EndUpdate();
@@ -221,7 +238,7 @@ namespace HiWebAgent
             firewallNote.Text = guard.FirewallOn
                 ? "Двойной щелчок по записи журнала с неудачным входом или входом — пометить адрес как свой."
                 : "Брандмауэр Windows выключен: правила блокировки не действуют, пока он не включён. При блокировке агент предложит включить его (RDP останется доступен).";
-            firewallNote.ForeColor = guard.FirewallOn ? SystemColors.GrayText : Color.FromArgb(190, 50, 30);
+            firewallNote.ForeColor = guard.FirewallOn ? Theme.P.Muted : Theme.P.Danger;
             UpdateButtons();
         }
 
@@ -269,7 +286,7 @@ namespace HiWebAgent
             bool enableFirewall = false;
             if (!guard.FirewallOn)
             {
-                DialogResult answer = MessageBox.Show(
+                DialogResult answer = ThemedBox.Show(this, 
                     "Брандмауэр Windows на этом ПК выключен, поэтому правило блокировки не будет работать.\n\n"
                     + "Включить брандмауэр и заблокировать " + t.Cidr + "?\n"
                     + "Входящий RDP останется разрешён; остальные входящие подключения, которые не разрешены правилами, будут блокироваться.\n\n"
@@ -278,7 +295,7 @@ namespace HiWebAgent
                 if (answer == DialogResult.Cancel) return;
                 enableFirewall = answer == DialogResult.Yes;
             }
-            else if (MessageBox.Show("Заблокировать подсеть " + t.Cidr + "? Подключения с неё к этому ПК перестанут проходить.\nWindows запросит права администратора.",
+            else if (ThemedBox.Show(this, "Заблокировать подсеть " + t.Cidr + "? Подключения с неё к этому ПК перестанут проходить.\nWindows запросит права администратора.",
                 AgentInfo.Product, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
             {
                 return;
@@ -290,7 +307,7 @@ namespace HiWebAgent
         {
             string cidr = SelectedTag(blockedList);
             if (cidr == null || busy) return;
-            if (MessageBox.Show("Разблокировать " + cidr + "?\nWindows запросит права администратора.", AgentInfo.Product,
+            if (ThemedBox.Show(this, "Разблокировать " + cidr + "?\nWindows запросит права администратора.", AgentInfo.Product,
                 MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
             Run(delegate(Action<string> done) { guard.Unblock(cidr, done); });
         }
@@ -306,7 +323,7 @@ namespace HiWebAgent
                 UseWaitCursor = false;
                 if (IsDisposed) return;
                 RefreshAll();
-                if (error != null) MessageBox.Show(error, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (error != null) ThemedBox.Show(this, error, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             });
         }
 
@@ -327,7 +344,7 @@ namespace HiWebAgent
         {
             string ip = SelectedTag(entryList);
             if (ip == null) return;
-            if (MessageBox.Show("Считать адрес " + ip + " своим? Входы и неудачные попытки с него больше не будут считаться подозрительными.",
+            if (ThemedBox.Show(this, "Считать адрес " + ip + " своим? Входы и неудачные попытки с него больше не будут считаться подозрительными.",
                 AgentInfo.Product, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
             guard.Trust(ip);
         }

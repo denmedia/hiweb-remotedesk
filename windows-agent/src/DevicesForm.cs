@@ -10,12 +10,15 @@ namespace HiWebAgent
     /// связь по локальной сети), можно переключиться на любое, переименовать его в списке или удалить.
     /// Устройства заводятся только подключением к ПК — в этом окне их не добавить, зато можно убрать.
     /// </summary>
-    sealed class DevicesForm : Form
+    sealed class DevicesForm : ThemedForm
     {
         readonly Func<string, bool> isConnected;
         readonly Action<string> onSwitch;
         readonly Action onChanged;
-        readonly ListView list = new ListView();
+        readonly ThemedList list = new ThemedList();
+        readonly PillButton switchButton;
+        readonly PillButton renameButton;
+        readonly PillButton removeButton;
         string selectedKey;
 
         /// <summary>[onSwitch] вызывается с идентификатором устройства, [onChanged] — после переименования или удаления.</summary>
@@ -27,21 +30,16 @@ namespace HiWebAgent
 
             Text = "Устройства — " + AgentInfo.Product;
             StartPosition = FormStartPosition.CenterScreen;
-            MinimizeBox = false;
-            ShowIcon = false;
-            ClientSize = new Size(600, 320);
-            MinimumSize = new Size(480, 260);
-            Font = SystemFonts.MessageBoxFont;
+            ClientSize = new Size(Ui.Px(this, 660), Ui.Px(this, 400));
+            MinimumSize = new Size(Ui.Px(this, 540), Ui.Px(this, 320));
+            Padding = new Padding(Ui.Px(this, 20), Ui.Px(this, 16), Ui.Px(this, 20), Ui.Px(this, 16));
 
-            list.View = View.Details;
-            list.FullRowSelect = true;
-            list.MultiSelect = false;
-            list.HideSelection = false;
             list.Dock = DockStyle.Fill;
-            list.Columns.Add("Устройство", 220);
-            list.Columns.Add("Модель", 150);
-            list.Columns.Add("Связь", 90);
-            list.Columns.Add("Последнее подключение", 140);
+            list.FillColumn = 0;
+            list.Columns.Add("Устройство", Ui.Px(this, 220));
+            list.Columns.Add("Модель", Ui.Px(this, 150));
+            list.Columns.Add("Связь", Ui.Px(this, 90));
+            list.Columns.Add("Последнее подключение", Ui.Px(this, 150));
             list.DoubleClick += delegate { SwitchSelected(); };
             list.SelectedIndexChanged += delegate
             {
@@ -50,51 +48,61 @@ namespace HiWebAgent
                 UpdateButtons();
             };
 
-            var buttons = new FlowLayoutPanel();
-            buttons.Dock = DockStyle.Bottom;
-            buttons.FlowDirection = FlowDirection.LeftToRight;
-            buttons.AutoSize = true;
-            buttons.Padding = new Padding(8);
-            buttons.WrapContents = false;
+            var card = new Card();
+            card.Dock = DockStyle.Fill;
+            card.Controls.Add(list);
 
-            Button switchButton = MakeButton("Переключиться", delegate { SwitchSelected(); });
-            Button renameButton = MakeButton("Переименовать…", delegate { RenameSelected(); });
-            Button removeButton = MakeButton("Удалить", delegate { RemoveSelected(); });
-            Button closeButton = MakeButton("Закрыть", delegate { Close(); });
-            buttons.Controls.Add(switchButton);
-            buttons.Controls.Add(renameButton);
-            buttons.Controls.Add(removeButton);
-            buttons.Controls.Add(new Label { AutoSize = false, Width = 40 });
-            buttons.Controls.Add(closeButton);
+            var header = MakeLabel("Устройства", false);
+            header.Font = new Font(Font.FontFamily, Font.Size * 1.65f, FontStyle.Bold, Font.Unit);
+            header.Dock = DockStyle.Top;
+            header.Height = Ui.Px(this, 36);
 
-            var hint = new Label();
-            hint.Dock = DockStyle.Bottom;
-            hint.AutoSize = false;
-            hint.Height = 40;
-            hint.Padding = new Padding(10, 6, 10, 6);
-            hint.Text = "В списке появляются устройства, которые подключались к этому ПК. Удаление убирает запись "
-                + "на этом ПК; чтобы она вернулась, подключитесь к ПК с устройства снова.";
+            var hint = MakeLabel("В списке появляются устройства, которые подключались к этому ПК. Удаление убирает запись "
+                + "на этом ПК; чтобы она вернулась, подключитесь к ПК с устройства снова.", true);
+            hint.Dock = DockStyle.Top;
+            hint.Height = Ui.Px(this, 44);
 
-            Controls.Add(list);
+            var bar = new ButtonBar();
+            var pill = new Pill();
+            switchButton = new PillButton("Переключиться", PillKind.Ghost, "\uE8AB", delegate { SwitchSelected(); });
+            renameButton = new PillButton("Переименовать…", PillKind.Ghost, "\uE8AC", delegate { RenameSelected(); });
+            switchButton.Margin = renameButton.Margin = new Padding(2, 0, 2, 0);
+            pill.Controls.Add(switchButton);
+            pill.Controls.Add(renameButton);
+            removeButton = new PillButton("Удалить", PillKind.Danger, "\uE74D", delegate { RemoveSelected(); });
+            removeButton.Margin = new Padding(Ui.Px(this, 10), 0, 0, 0);
+            var closeButton = new PillButton("Закрыть", PillKind.Normal, null, delegate { Close(); });
+            // Как у таблетки и «Удалить»: без поля сверху, иначе кнопка стоит ниже остальных.
+            closeButton.Margin = new Padding(0);
+            bar.LeftFlow.Controls.Add(pill);
+            bar.LeftFlow.Controls.Add(removeButton);
+            bar.RightFlow.Controls.Add(closeButton);
+
+            // Порядок добавления задаёт порядок стыковки: последний добавленный прижимается к краю первым.
+            Controls.Add(card);
+            Controls.Add(Spacer(DockStyle.Bottom, 12));
+            Controls.Add(bar);
+            Controls.Add(Spacer(DockStyle.Top, 10));
             Controls.Add(hint);
-            Controls.Add(buttons);
-            switchButton.Name = "switchButton";
-            renameButton.Name = "renameButton";
-            removeButton.Name = "removeButton";
+            Controls.Add(header);
             AcceptButton = switchButton;
+            CancelButton = closeButton;
             RefreshList();
             UpdateButtons();
         }
 
-        static Button MakeButton(string text, EventHandler click)
+        Control Spacer(DockStyle dock, int height)
         {
-            var b = new Button();
-            b.Text = text;
-            b.AutoSize = true;
-            b.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-            b.Padding = new Padding(8, 2, 8, 2);
-            b.Click += click;
-            return b;
+            var p = new Panel();
+            p.Dock = dock;
+            p.Height = Ui.Px(this, height);
+            p.BackColor = Color.Transparent;
+            return p;
+        }
+
+        protected override void OnThemeChanged()
+        {
+            RefreshList();
         }
 
         /// <summary>Перечитывает список; выделение остаётся на прежнем устройстве, если оно ещё есть.</summary>
@@ -112,7 +120,7 @@ namespace HiWebAgent
                     item.SubItems.Add(isConnected(d.Key) ? "в сети" : "не в сети");
                     item.SubItems.Add(PairedDevice.TimeText(d.LastSeen));
                     item.Tag = d.Key;
-                    item.ForeColor = isConnected(d.Key) ? SystemColors.ControlText : SystemColors.GrayText;
+                    item.ForeColor = isConnected(d.Key) ? Theme.P.Text : Theme.P.Muted;
                     list.Items.Add(item);
                 }
             }
@@ -148,15 +156,7 @@ namespace HiWebAgent
         void UpdateButtons()
         {
             bool has = Selected() != null;
-            foreach (Control c in Controls)
-            {
-                var panel = c as FlowLayoutPanel;
-                if (panel == null) continue;
-                foreach (Control b in panel.Controls)
-                {
-                    if (b.Name == "switchButton" || b.Name == "renameButton" || b.Name == "removeButton") b.Enabled = has;
-                }
-            }
+            switchButton.Enabled = renameButton.Enabled = removeButton.Enabled = has;
         }
 
         void SwitchSelected()
@@ -183,7 +183,7 @@ namespace HiWebAgent
         {
             PairedDevice d = Selected();
             if (d == null) return;
-            var answer = MessageBox.Show(
+            var answer = ThemedBox.Show(this,
                 "Удалить устройство «" + d.Title + "» из списка?" + Environment.NewLine
                     + "К этому ПК оно сможет подключиться, но звать его командой «Переключиться на …» агент больше не будет.",
                 AgentInfo.Product, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
@@ -196,53 +196,43 @@ namespace HiWebAgent
     }
 
     /// <summary>Однострочный диалог ввода: имя устройства, не длиннее 40 символов.</summary>
-    sealed class RenameDialog : Form
+    sealed class RenameDialog : ThemedForm
     {
-        readonly TextBox box = new TextBox();
+        readonly ThemedInput input = new ThemedInput();
 
         RenameDialog(string title, string value)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             StartPosition = FormStartPosition.CenterParent;
-            MinimizeBox = false;
             MaximizeBox = false;
-            ShowIcon = false;
-            ClientSize = new Size(380, 110);
-            Font = SystemFonts.MessageBoxFont;
+            int m = Ui.Px(this, 22);
+            ClientSize = new Size(Ui.Px(this, 440), Ui.Px(this, 190));
 
-            box.Text = value ?? "";
-            box.SelectAll();
-            box.Location = new Point(12, 20);
-            box.Width = ClientSize.Width - 24;
-            box.MaxLength = 40;
-            box.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top;
+            var hint = MakeLabel("Так устройство называется в меню агента.", true);
+            hint.SetBounds(m, m, ClientSize.Width - m * 2, Font.Height + 4);
 
-            var ok = new Button();
-            ok.Text = "ОК";
+            input.Font = Font;
+            input.Box.Text = value ?? "";
+            input.Box.MaxLength = 40;
+            input.SetBounds(m, hint.Bottom + Ui.Px(this, 10), ClientSize.Width - m * 2, input.Height);
+
+            var ok = new PillButton("ОК", PillKind.Primary, null, null);
             ok.DialogResult = DialogResult.OK;
-            ok.AutoSize = true;
-            ok.Location = new Point(ClientSize.Width - 170, 60);
-            ok.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-
-            var cancel = new Button();
-            cancel.Text = "Отмена";
+            var cancel = new PillButton("Отмена", PillKind.Normal, null, null);
             cancel.DialogResult = DialogResult.Cancel;
-            cancel.AutoSize = true;
-            cancel.Location = new Point(ClientSize.Width - 88, 60);
-            cancel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
+            ok.Width = cancel.Width = Math.Max(ok.Width, Ui.Px(this, 96));
+            int y = ClientSize.Height - m - ok.Height;
+            cancel.Location = new Point(ClientSize.Width - m - cancel.Width, y);
+            ok.Location = new Point(cancel.Left - Ui.Px(this, 8) - ok.Width, y);
 
-            var hint = new Label();
-            hint.Text = "Так устройство называется в меню агента.";
-            hint.AutoSize = true;
-            hint.Location = new Point(12, 46);
-
-            Controls.Add(box);
             Controls.Add(hint);
+            Controls.Add(input);
             Controls.Add(ok);
             Controls.Add(cancel);
             AcceptButton = ok;
             CancelButton = cancel;
+            Shown += delegate { input.Box.Focus(); input.Box.SelectAll(); };
         }
 
         /// <summary>Новое имя или null, если пользователь отменил ввод.</summary>
@@ -250,7 +240,7 @@ namespace HiWebAgent
         {
             using (var dialog = new RenameDialog(title, value))
             {
-                return dialog.ShowDialog(owner) == DialogResult.OK ? dialog.box.Text.Trim() : null;
+                return dialog.ShowDialog(owner) == DialogResult.OK ? dialog.input.Box.Text.Trim() : null;
             }
         }
     }

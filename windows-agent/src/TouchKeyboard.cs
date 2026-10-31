@@ -112,6 +112,8 @@ namespace HiWebAgent
         volatile bool active;
         volatile bool stopped;
         volatile bool hidePending;
+        volatile bool applyMode;
+        volatile string mode = "auto";
         // Где сейчас клавиатура (null — скрыта). Окно клавиатуры не находится через WindowFromPoint,
         // поэтому щелчок «по клавиатуре» определяем по её прямоугольнику в момент нажатия кнопки.
         volatile object paneRect;
@@ -123,6 +125,24 @@ namespace HiWebAgent
         /// Вызывается из потока клавиатуры.
         /// </summary>
         public event Action<int[]> PaneChanged;
+
+        /// <summary>
+        /// Режим по команде планшета (кнопка клавиатуры в панели сеанса): "auto" — клавиатура появляется при щелчке в поле
+        /// ввода и прячется при щелчке вне его; "show" — открыта и остаётся, пока её не закроют; "hide" — всегда скрыта
+        /// (этот режим задаёт владелец через <see cref="Active"/> = false). Менять до <see cref="Active"/>.
+        /// </summary>
+        public string Mode
+        {
+            get { return mode; }
+            set
+            {
+                if (value != "show" && value != "hide") value = "auto";
+                if (mode == value) return;
+                mode = value;
+                applyMode = true;
+                clicked.Set();
+            }
+        }
 
         public TouchKeyboard()
         {
@@ -147,6 +167,8 @@ namespace HiWebAgent
                 {
                     // Планшет после включения должен узнать положение уже открытой клавиатуры заново.
                     paneRect = null;
+                    applyMode = true;
+                    clicked.Set();
                     hook = SetWindowsHookEx(WH_MOUSE_LL, hookProc, GetModuleHandle(null), 0);
                     if (hook == IntPtr.Zero) Log.Write("touch keyboard: hook failed " + Marshal.GetLastWin32Error());
                 }
@@ -196,7 +218,13 @@ namespace HiWebAgent
                         continue;
                     }
                     if (!active) continue;
-                    if (click)
+                    if (applyMode)
+                    {
+                        applyMode = false;
+                        // «Показана»: открываем сразу, не дожидаясь щелчка в поле ввода.
+                        if (mode == "show") Show();
+                    }
+                    if (click && mode == "auto")
                     {
                         Thread.Sleep(SETTLE_MS);
                         if (!active) continue;

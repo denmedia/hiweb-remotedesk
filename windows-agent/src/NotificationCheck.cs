@@ -53,7 +53,7 @@ namespace HiWebAgent
     /// Windows → агент → канал сеанса → планшет. Последние шаги — настоящий тестовый тост Windows, который проходит
     /// путь целиком, и ответ планшета (`notif_ack`), показал ли он его.
     /// </summary>
-    sealed class NotificationCheckForm : Form
+    sealed class NotificationCheckForm : ThemedForm
     {
         enum Mark { Pending, Running, Ok, Fail, Skip }
 
@@ -78,7 +78,10 @@ namespace HiWebAgent
         readonly Label[] glyphs = new Label[Titles.Length];
         readonly Label[] texts = new Label[Titles.Length];
         readonly Label verdict = new Label();
-        readonly Button again = new Button();
+        readonly PillButton again = new PillButton("Проверить ещё раз", PillKind.Primary, "\uE72C", null);
+        readonly Mark[] marks = new Mark[Titles.Length];
+        readonly string[] details = new string[Titles.Length];
+        int verdictState;
         bool running;
         string problem;
 
@@ -96,69 +99,82 @@ namespace HiWebAgent
             Text = "Проверка уведомлений — " + AgentInfo.Product;
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
-            MinimizeBox = false;
             MaximizeBox = false;
-            ShowIcon = false;
-            ClientSize = new Size(580, 660);
-            Font = SystemFonts.MessageBoxFont;
+            ClientSize = new Size(Ui.Px(this, 640), Ui.Px(this, 620));
+            Padding = new Padding(Ui.Px(this, 20), Ui.Px(this, 16), Ui.Px(this, 20), Ui.Px(this, 16));
 
-            var intro = new Label();
-            intro.Text = "Агент покажет тестовое уведомление Windows и проследит, дойдёт ли оно до планшета. " +
-                "Для этого приложение HiWeb на планшете должно быть открытым сеансом и свёрнутым.";
+            var header = MakeLabel("Проверка уведомлений", false);
+            header.Font = new Font(Font.FontFamily, Font.Size * 1.65f, FontStyle.Bold, Font.Unit);
+            header.Dock = DockStyle.Top;
+            header.Height = Ui.Px(this, 36);
+
+            var intro = MakeLabel("Агент покажет тестовое уведомление Windows и проследит, дойдёт ли оно до планшета. " +
+                "Для этого приложение HiWeb на планшете должно быть открытым сеансом и свёрнутым.", true);
             intro.Dock = DockStyle.Top;
-            intro.Height = 52;
-            intro.Padding = new Padding(10, 8, 10, 0);
+            intro.Height = Ui.Px(this, 56);
 
             var table = new TableLayoutPanel();
             table.Dock = DockStyle.Fill;
             table.AutoScroll = true;
-            table.Padding = new Padding(10, 6, 10, 6);
+            table.BackColor = Color.Transparent;
+            table.Padding = new Padding(Ui.Px(this, 8), Ui.Px(this, 6), Ui.Px(this, 8), Ui.Px(this, 6));
             table.ColumnCount = 2;
-            table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 28));
+            table.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, Ui.Px(this, 30)));
             table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             for (int i = 0; i < Titles.Length; i++)
             {
                 var glyph = new Label();
                 glyph.AutoSize = true;
+                glyph.BackColor = Color.Transparent;
                 glyph.Font = new Font(Font, FontStyle.Bold);
-                glyph.Margin = new Padding(0, 0, 0, 8);
+                glyph.Margin = new Padding(0, 0, 0, Ui.Px(this, 10));
                 var text = new Label();
                 text.AutoSize = true;
-                text.MaximumSize = new Size(520, 0);
-                text.Margin = new Padding(0, 0, 0, 8);
+                text.BackColor = Color.Transparent;
+                text.MaximumSize = new Size(Ui.Px(this, 540), 0);
+                text.Margin = new Padding(0, 0, 0, Ui.Px(this, 10));
                 glyphs[i] = glyph;
                 texts[i] = text;
                 table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 table.Controls.Add(glyph, 0, i);
                 table.Controls.Add(text, 1, i);
             }
+            var card = new Card();
+            card.Dock = DockStyle.Fill;
+            card.Padding = new Padding(Ui.Px(this, 10));
+            card.Controls.Add(table);
 
             verdict.Dock = DockStyle.Bottom;
-            verdict.Height = 64;
-            verdict.Padding = new Padding(10, 6, 10, 0);
+            verdict.Height = Ui.Px(this, 70);
+            verdict.BackColor = Color.Transparent;
+            verdict.Padding = new Padding(0, Ui.Px(this, 10), 0, 0);
             verdict.Font = new Font(Font, FontStyle.Bold);
 
-            var buttons = new FlowLayoutPanel();
-            buttons.Dock = DockStyle.Bottom;
-            buttons.FlowDirection = FlowDirection.RightToLeft;
-            buttons.AutoSize = true;
-            buttons.Padding = new Padding(8);
-            var close = new Button();
-            close.Text = "Закрыть";
-            close.AutoSize = true;
-            close.Click += delegate { Close(); };
-            again.Text = "Проверить ещё раз";
-            again.AutoSize = true;
+            var bar = new ButtonBar();
+            var close = new PillButton("Закрыть", PillKind.Normal, null, delegate { Close(); });
             again.Click += delegate { Run(); };
-            buttons.Controls.Add(close);
-            buttons.Controls.Add(again);
+            bar.LeftFlow.Controls.Add(again);
+            bar.RightFlow.Controls.Add(close);
             CancelButton = close;
 
-            Controls.Add(table);
-            Controls.Add(intro);
+            // Порядок добавления задаёт порядок стыковки: последний добавленный прижимается к краю первым.
+            Controls.Add(card);
             Controls.Add(verdict);
-            Controls.Add(buttons);
+            Controls.Add(bar);
+            Controls.Add(intro);
+            Controls.Add(header);
             Shown += delegate { Run(); };
+        }
+
+        protected override void OnThemeChanged()
+        {
+            for (int i = 0; i < Titles.Length; i++) Render(i);
+            ColorVerdict();
+        }
+
+        void ColorVerdict()
+        {
+            verdict.ForeColor = verdictState == 1 ? Theme.P.Ok : verdictState == 2 ? Theme.P.Danger : Theme.P.Text;
         }
 
         /// <summary>
@@ -193,7 +209,9 @@ namespace HiWebAgent
             running = true;
             again.Enabled = false;
             problem = null;
+            verdictState = 0;
             verdict.Text = "";
+            ColorVerdict();
             for (int i = 0; i < Titles.Length; i++) Set(i, Mark.Pending, null);
             try
             {
@@ -208,7 +226,8 @@ namespace HiWebAgent
             if (IsDisposed) return;
             again.Enabled = true;
             bool good = problem == null;
-            verdict.ForeColor = good ? Color.FromArgb(0, 128, 0) : Color.FromArgb(192, 0, 0);
+            verdictState = good ? 1 : 2;
+            ColorVerdict();
             verdict.Text = good ? "Всё работает: уведомления Windows доходят до планшета." : "Причина: " + problem;
         }
 
@@ -356,30 +375,41 @@ namespace HiWebAgent
         void Set(int step, Mark mark, string detail)
         {
             if (IsDisposed) return;
+            marks[step] = mark;
+            details[step] = detail;
+            Render(step);
+        }
+
+        /// <summary>Рисует шаг по сохранённому состоянию: так цвета обновляются и при смене темы Windows.</summary>
+        void Render(int step)
+        {
             Label glyph = glyphs[step];
+            Mark mark = marks[step];
+            string detail = details[step];
+            Palette p = Theme.P;
             switch (mark)
             {
                 case Mark.Ok:
                     glyph.Text = "✔";
-                    glyph.ForeColor = Color.FromArgb(0, 128, 0);
+                    glyph.ForeColor = p.Ok;
                     break;
                 case Mark.Fail:
                     glyph.Text = "✘";
-                    glyph.ForeColor = Color.FromArgb(192, 0, 0);
+                    glyph.ForeColor = p.Danger;
                     break;
                 case Mark.Running:
                     glyph.Text = "…";
-                    glyph.ForeColor = Color.FromArgb(0, 90, 200);
+                    glyph.ForeColor = p.Accent;
                     break;
                 case Mark.Skip:
                     glyph.Text = "–";
-                    glyph.ForeColor = SystemColors.GrayText;
+                    glyph.ForeColor = p.Muted;
                     break;
                 default:
                     glyph.Text = "";
                     break;
             }
-            texts[step].ForeColor = mark == Mark.Skip || mark == Mark.Pending ? SystemColors.GrayText : SystemColors.ControlText;
+            texts[step].ForeColor = mark == Mark.Skip || mark == Mark.Pending ? p.Muted : p.Text;
             texts[step].Text = Titles[step] + (string.IsNullOrEmpty(detail) ? "" : "\n" + detail);
         }
     }

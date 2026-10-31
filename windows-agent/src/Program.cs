@@ -33,10 +33,10 @@ namespace HiWebAgent
                 {
                     // «Установленные приложения» → Удалить запускает эту команду; --quiet — без вопросов (QuietUninstallString).
                     bool quiet = args.Contains("--quiet");
-                    if (!quiet && MessageBox.Show("Удалить " + AgentInfo.Product + " с этого компьютера?", AgentInfo.Product,
+                    if (!quiet && ThemedBox.Show("Удалить " + AgentInfo.Product + " с этого компьютера?", AgentInfo.Product,
                             MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return 1;
                     Installer.Uninstall(false);
-                    if (!quiet) MessageBox.Show(AgentInfo.Product + " удалён.", AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    if (!quiet) ThemedBox.Show(AgentInfo.Product + " удалён.", AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return 0;
                 }
                 if (!Installer.IsInstalledCopy(self))
@@ -48,7 +48,7 @@ namespace HiWebAgent
             catch (Exception e)
             {
                 Log.Write("setup failed: " + e);
-                MessageBox.Show("Не удалось выполнить действие: " + e.Message, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                ThemedBox.Show("Не удалось выполнить действие: " + e.Message, AgentInfo.Product, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
 
