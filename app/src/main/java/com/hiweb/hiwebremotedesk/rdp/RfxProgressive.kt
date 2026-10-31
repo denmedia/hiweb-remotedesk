@@ -1,11 +1,23 @@
 package com.hiweb.hiwebremotedesk.rdp
 
 /**
- * Декодер RemoteFX Progressive (MS-RDPEGFX 2.2.4.4, кодек CAPROGRESSIVE) в том виде, в каком его передаёт
- * GNOME Remote Desktop: простые тайлы 64x64 (PROGRESSIVE_TILE_SIMPLE), энтропийное кодирование RLGR1.
- * Тайлы FIRST и UPGRADE (постепенное уточнение) не поддерживаются.
+ * Декодер RemoteFX Progressive (MS-RDPEGFX 2.2.4.4, кодек CAPROGRESSIVE) для одной поверхности.
+ *
+ * Тайлы 64x64, энтропийное кодирование RLGR1. Поддерживаются все три вида тайлов:
+ *  - SIMPLE (GNOME Remote Desktop): готовый тайл целиком;
+ *  - FIRST (Windows): первый проход с пониженным качеством — старшие биты коэффициентов;
+ *  - UPGRADE (Windows): уточнение — недостающие младшие биты коэффициентов (SRL-поток для новых значимых
+ *    коэффициентов, сырые биты для уже известных).
+ * Режим «extrapolate» региона (Windows) меняет размеры поддиапазонов и вейвлет-преобразование, без него (GNOME) —
+ * классические 1024/256/64 коэффициентов. Состояние уточнения хранится по тайлам внутри экземпляра, поэтому
+ * экземпляр живёт столько же, сколько поверхность. Алгоритм сверен с FreeRDP (libfreerdp/codec/progressive.c).
+ *
+ * Готовые тайлы отдаются в [onBlit] как ARGB 64x64: области [srcX, srcY, w, h] нужно перенести в ([dx], [dy])
+ * поверхности; область уже обрезана по прямоугольникам региона.
  */
-class RfxProgressive(private val onTile: (x: Int, y: Int, argb: IntArray) -> Unit) {
+class RfxProgressive(
+    private val onBlit: (tile: IntArray, srcX: Int, srcY: Int, w: Int, h: Int, dx: Int, dy: Int) -> Unit,
+) {
     companion object {
         private const val SYNC = 0xCCC0
         private const val FRAME_BEGIN = 0xCCC1
@@ -17,31 +29,53 @@ class RfxProgressive(private val onTile: (x: Int, y: Int, argb: IntArray) -> Uni
         private const val TILE_UPGRADE = 0xCCC7
         const val TILE = 64
         private const val COEFFS = 4096
+        private const val QUALITY_FULL = 0xFF
+        private const val FLAG_TILE_DIFFERENCE = 0x01
+        private const val FLAG_EXTRAPOLATE = 0x01
 
-        // Смещения диапазонов коэффициентов в тайле: HL1, LH1, HH1, HL2, LH2, HH2, HL3, LH3, HH3, LL3.
-        private const val HL1 = 0
-        private const val LH1 = 1024
-        private const val HH1 = 2048
-        private const val HL2 = 3072
-        private const val LH2 = 3328
-        private const val HH2 = 3584
-        private const val HL3 = 3840
-        private const val LH3 = 3904
-        private const val HH3 = 3968
-        private const val LL3 = 4032
+        // Поддиапазоны тайла в порядке HL1, LH1, HH1, HL2, LH2, HH2, HL3, LH3, HH3, LL3: смещения и размеры.
+        // Без extrapolate — степени двойки; с ним уровни 1–3 имеют размеры 31x33, 16x17, 8x9 и LL3 9x9.
+        private val OFFSETS = arrayOf(
+            intArrayOf(0, 1024, 2048, 3072, 3328, 3584, 3840, 3904, 3968, 4032),
+            intArrayOf(0, 1023, 2046, 3007, 3279, 3551, 3807, 3879, 3951, 4015),
+        )
+        private val LENGTHS = arrayOf(
+            intArrayOf(1024, 1024, 1024, 256, 256, 256, 64, 64, 64, 64),
+            intArrayOf(1023, 1023, 961, 272, 272, 256, 72, 72, 64, 81),
+        )
+
+        // Положение поддиапазона в векторе квантования LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1.
+        private val QUANT_INDEX = intArrayOf(7, 8, 9, 4, 5, 6, 1, 2, 3, 0)
+        private const val LL3_BAND = 9
     }
 
-    /** Десять значений квантования одного компонента: LL3, HL3, LH3, HH3, HL2, LH2, HH2, HL1, LH1, HH1. */
-    private class Quant(val v: IntArray)
+    /** Значения квантования трёх компонентов (Y, Cb, Cr): десять значений на компонент. */
+    private class Quants(val y: IntArray, val cb: IntArray, val cr: IntArray) {
+        fun of(c: Int) = when (c) { 0 -> y; 1 -> cb; else -> cr }
+    }
 
-    private val coeff = Array(3) { ShortArray(COEFFS) }
+    private class Region(
+        val extrapolate: Boolean,
+        val rects: List<IntArray>,
+        val quants: List<IntArray>,
+        val progressive: List<Quants>,
+    )
+
+    /** Состояние тайла между проходами: сырые значения (знаки) и накопленные коэффициенты. */
+    private class TileState {
+        val sign = Array(3) { ShortArray(COEFFS) }
+        val current = Array(3) { ShortArray(COEFFS) }
+        val bitPos = Array(3) { IntArray(10) }
+    }
+
+    private val tiles = HashMap<Int, TileState>()
+    private val full = Quants(IntArray(10), IntArray(10), IntArray(10))
+    private val work = Array(3) { ShortArray(COEFFS) }
     private val dwtTmp = ShortArray(COEFFS)
-    private var skippedTiles = 0
 
-    /** Разбирает поток блоков одной команды WireToSurface и отдаёт готовые тайлы в [onTile]. */
+    /** Разбирает поток блоков одной команды WireToSurface и отдаёт готовые тайлы в [onBlit]. */
     fun decode(data: ByteArray) {
         val r = ByteReader(data)
-        var quants = emptyList<Quant>()
         while (r.remaining >= 6) {
             val type = r.u16le()
             val len = r.u32le().toInt()
@@ -50,33 +84,38 @@ class RfxProgressive(private val onTile: (x: Int, y: Int, argb: IntArray) -> Uni
             r.skip(len - 6)
             when (type) {
                 SYNC, CONTEXT, FRAME_BEGIN, FRAME_END -> Unit
-                REGION -> quants = region(body)
+                REGION -> region(body)
                 else -> throw RdpException("RFX: неожиданный блок 0x${type.toString(16)}")
             }
         }
     }
 
-    private fun region(b: ByteReader): List<Quant> {
+    private fun readQuant(b: ByteReader): IntArray {
+        val raw = b.bytes(5)
+        val q = IntArray(10)
+        for (i in 0 until 5) {
+            q[i * 2] = raw[i].toInt() and 0x0F
+            q[i * 2 + 1] = (raw[i].toInt() and 0xFF) shr 4
+        }
+        return q
+    }
+
+    private fun region(b: ByteReader) {
         val tileSize = b.u8()
         val numRects = b.u16le()
         val numQuant = b.u8()
         val numProgQuant = b.u8()
-        b.u8() // flags: бит 0 — «extrapolate»; сервер GNOME его не использует
+        val flags = b.u8()
         val numTiles = b.u16le()
         b.u32le() // размер данных тайлов
         if (tileSize != TILE) throw RdpException("RFX: размер тайла $tileSize")
-        b.skip(numRects * 8)
-        val quants = List(numQuant) {
-            val raw = b.bytes(5)
-            val q = IntArray(10)
-            q[0] = raw[0].toInt() and 0x0F; q[1] = (raw[0].toInt() and 0xFF) shr 4
-            q[2] = raw[1].toInt() and 0x0F; q[3] = (raw[1].toInt() and 0xFF) shr 4
-            q[4] = raw[2].toInt() and 0x0F; q[5] = (raw[2].toInt() and 0xFF) shr 4
-            q[6] = raw[3].toInt() and 0x0F; q[7] = (raw[3].toInt() and 0xFF) shr 4
-            q[8] = raw[4].toInt() and 0x0F; q[9] = (raw[4].toInt() and 0xFF) shr 4
-            Quant(q)
+        val rects = List(numRects) { intArrayOf(b.u16le(), b.u16le(), b.u16le(), b.u16le()) }
+        val quants = List(numQuant) { readQuant(b) }
+        val progressive = List(numProgQuant) {
+            b.u8() // качество (номер прохода задаёт сам тайл)
+            Quants(readQuant(b), readQuant(b), readQuant(b))
         }
-        b.skip(numProgQuant * 16)
+        val region = Region(flags and FLAG_EXTRAPOLATE != 0, rects, quants, progressive)
         repeat(numTiles) {
             val type = b.u16le()
             val len = b.u32le().toInt()
@@ -84,57 +123,338 @@ class RfxProgressive(private val onTile: (x: Int, y: Int, argb: IntArray) -> Uni
             val tile = ByteReader(b.data, b.pos, b.pos + len - 6)
             b.skip(len - 6)
             when (type) {
-                TILE_SIMPLE -> simpleTile(tile, quants)
-                TILE_FIRST, TILE_UPGRADE -> skippedTiles++
+                TILE_SIMPLE -> firstTile(tile, region, simple = true)
+                TILE_FIRST -> firstTile(tile, region, simple = false)
+                TILE_UPGRADE -> upgradeTile(tile, region)
                 else -> throw RdpException("RFX: неожиданный блок тайла 0x${type.toString(16)}")
             }
         }
-        return quants
     }
 
-    private fun simpleTile(t: ByteReader, quants: List<Quant>) {
-        val qy = t.u8(); val qcb = t.u8(); val qcr = t.u8()
-        val xIdx = t.u16le(); val yIdx = t.u16le()
-        t.u8() // flags
-        val yLen = t.u16le(); val cbLen = t.u16le(); val crLen = t.u16le()
+    /** Положение «битовой плоскости» каждого поддиапазона: значения региона плюс прогрессивные для качества [quality]. */
+    private fun bitPositions(region: Region, tile: IntArray, quality: Int): Quants {
+        for (c in 0..2) if (tile[c] >= region.quants.size) throw RdpException("RFX: индекс квантования ${tile[c]}")
+        val prog = if (quality == QUALITY_FULL) full else region.progressive.getOrNull(quality) ?: throw RdpException("RFX: качество $quality")
+        fun sum(base: IntArray, p: IntArray) = IntArray(10) { base[it] + p[it] }
+        return Quants(sum(region.quants[tile[0]], prog.y), sum(region.quants[tile[1]], prog.cb), sum(region.quants[tile[2]], prog.cr))
+    }
+
+    private fun firstTile(t: ByteReader, region: Region, simple: Boolean) {
+        val idx = intArrayOf(t.u8(), t.u8(), t.u8())
+        val xIdx = t.u16le()
+        val yIdx = t.u16le()
+        val flags = t.u8()
+        val quality = if (simple) QUALITY_FULL else t.u8()
+        val yLen = t.u16le()
+        val cbLen = t.u16le()
+        val crLen = t.u16le()
         val tail = t.u16le()
         val yOff = t.pos
         val cbOff = yOff + yLen
         val crOff = cbOff + cbLen
         if (crOff + crLen + tail > t.end) throw RdpException("RFX: данные тайла обрезаны")
-        if (qy >= quants.size || qcb >= quants.size || qcr >= quants.size) throw RdpException("RFX: индекс квантования")
-        component(t.data, yOff, yLen, quants[qy], coeff[0])
-        component(t.data, cbOff, cbLen, quants[qcb], coeff[1])
-        component(t.data, crOff, crLen, quants[qcr], coeff[2])
-        onTile(xIdx * TILE, yIdx * TILE, toArgb())
+        val bitPos = bitPositions(region, idx, quality)
+        val diff = flags and FLAG_TILE_DIFFERENCE != 0
+        val key = (yIdx shl 16) or xIdx
+        // Состояние нужно только тайлам, которые потом уточняются (качество ниже полного) или читаются как разность.
+        val keep = quality != QUALITY_FULL
+        val state = if (keep) tiles.getOrPut(key) { TileState() } else tiles[key]
+        val lens = intArrayOf(yLen, cbLen, crLen)
+        val offs = intArrayOf(yOff, cbOff, crOff)
+        for (c in 0..2) {
+            val buf = work[c]
+            rlgr1Decode(t.data, offs[c], lens[c], buf)
+            if (keep) {
+                System.arraycopy(buf, 0, state!!.sign[c], 0, COEFFS)
+                System.arraycopy(bitPos.of(c), 0, state.bitPos[c], 0, 10)
+            }
+            dequantize(buf, bitPos.of(c), region.extrapolate)
+            if (diff && state != null) {
+                // Тайл-разность: коэффициенты прибавляются к прежним, сумма становится и результатом, и новым состоянием.
+                val cur = state.current[c]
+                for (i in 0 until COEFFS) {
+                    buf[i] = (buf[i] + cur[i]).toShort()
+                    cur[i] = buf[i]
+                }
+            } else if (keep) {
+                System.arraycopy(buf, 0, state!!.current[c], 0, COEFFS)
+            }
+            transform(buf, region.extrapolate)
+        }
+        emit(xIdx, yIdx, region)
     }
 
-    private fun component(data: ByteArray, off: Int, len: Int, q: Quant, out: ShortArray) {
-        rlgr1Decode(data, off, len, out)
-        // Разностное кодирование диапазона LL3.
-        for (i in 1 until 64) out[LL3 + i] = (out[LL3 + i] + out[LL3 + i - 1]).toShort()
-        val v = q.v
-        shift(out, HL1, 1024, v[7] - 1)
-        shift(out, LH1, 1024, v[8] - 1)
-        shift(out, HH1, 1024, v[9] - 1)
-        shift(out, HL2, 256, v[4] - 1)
-        shift(out, LH2, 256, v[5] - 1)
-        shift(out, HH2, 256, v[6] - 1)
-        shift(out, HL3, 64, v[1] - 1)
-        shift(out, LH3, 64, v[2] - 1)
-        shift(out, HH3, 64, v[3] - 1)
-        shift(out, LL3, 64, v[0] - 1)
-        idwt(out, HL3, 8)
-        idwt(out, HL2, 16)
-        idwt(out, HL1, 32)
+    private fun upgradeTile(t: ByteReader, region: Region) {
+        val idx = intArrayOf(t.u8(), t.u8(), t.u8())
+        val xIdx = t.u16le()
+        val yIdx = t.u16le()
+        val quality = t.u8()
+        val srlLen = IntArray(3)
+        val rawLen = IntArray(3)
+        for (c in 0..2) {
+            srlLen[c] = t.u16le()
+            rawLen[c] = t.u16le()
+        }
+        val state = tiles[(yIdx shl 16) or xIdx] ?: throw RdpException("RFX: уточнение тайла $xIdx,$yIdx без первого прохода")
+        val bitPos = bitPositions(region, idx, quality)
+        var pos = t.pos
+        for (c in 0..2) {
+            val srlOff = pos
+            val rawOff = srlOff + srlLen[c]
+            pos = rawOff + rawLen[c]
+            if (pos > t.end) throw RdpException("RFX: данные уточнения обрезаны")
+            val numBits = IntArray(10)
+            for (i in 0 until 10) {
+                numBits[i] = state.bitPos[c][i] - bitPos.of(c)[i]
+                if (numBits[i] < 0) throw RdpException("RFX: уточнение понижает качество")
+            }
+            upgrade(state.current[c], state.sign[c], t.data, srlOff, srlLen[c], rawOff, rawLen[c], bitPos.of(c), numBits, region.extrapolate)
+            System.arraycopy(bitPos.of(c), 0, state.bitPos[c], 0, 10)
+            System.arraycopy(state.current[c], 0, work[c], 0, COEFFS)
+            transform(work[c], region.extrapolate)
+        }
+        emit(xIdx, yIdx, region)
     }
 
-    private fun shift(buf: ShortArray, off: Int, n: Int, s: Int) {
-        if (s <= 0) return
-        for (i in off until off + n) buf[i] = (buf[i].toInt() shl s).toShort()
+    /** Дифференциальное декодирование LL3 и сдвиг каждого поддиапазона на (положение − 1) бит. */
+    private fun dequantize(buf: ShortArray, bitPos: IntArray, extrapolate: Boolean) {
+        val mode = if (extrapolate) 1 else 0
+        val off = OFFSETS[mode]
+        val len = LENGTHS[mode]
+        for (i in 1 until len[LL3_BAND]) buf[off[LL3_BAND] + i] = (buf[off[LL3_BAND] + i] + buf[off[LL3_BAND] + i - 1]).toShort()
+        for (band in 0 until 10) {
+            val s = bitPos[QUANT_INDEX[band]] - 1
+            if (s <= 0) continue
+            for (i in off[band] until off[band] + len[band]) buf[i] = (buf[i].toInt() shl s).toShort()
+        }
     }
 
-    /** Один уровень обратного вейвлет-преобразования; результат записывается в тот же участок буфера. */
+    // ------------------------------------------------------------------ уточнение
+
+    /** Читатель битов от старшего к младшему; за концом данных отдаёт нули, как поток FreeRDP. */
+    internal class BitSource(val data: ByteArray, off: Int, len: Int) {
+        private var pos = off * 8
+        private val endBit = (off + len) * 8
+
+        fun bit(): Int {
+            if (pos >= endBit) { pos++; return 0 }
+            val v = (data[pos ushr 3].toInt() ushr (7 - (pos and 7))) and 1
+            pos++
+            return v
+        }
+
+        fun bits(n: Int): Int {
+            var v = 0
+            for (i in 0 until n) v = (v shl 1) or bit()
+            return v
+        }
+    }
+
+    /** Состояние SRL-декодера (упрощённое RLGR для новых значимых коэффициентов). */
+    internal class Srl(val bits: BitSource) {
+        var kp = 8
+        var nz = 0
+        var mode = 0
+
+        fun read(numBits: Int): Int {
+            if (nz > 0) { nz--; return 0 }
+            val k = kp / 8
+            if (mode == 0) {
+                if (bits.bit() == 0) {
+                    // «0»: не меньше (1 shl k) нулей подряд.
+                    nz = 1 shl k
+                    kp = minOf(kp + 4, 80)
+                    nz--
+                    return 0
+                }
+                // «1»: меньше (1 shl k) нулей, их число — следующие k бит; дальше идёт значение.
+                nz = if (k > 0) bits.bits(k) else 0
+                mode = 1
+                if (nz > 0) { nz--; return 0 }
+            }
+            mode = 0
+            val sign = bits.bit()
+            kp = if (kp < 6) 0 else kp - 6
+            if (numBits == 1) return if (sign == 1) -1 else 1
+            var mag = 1
+            val max = (1 shl numBits) - 1
+            while (mag < max) {
+                if (bits.bit() == 1) break
+                mag++
+            }
+            return if (sign == 1) -mag else mag
+        }
+    }
+
+    private fun upgrade(
+        current: ShortArray, sign: ShortArray, data: ByteArray, srlOff: Int, srlLen: Int, rawOff: Int, rawLen: Int,
+        bitPos: IntArray, numBits: IntArray, extrapolate: Boolean,
+    ) {
+        val mode = if (extrapolate) 1 else 0
+        val off = OFFSETS[mode]
+        val len = LENGTHS[mode]
+        val srl = Srl(BitSource(data, srlOff, srlLen))
+        val raw = BitSource(data, rawOff, rawLen)
+        for (band in 0 until 10) {
+            val bits = numBits[QUANT_INDEX[band]]
+            if (bits < 1) continue
+            val shift = bitPos[QUANT_INDEX[band]] - 1
+            for (i in off[band] until off[band] + len[band]) {
+                val input = when {
+                    band == LL3_BAND -> raw.bits(bits)
+                    sign[i] > 0 -> raw.bits(bits)
+                    sign[i] < 0 -> -raw.bits(bits)
+                    else -> srl.read(bits).also { sign[i] = it.toShort() }
+                }
+                current[i] = (current[i] + (input shl shift)).toShort()
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ преобразования
+
+    /** Обратное вейвлет-преобразование коэффициентов [buf] → значения компонента (в нём же). */
+    internal fun transform(buf: ShortArray, extrapolate: Boolean) {
+        if (extrapolate) {
+            idwtBlock(buf, 3807, 3)
+            idwtBlock(buf, 3007, 2)
+            idwtBlock(buf, 0, 1)
+        } else {
+            idwt(buf, 3840, 8)
+            idwt(buf, 3072, 16)
+            idwt(buf, 0, 32)
+        }
+    }
+
+    private fun clamp16(v: Int) = (if (v < -32768) -32768 else if (v > 32767) 32767 else v).toShort()
+
+    /**
+     * Один уровень обратного преобразования в режиме extrapolate (FreeRDP: progressive_rfx_dwt_2d_decode_block):
+     * блок лежит с [base]; порядок поддиапазонов HL, LH, HH, LL; результат записывается на то же место со строкой
+     * (nBandL + nBandH).
+     */
+    private fun idwtBlock(buf: ShortArray, base: Int, level: Int) {
+        val nBandL = (64 shr level) + 1
+        val nBandH = if (level == 1) 31 else (64 + (1 shl (level - 1))) shr level
+        val hl = base
+        val lh = hl + nBandH * nBandL
+        val hh = lh + nBandL * nBandH
+        val ll = hh + nBandH * nBandH
+        val step = nBandL + nBandH
+        val l = 0
+        val h = nBandL * step
+        // горизонтально: LL + HL → L, LH + HH → H
+        idwtX(buf, ll, nBandL, buf, hl, nBandH, dwtTmp, l, step, nBandL, nBandH, nBandL)
+        idwtX(buf, lh, nBandL, buf, hh, nBandH, dwtTmp, h, step, nBandL, nBandH, nBandH)
+        // вертикально: L + H → результат
+        idwtY(dwtTmp, l, step, dwtTmp, h, step, buf, base, step, nBandL, nBandH, step)
+    }
+
+    private fun idwtX(
+        low: ShortArray, lowBase: Int, lowStep: Int, high: ShortArray, highBase: Int, highStep: Int,
+        dst: ShortArray, dstBase: Int, dstStep: Int, nLow: Int, nHigh: Int, rows: Int,
+    ) {
+        for (row in 0 until rows) {
+            var pl = lowBase + row * lowStep
+            var ph = highBase + row * highStep
+            var px = dstBase + row * dstStep
+            var h0 = high[ph++].toInt()
+            var l0 = low[pl++].toInt()
+            var x0 = clamp16(l0 - h0).toInt()
+            var x2 = x0
+            for (j in 0 until nHigh - 1) {
+                val h1 = high[ph++].toInt()
+                l0 = low[pl++].toInt()
+                x2 = clamp16(l0 - (h0 + h1) / 2).toInt()
+                val x1 = clamp16((x0 + x2) / 2 + 2 * h0).toInt()
+                dst[px] = x0.toShort()
+                dst[px + 1] = x1.toShort()
+                px += 2
+                x0 = x2
+                h0 = h1
+            }
+            if (nLow <= nHigh + 1) {
+                if (nLow <= nHigh) {
+                    dst[px] = x2.toShort()
+                    dst[px + 1] = clamp16(x2 + 2 * h0)
+                } else {
+                    l0 = low[pl].toInt()
+                    x0 = clamp16(l0 - h0).toInt()
+                    dst[px] = x2.toShort()
+                    dst[px + 1] = clamp16((x0 + x2) / 2 + 2 * h0)
+                    dst[px + 2] = x0.toShort()
+                }
+            } else {
+                l0 = low[pl++].toInt()
+                x0 = clamp16(l0 - h0 / 2).toInt()
+                dst[px] = x2.toShort()
+                dst[px + 1] = clamp16((x0 + x2) / 2 + 2 * h0)
+                dst[px + 2] = x0.toShort()
+                l0 = low[pl].toInt()
+                dst[px + 3] = clamp16((x0 + l0) / 2)
+            }
+        }
+    }
+
+    private fun idwtY(
+        low: ShortArray, lowBase: Int, lowStep: Int, high: ShortArray, highBase: Int, highStep: Int,
+        dst: ShortArray, dstBase: Int, dstStep: Int, nLow: Int, nHigh: Int, cols: Int,
+    ) {
+        for (col in 0 until cols) {
+            var pl = lowBase + col
+            var ph = highBase + col
+            var px = dstBase + col
+            var h0 = high[ph].toInt()
+            ph += highStep
+            var l0 = low[pl].toInt()
+            pl += lowStep
+            var x0 = clamp16(l0 - h0).toInt()
+            var x2 = x0
+            for (j in 0 until nHigh - 1) {
+                val h1 = high[ph].toInt()
+                ph += highStep
+                l0 = low[pl].toInt()
+                pl += lowStep
+                x2 = clamp16(l0 - (h0 + h1) / 2).toInt()
+                val x1 = clamp16((x0 + x2) / 2 + 2 * h0).toInt()
+                dst[px] = x0.toShort()
+                px += dstStep
+                dst[px] = x1.toShort()
+                px += dstStep
+                x0 = x2
+                h0 = h1
+            }
+            if (nLow <= nHigh + 1) {
+                if (nLow <= nHigh) {
+                    dst[px] = x2.toShort()
+                    px += dstStep
+                    dst[px] = clamp16(x2 + 2 * h0)
+                } else {
+                    l0 = low[pl].toInt()
+                    x0 = clamp16(l0 - h0).toInt()
+                    dst[px] = x2.toShort()
+                    px += dstStep
+                    dst[px] = clamp16((x0 + x2) / 2 + 2 * h0)
+                    px += dstStep
+                    dst[px] = x0.toShort()
+                }
+            } else {
+                l0 = low[pl].toInt()
+                pl += lowStep
+                x0 = clamp16(l0 - h0 / 2).toInt()
+                dst[px] = x2.toShort()
+                px += dstStep
+                dst[px] = clamp16((x0 + x2) / 2 + 2 * h0)
+                px += dstStep
+                dst[px] = x0.toShort()
+                px += dstStep
+                l0 = low[pl].toInt()
+                dst[px] = clamp16((x0 + l0) / 2)
+            }
+        }
+    }
+
+    /** Один уровень классического обратного преобразования (без extrapolate); результат — на том же месте буфера. */
     private fun idwt(buf: ShortArray, base: Int, sub: Int) {
         val total = sub shl 1
         val area = sub * sub
@@ -186,10 +506,24 @@ class RfxProgressive(private val onTile: (x: Int, y: Int, argb: IntArray) -> Uni
         }
     }
 
+    /** Переносит готовый тайл ([work], YCbCr с 5 дробными битами) на поверхность в пределах прямоугольников региона. */
+    private fun emit(xIdx: Int, yIdx: Int, region: Region) {
+        val tx = xIdx * TILE
+        val ty = yIdx * TILE
+        val argb = toArgb()
+        for (r in region.rects) {
+            val l = maxOf(r[0], tx)
+            val t = maxOf(r[1], ty)
+            val rt = minOf(r[0] + r[2], tx + TILE)
+            val b = minOf(r[1] + r[3], ty + TILE)
+            if (l < rt && t < b) onBlit(argb, l - tx, t - ty, rt - l, b - t, l, t)
+        }
+    }
+
     /** YCbCr (с 5 дробными битами) в ARGB 64x64. */
     private fun toArgb(): IntArray {
         val out = IntArray(TILE * TILE)
-        val yb = coeff[0]; val cbb = coeff[1]; val crb = coeff[2]
+        val yb = work[0]; val cbb = work[1]; val crb = work[2]
         for (i in out.indices) {
             val y = (yb[i] + 4096) shl 16
             val cb = cbb[i].toInt()

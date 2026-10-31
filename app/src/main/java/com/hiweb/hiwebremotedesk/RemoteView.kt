@@ -142,9 +142,13 @@ class RemoteView(context: Context) : View(context) {
     private var awaitCovered = -1L
     private var awaitArea = 0L
     private var awaitFirst = false
+
+    // Размер сменился внутри сеанса: кадры не замолкают, поэтому ждём лишь короткое время после покрытия стола.
+    private var liveResize = false
+    private var settledAt = 0L
     private val snapshotNode = RenderNode("rotation")
     private val desktopReady: Runnable = Runnable {
-        synchronized(lock) { awaitCovered = -1 }
+        synchronized(lock) { awaitCovered = -1; settledAt = 0 }
         removeCallbacks(desktopQuiet)
         transition?.clock?.ready(SystemClock.uptimeMillis())
         onRotationWait?.invoke(false)
@@ -154,7 +158,7 @@ class RemoteView(context: Context) : View(context) {
     // Кадры нового стола перестали приходить: после экрана входа и «Добро пожаловать» Windows присылает сам стол.
     private val desktopQuiet: Runnable = Runnable { desktopReady.run() }
 
-    fun initDesktop(width: Int, height: Int) {
+    fun initDesktop(width: Int, height: Int, live: Boolean = false) {
         synchronized(lock) {
             if (bitmap?.width != width || bitmap?.height != height) {
                 val created = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
@@ -166,6 +170,8 @@ class RemoteView(context: Context) : View(context) {
                     awaitCovered = 0
                     awaitArea = width.toLong() * height
                     awaitFirst = false
+                    settledAt = 0
+                    liveResize = live
                     desktopFresh = true
                 }
             }
@@ -174,13 +180,15 @@ class RemoteView(context: Context) : View(context) {
     }
 
     /** Вызывается из потока RDP. */
-    fun applyBitmap(left: Int, top: Int, w: Int, h: Int, argb: IntArray) {
+    fun applyBitmap(left: Int, top: Int, w: Int, h: Int, argb: IntArray, offset: Int = 0, stride: Int = w) {
         var settled = false
         var first = false
+        var quietMs = FRAMES_QUIET_MS
+        var capMs = FRAMES_CAP_MS
         synchronized(lock) {
             val b = bitmap ?: return
             if (left < 0 || top < 0 || left + w > b.width || top + h > b.height) return
-            b.setPixels(argb, 0, w, left, top, w, h)
+            b.setPixels(argb, offset, stride, left, top, w, h)
             if (awaitCovered >= 0) {
                 awaitCovered += w.toLong() * h
                 if (!awaitFirst) {
@@ -188,14 +196,23 @@ class RemoteView(context: Context) : View(context) {
                     first = true
                 }
                 settled = awaitCovered * 2 >= awaitArea
+                if (liveResize) {
+                    capMs = LIVE_CAP_MS
+                    if (settled) {
+                        val now = SystemClock.uptimeMillis()
+                        if (settledAt == 0L) settledAt = now
+                        // Кадры идут и после смены размера (экран живой): откладываем уход картинки лишь до LIVE_SETTLE_MAX_MS.
+                        quietMs = minOf(LIVE_QUIET_MS, maxOf(0L, settledAt + LIVE_SETTLE_MAX_MS - now))
+                    }
+                }
             }
         }
         // Картинка уходит, когда Windows перерисовала половину стола и кадры затихли: анимация экрана входа или
         // «Добро пожаловать» их не прерывает. Не дольше FRAMES_CAP_MS после первого кадра (на столе может идти видео).
-        if (first) postDelayed(desktopReady, FRAMES_CAP_MS)
+        if (first) postDelayed(desktopReady, capMs)
         if (settled) {
             removeCallbacks(desktopQuiet)
-            postDelayed(desktopQuiet, FRAMES_QUIET_MS)
+            postDelayed(desktopQuiet, quietMs)
         }
         postInvalidateOnAnimation()
     }
@@ -800,6 +817,11 @@ class RemoteView(context: Context) : View(context) {
         /** Сколько кадры нового стола должны молчать, прежде чем убирать прежнюю картинку, и самый долгий срок ожидания после первого кадра. */
         const val FRAMES_QUIET_MS = 500L
         const val FRAMES_CAP_MS = 5_000L
+
+        /** Смена размера внутри сеанса: затишье, самый долгий срок после покрытия стола и после первого кадра. */
+        const val LIVE_QUIET_MS = 120L
+        const val LIVE_SETTLE_MAX_MS = 400L
+        const val LIVE_CAP_MS = 1_500L
 
         /** Кнопки мыши Android, которые пересылаются на ПК. */
         val MOUSE_BUTTONS = intArrayOf(

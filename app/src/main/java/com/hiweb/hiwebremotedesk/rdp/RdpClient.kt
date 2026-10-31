@@ -45,6 +45,10 @@ data class RdpConfig(
     val windowsTls: Boolean = true,
     /** Графический конвейер RDPEGFX (RemoteFX Progressive): единственный способ получить картинку от GNOME Remote Desktop. */
     val gfx: Boolean = false,
+    /** Предлагать серверу H.264 (AVC420) и разжимать его аппаратным декодером; действует только вместе с [gfx]. */
+    val hardwareVideo: Boolean = false,
+    /** Windows (а не GNOME) на другом конце графического конвейера: не предлагать версии 10+, см. [GfxChannel]. */
+    val gfxClassic: Boolean = false,
 )
 
 interface RdpListener {
@@ -56,6 +60,16 @@ interface RdpListener {
 
     /** Прямоугольник обновлённых пикселей (ARGB, сверху вниз). */
     fun onBitmap(left: Int, top: Int, width: Int, height: Int, argb: IntArray)
+
+    /**
+     * Та же область без копирования (графический конвейер): первая точка — [argb] с индекса [offset], шаг строки
+     * [stride]. Пиксели действуют только внутри вызова. По умолчанию область копируется и уходит в [onBitmap].
+     */
+    fun onBitmapRegion(argb: IntArray, offset: Int, stride: Int, left: Int, top: Int, width: Int, height: Int) {
+        val copy = IntArray(width * height)
+        for (row in 0 until height) System.arraycopy(argb, offset + row * stride, copy, row * width, width)
+        onBitmap(left, top, width, height, copy)
+    }
 
     /** На ПК скопирован текст. Вызывается из потока RDP. */
     fun onClipboardText(text: String) {}
@@ -448,10 +462,16 @@ class RdpClient(
                         put(DisplayControlChannel.CHANNEL_NAME, DisplayControlChannel { Log.i(TAG, it) }.also { display = it })
                         put(
                             GfxChannel.CHANNEL_NAME,
-                            GfxChannel({ w, h ->
-                                deskW = w; deskH = h
-                                listener.onDesktopSize(w, h)
-                            }) { l, t, w, h, argb -> listener.onBitmap(l, t, w, h, argb) },
+                            GfxChannel(
+                                onDesktopSize = { w, h ->
+                                    deskW = w; deskH = h
+                                    listener.onDesktopSize(w, h)
+                                },
+                                avc = if (cfg.hardwareVideo) HardwareAvc.factory { Log.i(TAG, "avc: $it") } else null,
+                                classic = cfg.gfxClassic,
+                                onRegion = { argb, offset, stride, l, t, w, h -> listener.onBitmapRegion(argb, offset, stride, l, t, w, h) },
+                                onBitmap = { l, t, w, h, argb -> listener.onBitmap(l, t, w, h, argb) },
+                            ),
                         )
                     }
                 },

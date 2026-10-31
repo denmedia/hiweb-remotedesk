@@ -140,6 +140,8 @@ fun DeviceEditDialog(
     var mouseSpeedPercent by remember { mutableStateOf((device?.mouseSpeedPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var mouseWheelPercent by remember { mutableStateOf((device?.mouseWheelPercent ?: StrengthLevels.DEFAULT).toFloat()) }
     var fileTransfer by remember { mutableStateOf(device?.fileTransfer ?: true) }
+    var hardwareVideo by remember { mutableStateOf(device?.hardwareVideo ?: true) }
+    var windowsGfx by remember { mutableStateOf(device?.windowsGfx ?: false) }
     var microphone by remember { mutableStateOf(device?.microphone ?: false) }
     var camera by remember { mutableStateOf(device?.camera ?: false) }
     val cameraOff = remember { mutableStateListOf<String>().apply { addAll(device?.cameraOff.orEmpty()) } }
@@ -352,6 +354,33 @@ fun DeviceEditDialog(
                                     color = TextSecondary, fontSize = 12.sp,
                                 )
                             }
+                            if (os == OsType.WINDOWS) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("Графический конвейер (RDPEGFX)", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            "Современный способ передачи картинки: нужен для H.264, меняет размер экрана при повороте без переподключения. " +
+                                                "Проверен меньше классического — если картинка искажается, выключите. Применяется при следующем подключении.",
+                                            color = TextSecondary, fontSize = 12.sp,
+                                        )
+                                    }
+                                    Switch(checked = windowsGfx, onCheckedChange = { windowsGfx = it })
+                                }
+                            }
+                            if (os == OsType.UBUNTU || windowsGfx) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Column(Modifier.weight(1f)) {
+                                        Text("H.264, аппаратное декодирование", color = TextPrimary, fontSize = 15.sp)
+                                        Text(
+                                            "Сервер сжимает экран видеокодеком, планшет разжимает его видеочипом: меньше трафика и нагрузки на процессор. " +
+                                                "Работает, если сервер умеет кодировать H.264 (Ubuntu — видеокарта с VA-API или NVENC; Windows решает сам), иначе сеанс идёт как обычно. " +
+                                                "Применяется при следующем подключении.",
+                                            color = TextSecondary, fontSize = 12.sp,
+                                        )
+                                    }
+                                    Switch(checked = hardwareVideo, onCheckedChange = { hardwareVideo = it })
+                                }
+                            }
                             StrengthSlider(
                                 title = "Сила скролла",
                                 hint = "Скорость прокрутки двумя пальцами на тачпаде и сенсорном экране. Применяется при следующем подключении.",
@@ -512,6 +541,8 @@ fun DeviceEditDialog(
                             mouseSpeedPercent = StrengthLevels.snap(mouseSpeedPercent),
                             mouseWheelPercent = StrengthLevels.snap(mouseWheelPercent),
                             fileTransfer = fileTransfer,
+                            hardwareVideo = hardwareVideo,
+                            windowsGfx = windowsGfx,
                             microphone = microphone,
                             camera = camera,
                             cameraOff = cameraOff.toSet(),

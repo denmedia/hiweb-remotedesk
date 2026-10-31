@@ -76,6 +76,8 @@ class DeviceRepository private constructor(private val context: Context) {
                     .put("mouse_pct", d.mouseSpeedPercent)
                     .put("wheel_pct", d.mouseWheelPercent)
                     .put("files", d.fileTransfer)
+                    .put("h264", d.hardwareVideo)
+                    .put("win_gfx", d.windowsGfx)
                     .put("mic", d.microphone)
                     .put("cam", d.camera)
                     .put("cam_off", JSONArray(d.cameraOff.toList()))
@@ -145,6 +147,8 @@ class DeviceRepository private constructor(private val context: Context) {
                     mouseSpeedPercent = o.optInt("mouse_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
                     mouseWheelPercent = o.optInt("wheel_pct", StrengthLevels.DEFAULT).coerceIn(StrengthLevels.MIN, StrengthLevels.MAX),
                     fileTransfer = o.optBoolean("files", true),
+                    hardwareVideo = o.optBoolean("h264", true),
+                    windowsGfx = o.optBoolean("win_gfx", false),
                     microphone = o.optBoolean("mic", false),
                     camera = o.optBoolean("cam", false),
                     cameraOff = o.optJSONArray("cam_off")?.let { a -> (0 until a.length()).map { a.getString(it) }.toSet() } ?: emptySet(),
