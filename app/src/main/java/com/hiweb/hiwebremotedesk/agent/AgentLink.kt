@@ -66,6 +66,7 @@ class AgentLink(
     @Volatile private var foreground = true
     @Volatile private var battery: Pair<Int, Boolean>? = null
     @Volatile private var physicalKeyboard: Boolean? = null
+    @Volatile private var keyboardMode: String = "auto"
 
     val connected: Boolean get() = write != null
 
@@ -77,6 +78,7 @@ class AgentLink(
         battery?.let { (level, charging) -> send(batteryMessage(level, charging)) }
         physicalKeyboard?.let { send(keyboardMessage(it)) }
     }
+
 
     override fun onMessage(data: ByteArray) {
         val msg = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull() ?: return
@@ -140,6 +142,13 @@ class AgentLink(
         send(keyboardMessage(present))
     }
 
+    /** Режим сенсорной клавиатуры Windows ([com.hiweb.hiwebremotedesk.KeyboardMode.id]): `show`, `hide` или `auto`. */
+    fun setKeyboardMode(mode: String) {
+        if (keyboardMode == mode) return
+        keyboardMode = mode
+        physicalKeyboard?.let { send(keyboardMessage(it)) }
+    }
+
     /**
      * Передаёт агенту, как позвать планшет, когда тот не подключён: идентификатор ПК в приложении,
      * ключ подписи команд, UDP-порт и текущие адреса планшета. Канал RDP зашифрован TLS.
@@ -174,7 +183,8 @@ class AgentLink(
     private fun batteryMessage(level: Int, charging: Boolean) =
         JSONObject().put("t", "battery").put("level", level).put("charging", charging)
 
-    private fun keyboardMessage(present: Boolean) = JSONObject().put("t", "keyboard").put("physical", present)
+    private fun keyboardMessage(present: Boolean) =
+        JSONObject().put("t", "keyboard").put("physical", present).put("kbmode", keyboardMode)
 
     /** Ответ на уведомление с `ack`: показано ли оно, а если нет — почему ([PcNotifications.BLOCKED_VISIBLE] и др.). */
     fun sendNotificationAck(id: Long, blockedBy: String?) {

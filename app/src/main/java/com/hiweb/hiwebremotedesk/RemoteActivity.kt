@@ -40,6 +40,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentSize
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -51,13 +52,16 @@ import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.InstallDesktop
 import androidx.compose.material.icons.outlined.UploadFile
+import androidx.compose.material.icons.outlined.DesktopAccessDisabled
 import androidx.compose.material.icons.outlined.Keyboard
+import androidx.compose.material.icons.outlined.KeyboardHide
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.MicOff
 import androidx.compose.material.icons.outlined.Mouse
 import androidx.compose.material.icons.outlined.ScreenRotation
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material.icons.outlined.Videocam
 import androidx.compose.material.icons.outlined.VideocamOff
 import androidx.compose.material.icons.outlined.MoreVert
@@ -68,6 +72,8 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Switch
@@ -82,9 +88,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -129,6 +139,7 @@ import com.hiweb.hiwebremotedesk.rdp.ScanKey
 import com.hiweb.hiwebremotedesk.ui.RotationButton
 import com.hiweb.hiwebremotedesk.ui.StrengthSlider
 import com.hiweb.hiwebremotedesk.ui.theme.Accent
+import com.hiweb.hiwebremotedesk.ui.theme.DangerRed
 import com.hiweb.hiwebremotedesk.ui.theme.HiWebRemoteDeskTheme
 import com.hiweb.hiwebremotedesk.ui.theme.SurfaceButton
 import com.hiweb.hiwebremotedesk.ui.theme.Outline
@@ -300,6 +311,9 @@ class RemoteActivity : ComponentActivity() {
 
     /** Окно настроек, которые можно менять в ходе сеанса (кнопка «Настройки» в панели сеанса). */
     private var settingsOpen by mutableStateOf(false)
+
+    /** Режим экранной клавиатуры (кнопка в панели сеанса); хранится для каждого ПК, читается в onCreate. */
+    private var keyboardMode by mutableStateOf(KeyboardMode.DEFAULT)
     private var overlayPrompt by mutableStateOf(false)
 
     // Сеанс открыт командой с ПК при заблокированном планшете: рабочий стол закрыт заставкой до разблокировки.
@@ -405,6 +419,7 @@ class RemoteActivity : ComponentActivity() {
                         overlayPrompt = true
                     }
                     agentVersion = version
+                    applyKeyboardMode()
                     if (agentInstalling) {
                         agentInstalling = false
                         handler.removeCallbacks(agentTimeout)
@@ -436,7 +451,14 @@ class RemoteActivity : ComponentActivity() {
             }
 
             override fun onKeyboardPane(rect: android.graphics.Rect?) {
-                runOnUiThread { remoteView.keyboardPane = rect }
+                runOnUiThread {
+                    remoteView.keyboardPane = rect
+                    // Клавиатуру Windows в режиме «показана» закрыли на самом ПК (крестик на ней): кнопка в панели должна
+                    // показывать «скрыта». Пока приложение свёрнуто, агент прячет её сам — это закрытием не считается.
+                    if (rect == null && keyboardMode == KeyboardMode.SHOW && visible && windowsKeyboard()) {
+                        changeKeyboardMode(KeyboardMode.HIDE)
+                    }
+                }
             }
 
             override fun onAgentCursor(cursor: RemoteCursor) {
@@ -457,6 +479,7 @@ class RemoteActivity : ComponentActivity() {
         }).also { link ->
             GuardHub.attach(device.id, link)
             registerReceiver(null, android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))?.let { sendBattery(it, link) }
+            link.setKeyboardMode(keyboardMode.id)
             sendKeyboard(link)
         }
     }
@@ -509,13 +532,18 @@ class RemoteActivity : ComponentActivity() {
         requestedOrientation = SessionRotation.orientationFor(target, SessionRotation.naturalPortrait(rotation, portrait))
     }
 
-    /** Устаревший агент на ПК: окно с предложением обновить — не чаще раза в сутки для каждого ПК. */
+    /**
+     * Устаревший агент на ПК: окно с предложением обновить. Новая версия агента предлагается сразу, а ту же версию
+     * повторно — не чаще раза в сутки для каждого ПК (кнопка в панели сеанса остаётся, пока агент не обновлён).
+     */
     private fun offerAgentUpdate(installed: String) {
         if (!visible || agentInstalling || !AgentInstaller.isOutdated(installed, bundledAgentVersion)) return
         val key = "agent_update_asked_" + device.id
+        val versionKey = "agent_update_version_" + device.id
         val now = System.currentTimeMillis()
-        if (now - uiPrefs.getLong(key, 0) < AGENT_UPDATE_INTERVAL_MS) return
-        uiPrefs.edit().putLong(key, now).apply()
+        val sameVersion = uiPrefs.getString(versionKey, null) == bundledAgentVersion
+        if (sameVersion && now - uiPrefs.getLong(key, 0) < AGENT_UPDATE_INTERVAL_MS) return
+        uiPrefs.edit().putLong(key, now).putString(versionKey, bundledAgentVersion).apply()
         agentConfirm = true
     }
 
@@ -627,6 +655,7 @@ class RemoteActivity : ComponentActivity() {
         device = found
         powerAction = intent.getStringExtra(EXTRA_POWER_ACTION)?.let { name -> PowerAction.entries.firstOrNull { it.name == name } }
         keyHintDismissed = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("key_hint_dismissed", false)
+        keyboardMode = KeyboardMode.parse(uiPrefs.getString(keyboardModeKey(), null))
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
@@ -847,7 +876,9 @@ class RemoteActivity : ComponentActivity() {
             scalePercent = device.scalePercent, physicalWidthMm = physicalMm().first, physicalHeightMm = physicalMm().second,
             fileTransfer = device.fileTransfer, driveName = device.driveName, colorDepth = device.colorDepth,
             windowsTls = device.os == OsType.WINDOWS,
-            gfx = device.os == OsType.UBUNTU,
+            gfx = device.os == OsType.UBUNTU || device.windowsGfx,
+            hardwareVideo = device.hardwareVideo,
+            gfxClassic = device.os == OsType.WINDOWS,
         )
         agentInstalling = false
         agentVersion = null
@@ -883,6 +914,8 @@ class RemoteActivity : ComponentActivity() {
                     state = SessionState.Connected
                     pushClipboard()
                     updateCapture()
+                    // Для Windows клавиатуру подбирает applyKeyboardMode, когда агент назовёт версию (onAgentHello); без агента — кнопкой.
+                    if (device.os != OsType.WINDOWS) applyKeyboardMode()
                     // Закрепляем сертификат при первом успешном подключении.
                     val fp = pinnedCertSeen
                     if (device.certSha256 == null && fp != null) {
@@ -910,7 +943,14 @@ class RemoteActivity : ComponentActivity() {
             override fun onDesktopSize(width: Int, height: Int) {
                 if (seq != sessionSeq) return
                 desktopWidth = width
-                remoteView.initDesktop(width, height)
+                // Размер сменился внутри сеанса (графический конвейер): кадры идут и дальше, затишья ждать нельзя.
+                remoteView.initDesktop(width, height, live = true)
+            }
+
+            override fun onBitmapRegion(argb: IntArray, offset: Int, stride: Int, left: Int, top: Int, width: Int, height: Int) {
+                if (seq != sessionSeq) return
+                lastBitmapAt = SystemClock.uptimeMillis()
+                remoteView.applyBitmap(left, top, width, height, argb, offset, stride)
             }
 
             override fun onBitmap(left: Int, top: Int, width: Int, height: Int, argb: IntArray) {
@@ -1163,6 +1203,43 @@ class RemoteActivity : ComponentActivity() {
         WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.ime())
         // Клавиатура может перекрыть рабочий стол: жесты в этот момент не перехватываем.
         handler.postDelayed({ updateCapture() }, 200)
+    }
+
+    private fun keyboardModeKey() = "kbd_mode_" + device.id
+
+    /**
+     * Переключает режим экранной клавиатуры и запоминает его для этого ПК: агент показывает или прячет клавиатуру Windows
+     * ([KeyboardMode]), без подходящего агента работает клавиатура Android ([applyKeyboardMode]).
+     */
+    private fun changeKeyboardMode(mode: KeyboardMode) {
+        keyboardMode = mode
+        uiPrefs.edit().putString(keyboardModeKey(), mode.id).apply()
+        agent?.setKeyboardMode(mode.id)
+        applyKeyboardMode()
+    }
+
+    /** Агент на ПК понимает режимы клавиатуры (1.9.0+): экранной клавиатурой управляет он, а не планшет. */
+    private fun windowsKeyboard(): Boolean {
+        val installed = agentVersion ?: return false
+        return !AgentInstaller.isOutdated(installed, KeyboardMode.AGENT_VERSION)
+    }
+
+    /**
+     * С агентом нужной версии клавиатура Android не нужна (её убираем). Без него (Ubuntu, агента нет или он старый)
+     * режим «показана» открывает клавиатуру Android, остальные закрывают её.
+     */
+    private fun applyKeyboardMode() {
+        if (windowsKeyboard() || keyboardMode != KeyboardMode.SHOW) {
+            if (imeAttached()) closeKeyboard()
+        } else if (state == SessionState.Connected && !imeAttached()) {
+            openKeyboard()
+        }
+    }
+
+    /** На ПК стоит агент, а вложенный в приложение новее. */
+    private fun agentUpdateAvailable(): Boolean {
+        val installed = agentVersion ?: return false
+        return AgentInstaller.isOutdated(installed, bundledAgentVersion)
     }
 
     /** Прячет поле и клавиатуру, возвращая фокус экрану сеанса (иначе жесты идут в пустое поле). */
@@ -1441,14 +1518,22 @@ class RemoteActivity : ComponentActivity() {
 
     @Composable
     private fun RemoteScreen() {
+        // На планшете панель свёрнута в «ручку» сверху и сама сворачивается через 5 с без нажатий; на телефоне всегда на виду.
         var toolbar by remember { mutableStateOf(false) }
-        LaunchedEffect(toolbar) {
-            if (toolbar) {
+        var menuOpen by remember { mutableStateOf(false) }
+        var busy by remember { mutableStateOf(0) }
+        LaunchedEffect(toolbar, menuOpen, busy) {
+            if (toolbar && !menuOpen) {
                 kotlinx.coroutines.delay(5000)
                 toolbar = false
             }
         }
-        BackHandler { if (settingsOpen) settingsOpen = false else if (imeOpen) closeKeyboard() else disconnect() }
+        BackHandler {
+            if (menuOpen) menuOpen = false
+            else if (settingsOpen) settingsOpen = false
+            else if (imeOpen) { closeKeyboard(); if (keyboardMode == KeyboardMode.SHOW) changeKeyboardMode(KeyboardMode.HIDE) }
+            else disconnect()
+        }
 
         // На телефоне физических клавиш нет, а панель сеанса в книжной ориентации не помещается по ширине:
         // кнопки уходят вниз под палец и прокручиваются, а сама панель живёт поверх системной навигации.
@@ -1470,62 +1555,15 @@ class RemoteActivity : ComponentActivity() {
             }
 
             if (state == SessionState.Connected) {
-                if (phone) {
-                    PhoneSessionPanel(
-                        toolbar = toolbar,
-                        onToolbar = { toolbar = it },
-                        onKeyboard = { toolbar = false; if (imeOpen) closeKeyboard() else openKeyboard() },
-                    )
-                } else {
-                    Box(Modifier.align(Alignment.TopCenter)) {
-                        if (toolbar) {
-                            Row(
-                                Modifier.padding(top = 10.dp).clip(RoundedCornerShape(16.dp)).background(Surface.copy(alpha = 0.95f))
-                                    .border(1.dp, Outline, RoundedCornerShape(16.dp)).padding(6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                ToolbarButton(Icons.Outlined.Close, "Отключиться") { disconnect() }
-                                ToolbarButton(Icons.Outlined.Settings, "Настройки") { settingsOpen = true; toolbar = false }
-                                ToolbarButton(Icons.Outlined.ScreenRotation, "Повернуть") { rotateSession(); toolbar = false }
-                                if (device.microphone) {
-                                    ToolbarButton(
-                                        if (micOn) Icons.Outlined.Mic else Icons.Outlined.MicOff,
-                                        if (micOn) "Микрофон включён" else "Микрофон",
-                                        active = micOn,
-                                    ) { toggleMic(); toolbar = false }
-                                }
-                                // Кнопка показывает камеры планшета Windows; сам поток включает программа на ПК.
-                                if (device.camera) {
-                                    ToolbarButton(
-                                        if (cameraShared) Icons.Outlined.Videocam else Icons.Outlined.VideocamOff,
-                                        when { cameraOn -> "Камера: ПК смотрит"; cameraShared -> "Камера включена"; else -> "Камера" },
-                                        active = cameraShared,
-                                    ) { toggleCamera(); toolbar = false }
-                                }
-                                if (capturedByTouchpad) {
-                                    ToolbarButton(Icons.Outlined.TouchApp, if (captureOn) "Жесты: ПК" else "Жесты: планшет") { toggleCapture(); toolbar = false }
-                                }
-                                ToolbarButton(Icons.Outlined.Lock, "Ctrl+Alt+Del") { sendCtrlAltEnd(); toolbar = false }
-                                ToolbarButton(Icons.Outlined.Window, "Win") { tapWinKey(); toolbar = false }
-                                if (device.os == OsType.WINDOWS && powerAction == null) {
-                                    val installed = agentVersion
-                                    val label = when {
-                                        installed == null -> "Установить агент"
-                                        AgentInstaller.isOutdated(installed, bundledAgentVersion) -> "Обновить агент"
-                                        else -> null
-                                    }
-                                    if (label != null) ToolbarButton(Icons.Outlined.InstallDesktop, label) { agentConfirm = true; toolbar = false }
-                                }
-                            }
-                        } else {
-                            Box(
-                                Modifier.padding(top = 6.dp).clip(RoundedCornerShape(16.dp)).background(Surface.copy(alpha = 0.92f))
-                                    .border(1.dp, Outline, RoundedCornerShape(16.dp)).clickable { toolbar = true }
-                                    .padding(horizontal = 30.dp, vertical = 6.dp),
-                            ) { Icon(Icons.Outlined.ExpandMore, "Меню сеанса", tint = Color.White, modifier = Modifier.size(28.dp)) }
-                        }
-                    }
-                }
+                SessionToolbar(
+                    phone = phone,
+                    expanded = toolbar || phone,
+                    onExpand = { toolbar = true },
+                    onCollapse = { toolbar = false },
+                    menuOpen = menuOpen,
+                    onMenu = { menuOpen = it },
+                    onBusy = { busy++ },
+                )
             }
 
             if (state == SessionState.Connected) powerStatus?.let { PowerBanner(it) }
@@ -1580,89 +1618,161 @@ class RemoteActivity : ComponentActivity() {
     }
 
     /**
-     * Панель сеанса для смартфона. В книжной ориентации экран 384 dp: восемь подписанных кнопок в строку
-     * не влезают, поэтому панель — две прокручиваемые строки внизу, ближе к большим пальцам, плюс кнопка
-     * «Клавиатура» слева внизу (как на удалённых рабочих столах для телефонов).
+     * Компактная панель сеанса: таблетка с иконками (клавиатура, микрофон, камера, Win, «ещё») и отдельная красная
+     * кнопка «Отключиться». Остальное — в меню «⋮». На планшете сверху, свёрнута в «ручку» и сама сворачивается; на
+     * телефоне всегда внизу, над клавиатурой. Кнопки-переключатели (клавиатура, микрофон, камера) панель не закрывают,
+     * чтобы было видно новое состояние; остальные действия сворачивают её.
      */
     @Composable
-    private fun BoxScope.PhoneSessionPanel(toolbar: Boolean, onToolbar: (Boolean) -> Unit, onKeyboard: () -> Unit) {
-        Column(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding()) {
-            if (toolbar) {
-                Column(
-                    Modifier.padding(horizontal = 10.dp, vertical = 6.dp).clip(RoundedCornerShape(16.dp))
-                        .background(Surface.copy(alpha = 0.96f)).border(1.dp, Outline, RoundedCornerShape(16.dp))
-                        .padding(vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
+    private fun BoxScope.SessionToolbar(
+        phone: Boolean,
+        expanded: Boolean,
+        onExpand: () -> Unit,
+        onCollapse: () -> Unit,
+        menuOpen: Boolean,
+        onMenu: (Boolean) -> Unit,
+        onBusy: () -> Unit,
+    ) {
+        val placement = if (phone) {
+            Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding().padding(bottom = 10.dp)
+        } else {
+            Modifier.align(Alignment.TopCenter).padding(top = if (expanded) 8.dp else 4.dp)
+        }
+        Box(placement) {
+            if (!expanded) {
+                Box(
+                    Modifier.clip(RoundedCornerShape(12.dp)).background(Surface.copy(alpha = 0.92f))
+                        .border(1.dp, Outline, RoundedCornerShape(16.dp)).clickable(onClick = onExpand)
+                        .padding(horizontal = 16.dp, vertical = 1.dp),
                 ) {
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        ToolbarButton(Icons.Outlined.Close, "Отключиться") { disconnect() }
-                        ToolbarButton(Icons.Outlined.Settings, "Настройки") { settingsOpen = true; onToolbar(false) }
-                        ToolbarButton(Icons.Outlined.ScreenRotation, "Повернуть") { rotateSession(); onToolbar(false) }
-                        if (device.microphone) {
-                            ToolbarButton(
-                                if (micOn) Icons.Outlined.Mic else Icons.Outlined.MicOff,
-                                if (micOn) "Микрофон вкл." else "Микрофон",
-                                active = micOn,
-                            ) { toggleMic(); onToolbar(false) }
-                        }
-                        if (device.camera) {
-                            ToolbarButton(
-                                if (cameraShared) Icons.Outlined.Videocam else Icons.Outlined.VideocamOff,
-                                when { cameraOn -> "Камера: ПК смотрит"; cameraShared -> "Камера вкл."; else -> "Камера" },
-                                active = cameraShared,
-                            ) { toggleCamera(); onToolbar(false) }
-                        }
-                        // Без подключённой клавиатуры-тачпада переключать захват жестов нечего: пальцы и так для ПК.
-                        if (capturedByTouchpad) {
-                            ToolbarButton(Icons.Outlined.TouchApp, if (captureOn) "Жесты: ПК" else "Жесты: планшет") { toggleCapture(); onToolbar(false) }
-                        }
-                        ToolbarButton(Icons.Outlined.Lock, "Ctrl+Alt+Del") { sendCtrlAltEnd(); onToolbar(false) }
-                        ToolbarButton(Icons.Outlined.Window, "Win") { tapWinKey(); onToolbar(false) }
-                        ToolbarButton(Icons.AutoMirrored.Outlined.List, "Alt+Tab") { sendAltTab(); onToolbar(false) }                    }
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        if (device.os == OsType.WINDOWS && powerAction == null) {
-                            val installed = agentVersion
-                            val label = when {
-                                installed == null -> "Установить агент"
-                                AgentInstaller.isOutdated(installed, bundledAgentVersion) -> "Обновить агент"
-                                else -> null
-                            }
-                            if (label != null) ToolbarButton(Icons.Outlined.InstallDesktop, label) { agentConfirm = true; onToolbar(false) }
-                        }
-                        ToolbarButton(Icons.Outlined.ExpandMore, "Свернуть") { onToolbar(false) }
+                    Icon(Icons.Outlined.ExpandMore, "Меню сеанса", tint = Color.White, modifier = Modifier.size(20.dp))
+                    // Точка на «ручке»: в свёрнутой панели видно, что есть обновление агента.
+                    if (agentUpdateAvailable()) Box(Modifier.align(Alignment.TopEnd).size(7.dp).clip(CircleShape).background(Accent))
+                }
+                return@Box
+            }
+            val pill = RoundedCornerShape(28.dp)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    Modifier.shadow(6.dp, pill).clip(pill).background(SurfaceButton).padding(horizontal = 6.dp, vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    KeyboardModeButton(onBusy)
+                    if (device.microphone) {
+                        BarIcon(
+                            if (micOn) Icons.Outlined.Mic else Icons.Outlined.MicOff,
+                            if (micOn) "Микрофон включён" else "Микрофон",
+                            active = micOn,
+                        ) { toggleMic(); onBusy() }
+                    }
+                    // Кнопка показывает камеры планшета Windows; сам поток включает программа на ПК.
+                    if (device.camera) {
+                        BarIcon(
+                            if (cameraShared) Icons.Outlined.Videocam else Icons.Outlined.VideocamOff,
+                            when { cameraOn -> "Камера: ПК смотрит"; cameraShared -> "Камера включена"; else -> "Камера" },
+                            active = cameraShared,
+                        ) { toggleCamera(); onBusy() }
+                    }
+                    BarIcon(Icons.Outlined.Window, "Win") { tapWinKey(); onCollapse() }
+                    // Пока на ПК агент старее вложенного в приложение, кнопка всегда на виду (подсвечена).
+                    if (agentUpdateAvailable()) {
+                        BarIcon(Icons.Outlined.SystemUpdate, "Обновить агент", active = true) { agentConfirm = true; onCollapse() }
+                    }
+                    Box {
+                        BarIcon(Icons.Outlined.MoreVert, "Ещё", active = menuOpen) { onMenu(true) }
+                        SessionMenu(phone, menuOpen, onMenu, onCollapse)
                     }
                 }
-            }
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                PhoneButton(Icons.Outlined.Keyboard, "Клавиатура", primary = true, onClick = onKeyboard)
-                PhoneButton(Icons.Outlined.MoreVert, if (toolbar) "Свернуть" else "Меню", onClick = { onToolbar(!toolbar) })
+                Box(
+                    Modifier.size(52.dp).shadow(6.dp, RoundedCornerShape(16.dp)).clip(RoundedCornerShape(16.dp))
+                        .background(DangerRed).clickable { disconnect() },
+                    contentAlignment = Alignment.Center,
+                ) { Icon(Icons.Outlined.DesktopAccessDisabled, "Отключиться", tint = Color.White, modifier = Modifier.size(26.dp)) }
             }
         }
     }
 
-    /** Крупная кнопка панели телефона: не меньше 48 dp по высоте, чтобы попадать пальцем. */
+    /** Меню «⋮»: всё, что не поместилось в таблетку. */
     @Composable
-    private fun PhoneButton(icon: ImageVector, label: String, primary: Boolean = false, onClick: () -> Unit) {
-        Row(
-            Modifier.height(48.dp).clip(RoundedCornerShape(24.dp))
-                .background(if (primary) Accent else Surface.copy(alpha = 0.94f))
-                .border(1.dp, if (primary) Accent else Outline, RoundedCornerShape(24.dp))
-                .clickable(onClick = onClick).padding(horizontal = 16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+    private fun SessionMenu(phone: Boolean, open: Boolean, onMenu: (Boolean) -> Unit, onCollapse: () -> Unit) {
+        // Закрывает меню и панель, затем выполняет действие.
+        fun act(action: () -> Unit) = { onMenu(false); onCollapse(); action() }
+        DropdownMenu(expanded = open, onDismissRequest = { onMenu(false) }, modifier = Modifier.background(SurfaceButton)) {
+            BarMenuItem(Icons.Outlined.Settings, "Настройки", act { settingsOpen = true })
+            BarMenuItem(Icons.Outlined.ScreenRotation, "Повернуть", act { rotateSession() })
+            if (capturedByTouchpad) {
+                BarMenuItem(Icons.Outlined.TouchApp, if (captureOn) "Жесты: ПК" else "Жесты: планшет", act { toggleCapture() })
+            }
+            BarMenuItem(Icons.Outlined.Lock, "Ctrl+Alt+Del", act { sendCtrlAltEnd() })
+            // На планшете с чехлом Alt+Tab есть на самой клавиатуре; без неё переключать окна иначе нечем.
+            if (phone) BarMenuItem(Icons.AutoMirrored.Outlined.List, "Alt+Tab", act { sendAltTab() })
+            if (device.os == OsType.WINDOWS && powerAction == null) {
+                val installed = agentVersion
+                val label = when {
+                    installed == null -> "Установить агент"
+                    AgentInstaller.isOutdated(installed, bundledAgentVersion) -> "Обновить агент"
+                    else -> null
+                }
+                if (label != null) BarMenuItem(Icons.Outlined.InstallDesktop, label, act { agentConfirm = true })
+            }
+        }
+    }
+
+    @Composable
+    private fun BarMenuItem(icon: ImageVector, label: String, onClick: () -> Unit) {
+        DropdownMenuItem(
+            text = { Text(label, color = TextPrimary, fontSize = 15.sp) },
+            leadingIcon = { Icon(icon, null, tint = TextSecondary, modifier = Modifier.size(22.dp)) },
+            onClick = onClick,
+        )
+    }
+
+    /**
+     * Кнопка экранной клавиатуры с тремя состояниями ([KeyboardMode]): «показана» — подсвечена, «скрыта» — перечёркнутая
+     * клавиатура, «автоматически» — клавиатура со значком «A». Каждое нажатие переходит к следующему и коротко
+     * подписывает режим.
+     */
+    @Composable
+    private fun KeyboardModeButton(onBusy: () -> Unit) {
+        val mode = keyboardMode
+        BarIcon(
+            if (mode == KeyboardMode.HIDE) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
+            mode.title,
+            active = mode == KeyboardMode.SHOW,
+            badge = if (mode == KeyboardMode.AUTO) "A" else null,
         ) {
-            Icon(icon, null, tint = TextPrimary, modifier = Modifier.size(22.dp))
-            Text(label, color = TextPrimary, fontSize = 14.sp, maxLines = 1)
+            changeKeyboardMode(mode.next())
+            android.widget.Toast.makeText(this, keyboardMode.title, android.widget.Toast.LENGTH_SHORT).show()
+            onBusy()
+        }
+    }
+
+    /** Иконка-кнопка таблетки: круг 44 dp (с запасом для пальца), [active] подсвечивает включённый режим, [badge] — буква в углу. */
+    @Composable
+    private fun BarIcon(icon: ImageVector, description: String, active: Boolean = false, badge: String? = null, onClick: () -> Unit) {
+        // Внешний Box не обрезается: значок-буква сидит в углу квадрата 44 dp, а круглая обрезка срезала бы его (так и было).
+        Box(Modifier.size(44.dp)) {
+            Box(
+                Modifier.fillMaxSize().clip(CircleShape).background(if (active) Accent else Color.Transparent).clickable(onClick = onClick),
+                contentAlignment = Alignment.Center,
+            ) { Icon(icon, description, tint = TextPrimary, modifier = Modifier.size(24.dp)) }
+            if (badge != null) {
+                // Кольцо цвета таблетки отделяет букву от иконки; высота строки обрезана по глифу, иначе «A» уезжает вверх.
+                Box(
+                    Modifier.align(Alignment.BottomEnd).size(18.dp).clip(CircleShape).background(SurfaceButton).padding(1.5.dp)
+                        .clip(CircleShape).background(Accent),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        badge, color = TextPrimary, fontWeight = FontWeight.Bold,
+                        style = TextStyle(
+                            fontSize = 11.sp, lineHeight = 11.sp,
+                            lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.Both),
+                        ),
+                    )
+                }
+            }
         }
     }
 
