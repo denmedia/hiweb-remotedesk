@@ -76,6 +76,8 @@ dependencies {
     implementation(libs.jsch)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
+    // В JVM-тестах org.json из android.jar — заглушка; нужен настоящий (разбор ответа GitHub в AppUpdateTest)
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

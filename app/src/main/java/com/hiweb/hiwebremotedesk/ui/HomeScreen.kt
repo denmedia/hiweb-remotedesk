@@ -125,6 +125,7 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
     var agentConfirm by remember { mutableStateOf<Pair<Device, AgentPower>?>(null) }
     var discovery by remember { mutableStateOf(false) }
     var permissionsOpen by remember { mutableStateOf(false) }
+    var updateOpen by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val permissionsTick = rememberPermissionsTick()
     // После закрытия окна права могли измениться (выдали в настройках), поэтому пересчитываем и по нему.
@@ -191,6 +192,7 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                 TopBarCompact(
                     query = query, onQuery = vm::setQuery, sort = sort, onSort = vm::setSort, onRefresh = vm::refreshStatus,
                     permissionsMissing = permissionsMissing, onPermissions = { permissionsOpen = true },
+                    onUpdate = { updateOpen = true },
                 )
                 FilterChips(
                     devices = devices,
@@ -230,6 +232,7 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                     onRefresh = vm::refreshStatus,
                     permissionsMissing = permissionsMissing,
                     onPermissions = { permissionsOpen = true },
+                    onUpdate = { updateOpen = true },
                 )
                 Row(Modifier.fillMaxSize()) {
                     Sidebar(
@@ -274,6 +277,7 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
     }
 
     if (permissionsOpen) PermissionsDialog(onDismiss = { permissionsOpen = false })
+    if (updateOpen) UpdateDialog(onDismiss = { updateOpen = false })
     if (adding) {
         DeviceEditDialog(
             device = null, newId = vm.repo::newId, onSave = vm::save, onDelete = null,
@@ -490,6 +494,7 @@ private fun TopBarCompact(
     onRefresh: () -> Unit,
     permissionsMissing: Int,
     onPermissions: () -> Unit,
+    onUpdate: () -> Unit,
 ) {
     var searching by remember { mutableStateOf(query.isNotEmpty()) }
     var moreMenu by remember { mutableStateOf(false) }
@@ -545,6 +550,10 @@ private fun TopBarCompact(
                         )
                     },
                     onClick = { onPermissions(); moreMenu = false },
+                )
+                DropdownMenuItem(
+                    text = { Text("Проверить обновление", color = TextPrimary) },
+                    onClick = { onUpdate(); moreMenu = false },
                 )
                 SortOrder.entries.forEach { o ->
                     DropdownMenuItem(
@@ -615,6 +624,7 @@ private fun TopBar(
     onRefresh: () -> Unit,
     permissionsMissing: Int,
     onPermissions: () -> Unit,
+    onUpdate: () -> Unit,
 ) {
     var searching by remember { mutableStateOf(query.isNotEmpty()) }
     var sortMenu by remember { mutableStateOf(false) }
@@ -679,7 +689,10 @@ private fun TopBar(
                     text = { Text("Обновить статус", color = TextPrimary) },
                     onClick = { onRefresh(); moreMenu = false },
                 )
-
+                DropdownMenuItem(
+                    text = { Text("Проверить обновление", color = TextPrimary) },
+                    onClick = { onUpdate(); moreMenu = false },
+                )
             }
         }
     }
