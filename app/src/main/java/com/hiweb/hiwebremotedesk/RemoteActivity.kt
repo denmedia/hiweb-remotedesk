@@ -325,6 +325,9 @@ class RemoteActivity : ComponentActivity() {
     private var touchChannelReady by mutableStateOf(false)
     private var touchHint by mutableStateOf<String?>(null)
 
+    /** Подсказка про автоматическое нативное касание уже показана в этом открытии экрана сеанса. */
+    private var autoTouchHintShown = false
+
     private fun showTouchHint(text: String, ms: Long = 8_000) {
         touchHint = text
         handler.removeCallbacks(clearTouchHint)
@@ -828,7 +831,8 @@ class RemoteActivity : ComponentActivity() {
         remoteView.setMouseWheelSpeed(StrengthLevels.factor(device.mouseWheelPercent))
         remoteView.setStylusScrollSpeed(StrengthLevels.factor(device.stylusScrollPercent))
         remoteView.setDesktopProfile(if (device.os == OsType.UBUNTU) DesktopProfile.GNOME else DesktopProfile.WINDOWS)
-        nativeTouchOn = device.os == OsType.WINDOWS && device.nativeTouch == true
+        // null — режим «Авто»: нативное касание, как только Windows откроет канал (до этого и без канала — мышь).
+        nativeTouchOn = device.os == OsType.WINDOWS && device.nativeTouch != false
         remoteView.setNativeTouch(nativeTouchOn)
         remoteView.setStylusMode(device.stylusMode)
         remoteView.setStylusButtonAction(device.stylusButton)
@@ -923,6 +927,46 @@ class RemoteActivity : ComponentActivity() {
 
     /** Номер подключения: события закрытого при переподключении клиента не должны трогать экран. */
     @Volatile private var sessionSeq = 0
+
+    // Восстановление после обрыва связи: сеанс на ПК жив, поэтому подключаемся заново, пока не получится (RECONNECT_WINDOW_MS).
+    /** Сеанс хотя бы раз был подключён: до этого ошибка подключения показывается сразу (неверный адрес, пароль). */
+    private var everConnected = false
+
+    /** Номер текущей попытки восстановления; 0 — связь не терялась. */
+    private var reconnectAttempt by mutableStateOf(0)
+    private var reconnectReason by mutableStateOf<String?>(null)
+    private var lostAt = 0L
+    private val reconnectRun = Runnable {
+        if (!isFinishing && !isDestroyed && reconnectAttempt > 0) connect()
+    }
+
+    /**
+     * Связь оборвалась: ставит очередную попытку подключения. false — окно восстановления вышло, нужно показать ошибку.
+     * Экран при этом остаётся с последней картинкой под плашкой «Восстанавливаем подключение».
+     */
+    private fun scheduleReconnect(reason: String?): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (reconnectAttempt == 0) lostAt = now
+        if (now - lostAt > RECONNECT_WINDOW_MS) {
+            reconnectAttempt = 0
+            return false
+        }
+        val attempt = ++reconnectAttempt
+        val delay = RECONNECT_DELAYS_MS[minOf(attempt - 1, RECONNECT_DELAYS_MS.size - 1)]
+        android.util.Log.i("RDP", "связь потеряна ($reason): попытка $attempt через $delay мс")
+        reconnectReason = reason
+        quietReconnect = false
+        state = SessionState.Connecting
+        updateCapture()
+        handler.removeCallbacks(reconnectRun)
+        handler.postDelayed(reconnectRun, delay)
+        return true
+    }
+
+    private fun cancelReconnect() {
+        handler.removeCallbacks(reconnectRun)
+        reconnectAttempt = 0
+    }
 
     // Поворот планшета: рабочий стол перестраивается под новую ориентацию. Ждём, пока поворот закончится,
     // чтобы не слать серверу промежуточные размеры.
@@ -1066,7 +1110,11 @@ class RemoteActivity : ComponentActivity() {
                 desktopWidth = width
                 powerAction?.let { if (!powerSent) startPowerSequence(it) }
                 runOnUiThread {
+                    if (seq != sessionSeq) return@runOnUiThread
                     quietReconnect = false
+                    everConnected = true
+                    if (reconnectAttempt > 0) android.util.Log.i("RDP", "связь восстановлена с попытки $reconnectAttempt")
+                    reconnectAttempt = 0
                     state = SessionState.Connected
                     pushClipboard()
                     updateCapture()
@@ -1131,9 +1179,10 @@ class RemoteActivity : ComponentActivity() {
                 runOnUiThread {
                     if (seq != sessionSeq) return@runOnUiThread
                     touchChannelReady = ready
-                    // Первое подключение к этому ПК: Windows открыла канал касаний — включаем нативное управление сами.
-                    if (ready && device.nativeTouch == null && !isFinishing) {
-                        setNativeTouch(true)
+                    // Режим «Авто» (по умолчанию): Windows открыла канал касаний — нативное управление уже включено
+                    // ([nativeTouchOn] при null), выбор не перезаписываем, чтобы в форме ПК оставалось «Авто». Подсказка — один раз.
+                    if (ready && device.nativeTouch == null && !isFinishing && !autoTouchHintShown) {
+                        autoTouchHintShown = true
                         showTouchHint(
                             "Включено нативное управление Windows: пальцы${if (pen) " и перо" else ""} передаются как настоящие касания. " +
                                 "Вернуть мышь — меню «⋮» → «Касание».",
@@ -1143,7 +1192,7 @@ class RemoteActivity : ComponentActivity() {
                 }
             }
 
-            override fun onClosed(error: String?) {
+            override fun onClosed(error: String?, lost: Boolean) {
                 runOnUiThread {
                     // Прежний клиент закрыт ради переподключения (поворот): сеанс продолжается в новом.
                     if (seq != sessionSeq) return@runOnUiThread
@@ -1151,6 +1200,12 @@ class RemoteActivity : ComponentActivity() {
                     handler.removeCallbacks(agentTimeout)
                     agentInstalling = false
                     agentVersion = null
+                    // Связь оборвалась сама (не решение сервера и не ошибка входа): сеанс на ПК жив — подключаемся заново.
+                    // Фоновая служба при этом остаётся, чтобы Android не убил процесс посреди восстановления.
+                    if (lost && everConnected && powerAction == null && !powerSent && !isFinishing && scheduleReconnect(error)) {
+                        return@runOnUiThread
+                    }
+                    reconnectAttempt = 0
                     SessionService.stop(this@RemoteActivity)
                     // После команды питания сервер сам обрывает соединение: это успех, а не ошибка.
                     if (error == null || powerSent) {
@@ -1633,6 +1688,7 @@ class RemoteActivity : ComponentActivity() {
 
     private fun disconnect() {
         powerCancelled = true
+        cancelReconnect()
         saveThumbnail()
         // Поток сохранения копирует кадр заранее, поэтому закрывать соединение можно сразу.
         client?.close()
@@ -1709,6 +1765,7 @@ class RemoteActivity : ComponentActivity() {
 
     override fun onDestroy() {
         powerCancelled = true
+        cancelReconnect()
         handler.removeCallbacks(agentTimeout)
         if (::device.isInitialized) {
             runCatching { unregisterReceiver(batteryReceiver) }
@@ -1797,10 +1854,22 @@ class RemoteActivity : ComponentActivity() {
                         CircularProgressIndicator(color = Accent)
                         Spacer(Modifier.height(16.dp))
                         val waking = wakeStatus
-                        Text(waking ?: "Подключение к ${device.name}…", color = TextPrimary, fontSize = 18.sp, textAlign = TextAlign.Center)
+                        val restoring = reconnectAttempt > 0
                         Text(
-                            if (waking != null) "ПК в спящем режиме или выключен: отправлен сигнал пробуждения по сети" else device.host,
-                            color = TextSecondary, fontSize = 14.sp,
+                            when {
+                                waking != null -> waking
+                                restoring -> "Связь с ${device.name} потеряна"
+                                else -> "Подключение к ${device.name}…"
+                            },
+                            color = TextPrimary, fontSize = 18.sp, textAlign = TextAlign.Center,
+                        )
+                        Text(
+                            when {
+                                waking != null -> "ПК в спящем режиме или выключен: отправлен сигнал пробуждения по сети"
+                                restoring -> "Восстанавливаем подключение, попытка $reconnectAttempt" + (reconnectReason?.let { "\n$it" } ?: "")
+                                else -> device.host
+                            },
+                            color = TextSecondary, fontSize = 14.sp, textAlign = TextAlign.Center,
                         )
                         Spacer(Modifier.height(20.dp))
                         PanelButton("Отмена", primary = false) { disconnect() }
@@ -1812,7 +1881,7 @@ class RemoteActivity : ComponentActivity() {
                             .border(1.dp, Outline, RoundedCornerShape(20.dp)).padding(24.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
-                        Text("Не удалось подключиться", color = TextPrimary, fontSize = 20.sp)
+                        Text(if (everConnected) "Соединение потеряно" else "Не удалось подключиться", color = TextPrimary, fontSize = 20.sp)
                         Spacer(Modifier.height(10.dp))
                         Text(s.message, color = TextSecondary, fontSize = 15.sp, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(20.dp))
@@ -1861,44 +1930,51 @@ class RemoteActivity : ComponentActivity() {
                 return@Box
             }
             val pill = RoundedCornerShape(28.dp)
+            // Кнопки таблетки в порядке показа; rank — кого оставить на виду, когда все не помещаются (меньше — важнее).
+            val actions = buildList {
+                add(BarAction(0, if (keyboardMode == KeyboardMode.HIDE) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
+                    keyboardMode.title, keyboardMode.title, keyboardMode == KeyboardMode.SHOW,
+                    if (keyboardMode == KeyboardMode.AUTO) "A" else null) { cycleKeyboardMode(); onBusy() })
+                if (device.microphone) {
+                    add(BarAction(2, if (micOn) Icons.Outlined.Mic else Icons.Outlined.MicOff,
+                        if (micOn) "Микрофон включён" else "Микрофон", if (micOn) "Микрофон: выключить" else "Микрофон: включить",
+                        micOn) { toggleMic(); onBusy() })
+                }
+                // Кнопка показывает камеры планшета Windows; сам поток включает программа на ПК.
+                if (device.camera) {
+                    add(BarAction(3, if (cameraShared) Icons.Outlined.Videocam else Icons.Outlined.VideocamOff,
+                        when { cameraOn -> "Камера: ПК смотрит"; cameraShared -> "Камера включена"; else -> "Камера" },
+                        if (cameraShared) "Камера: убрать" else "Камера: показать",
+                        cameraShared) { toggleCamera(); onBusy() })
+                }
+                // Включённая, но неактивная кнопка: ждём, пока Windows запросит местоположение (канал открывает она).
+                if (device.os == OsType.WINDOWS) {
+                    add(BarAction(4, if (locationOn) Icons.Outlined.LocationOn else Icons.Outlined.LocationOff,
+                        when { locationActive -> "Геолокация передаётся"; locationOn -> "Геолокация: ждём Windows"; else -> "Геолокация" },
+                        if (locationOn) "Геолокация: выключить" else "Геолокация: включить",
+                        locationOn) { toggleLocation(); onBusy() })
+                }
+                add(BarAction(1, Icons.Outlined.Window, "Win", "Win", false) { tapWinKey(); onCollapse() })
+                // Пока на ПК агент старее вложенного в приложение, кнопка всегда на виду (подсвечена).
+                if (agentUpdateAvailable()) {
+                    add(BarAction(5, Icons.Outlined.SystemUpdate, "Обновить агент", "Обновить агент", true) { agentConfirm = true; onCollapse() })
+                }
+            }
+            // Сколько кнопок помещается в ряд вместе с «⋮» и «Отключиться» (таблетка: 12 dp отступов, 44 dp на кнопку, 2 dp между ними).
+            val rowWidth = LocalConfiguration.current.screenWidthDp - 24 - 52 - 10
+            val capacity = ((rowWidth - 12 + 2) / 46 - 1).coerceAtLeast(2)
+            val hidden = actions.sortedBy { it.rank }.drop(capacity).toSet()
+            val overflow = actions.filter { it in hidden }
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(
                     Modifier.shadow(6.dp, pill).clip(pill).background(SurfaceButton).padding(horizontal = 6.dp, vertical = 4.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
-                    KeyboardModeButton(onBusy)
-                    if (device.microphone) {
-                        BarIcon(
-                            if (micOn) Icons.Outlined.Mic else Icons.Outlined.MicOff,
-                            if (micOn) "Микрофон включён" else "Микрофон",
-                            active = micOn,
-                        ) { toggleMic(); onBusy() }
-                    }
-                    // Кнопка показывает камеры планшета Windows; сам поток включает программа на ПК.
-                    if (device.camera) {
-                        BarIcon(
-                            if (cameraShared) Icons.Outlined.Videocam else Icons.Outlined.VideocamOff,
-                            when { cameraOn -> "Камера: ПК смотрит"; cameraShared -> "Камера включена"; else -> "Камера" },
-                            active = cameraShared,
-                        ) { toggleCamera(); onBusy() }
-                    }
-                    // Включённая, но неактивная кнопка: ждём, пока Windows запросит местоположение (канал открывает она).
-                    if (device.os == OsType.WINDOWS) {
-                        BarIcon(
-                            if (locationOn) Icons.Outlined.LocationOn else Icons.Outlined.LocationOff,
-                            when { locationActive -> "Геолокация передаётся"; locationOn -> "Геолокация: ждём Windows"; else -> "Геолокация" },
-                            active = locationOn,
-                        ) { toggleLocation(); onBusy() }
-                    }
-                    BarIcon(Icons.Outlined.Window, "Win") { tapWinKey(); onCollapse() }
-                    // Пока на ПК агент старее вложенного в приложение, кнопка всегда на виду (подсвечена).
-                    if (agentUpdateAvailable()) {
-                        BarIcon(Icons.Outlined.SystemUpdate, "Обновить агент", active = true) { agentConfirm = true; onCollapse() }
-                    }
+                    actions.filter { it !in hidden }.forEach { BarIcon(it.icon, it.description, it.active, it.badge, it.onClick) }
                     Box {
                         BarIcon(Icons.Outlined.MoreVert, "Ещё", active = menuOpen) { onMenu(true) }
-                        SessionMenu(phone, menuOpen, onMenu, onCollapse)
+                        SessionMenu(phone, menuOpen, onMenu, onCollapse, overflow)
                     }
                 }
                 Box(
@@ -1910,12 +1986,24 @@ class RemoteActivity : ComponentActivity() {
         }
     }
 
-    /** Меню «⋮»: всё, что не поместилось в таблетку. */
+    /** Кнопка таблетки; [menuLabel] — её подпись в меню «⋮», куда она уходит, если на узком экране не помещается. */
+    private class BarAction(
+        val rank: Int,
+        val icon: ImageVector,
+        val description: String,
+        val menuLabel: String,
+        val active: Boolean,
+        val badge: String? = null,
+        val onClick: () -> Unit,
+    )
+
+    /** Меню «⋮»: всё, что не поместилось в таблетку ([overflow] — её кнопки, не вошедшие в ряд на узком экране). */
     @Composable
-    private fun SessionMenu(phone: Boolean, open: Boolean, onMenu: (Boolean) -> Unit, onCollapse: () -> Unit) {
+    private fun SessionMenu(phone: Boolean, open: Boolean, onMenu: (Boolean) -> Unit, onCollapse: () -> Unit, overflow: List<BarAction>) {
         // Закрывает меню и панель, затем выполняет действие.
         fun act(action: () -> Unit) = { onMenu(false); onCollapse(); action() }
         DropdownMenu(expanded = open, onDismissRequest = { onMenu(false) }, modifier = Modifier.background(SurfaceButton)) {
+            overflow.forEach { a -> BarMenuItem(a.icon, a.menuLabel, { onMenu(false); a.onClick() }) }
             BarMenuItem(Icons.Outlined.Settings, "Настройки", act { settingsOpen = true })
             BarMenuItem(Icons.Outlined.ScreenRotation, "Повернуть", act { rotateSession() })
             if (capturedByTouchpad) {
@@ -1934,7 +2022,9 @@ class RemoteActivity : ComponentActivity() {
                     AgentInstaller.isOutdated(installed, bundledAgentVersion) -> "Обновить агент"
                     else -> null
                 }
-                if (label != null) BarMenuItem(Icons.Outlined.InstallDesktop, label, act { agentConfirm = true })
+                if (label != null && overflow.none { it.menuLabel == label }) {
+                    BarMenuItem(Icons.Outlined.InstallDesktop, label, act { agentConfirm = true })
+                }
             }
         }
     }
@@ -1949,23 +2039,13 @@ class RemoteActivity : ComponentActivity() {
     }
 
     /**
-     * Кнопка экранной клавиатуры с тремя состояниями ([KeyboardMode]): «показана» — подсвечена, «скрыта» — перечёркнутая
-     * клавиатура, «автоматически» — клавиатура со значком «A». Каждое нажатие переходит к следующему и коротко
-     * подписывает режим.
+     * Кнопка экранной клавиатуры в таблетке имеет три состояния ([KeyboardMode]): «показана» — подсвечена, «скрыта» —
+     * перечёркнутая клавиатура, «автоматически» — клавиатура со значком «A». Каждое нажатие переходит к следующему и
+     * коротко подписывает режим.
      */
-    @Composable
-    private fun KeyboardModeButton(onBusy: () -> Unit) {
-        val mode = keyboardMode
-        BarIcon(
-            if (mode == KeyboardMode.HIDE) Icons.Outlined.KeyboardHide else Icons.Outlined.Keyboard,
-            mode.title,
-            active = mode == KeyboardMode.SHOW,
-            badge = if (mode == KeyboardMode.AUTO) "A" else null,
-        ) {
-            changeKeyboardMode(mode.next())
-            android.widget.Toast.makeText(this, keyboardMode.title, android.widget.Toast.LENGTH_SHORT).show()
-            onBusy()
-        }
+    private fun cycleKeyboardMode() {
+        changeKeyboardMode(keyboardMode.next())
+        android.widget.Toast.makeText(this, keyboardMode.title, android.widget.Toast.LENGTH_SHORT).show()
     }
 
     /** Иконка-кнопка таблетки: круг 44 dp (с запасом для пальца), [active] подсвечивает включённый режим, [badge] — буква в углу. */
@@ -2509,5 +2589,11 @@ class RemoteActivity : ComponentActivity() {
         private const val WAKE_RESEND_MS = 10_000L
         private const val WAKE_TIMEOUT_MS = 120_000L
         private const val WAKE_SETTLE_MS = 2_000L
+
+        /** Сколько после обрыва связи пытаемся восстановить подключение, прежде чем показать ошибку (ПК успевает перезагрузиться). */
+        private const val RECONNECT_WINDOW_MS = 5 * 60_000L
+
+        /** Паузы перед попытками восстановления; последняя повторяется. */
+        private val RECONNECT_DELAYS_MS = longArrayOf(500, 1_500, 3_000, 5_000)
     }
 }

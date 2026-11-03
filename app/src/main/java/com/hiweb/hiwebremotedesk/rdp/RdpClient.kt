@@ -96,8 +96,12 @@ interface RdpListener {
     /** Координаты планшета начали или перестали уходить на ПК (канал location). Вызывается не из потока интерфейса. */
     fun onLocationActive(active: Boolean) {}
 
-    /** Соединение закрыто. [error] == null при штатном отключении. */
-    fun onClosed(error: String?)
+    /**
+     * Соединение закрыто. [error] == null при штатном отключении. [lost] — это обрыв связи (сеть пропала, сервер
+     * или ПК пропали без объяснений, сеанс до этого работал), а не решение сервера или ошибка входа: сеанс на ПК
+     * жив, и подключение можно восстановить.
+     */
+    fun onClosed(error: String?, lost: Boolean = false)
 }
 
 class CertificateChangedException(val newFingerprint: String) :
@@ -134,6 +138,9 @@ class RdpClient(
 
     @Volatile private var closedByUser = false
     @Volatile private var ready = false
+
+    /** Идёт проверка пароля (CredSSP): сброс соединения на этом этапе — отказ сервера, а не потеря связи. */
+    @Volatile private var authenticating = false
     /** Первая активация уже была: следующие Demand Active — смена размера, а не вход. */
     private var activated = false
     private var thread: Thread? = null
@@ -301,6 +308,7 @@ class RdpClient(
 
     private fun run() {
         var error: String? = null
+        var lost = false
         try {
             connect()
             readLoop()
@@ -308,7 +316,10 @@ class RdpClient(
             error = e.message
         } catch (e: Exception) {
             if (!closedByUser) Log.w(TAG, "Session failed", e)
-            if (!closedByUser) error = errorInfoText(errorInfo) ?: friendly(e)
+            if (!closedByUser) {
+                error = errorInfoText(errorInfo) ?: friendly(e)
+                lost = isConnectionLoss(e)
+            }
         } finally {
             ready = false
             runCatching { socket?.close() }
@@ -318,9 +329,19 @@ class RdpClient(
             audioSource?.stop()
             camera?.stopAll()
             dvc?.closeAll()
-            listener.onClosed(if (closedByUser) null else error ?: errorInfoText(errorInfo))
+            listener.onClosed(if (closedByUser) null else error ?: errorInfoText(errorInfo), lost)
         }
     }
+
+    /**
+     * Сбой — обрыв связи, после которого стоит переподключиться: транспортная ошибка без объяснения от сервера
+     * (причину ухода сервер называет в `errorInfo`: выход из системы, другой пользователь, администратор — туда
+     * возвращаться нельзя). Сброс посреди CredSSP — это отказ сервера (чаще всего неверный пароль), его повторять
+     * нельзя: учётную запись Windows заблокируют. Всё остальное (нет маршрута, отказ в порту, обрыв TLS, тишина)
+     * — связь.
+     */
+    private fun isConnectionLoss(e: Exception): Boolean =
+        errorInfo == 0L && e is java.io.IOException && !authenticating
 
     private fun friendly(e: Exception): String = when (e) {
         is RdpException -> e.message ?: "Ошибка протокола RDP"
@@ -352,6 +373,31 @@ class RdpClient(
         }
     }
 
+    /**
+     * Сокет без обмена данными молчит сутками: в чтении нет таймаута (стол может не меняться), а системный keepalive
+     * по умолчанию срабатывает через два часа — тихий обрыв (Wi-Fi переключился, ПК ушёл в сон, NAT забыл соединение)
+     * иначе не замечался бы. Здесь зонды идут после 15 с тишины, раз в 5 с, три подряд без ответа обрывают сокет
+     * (читающий поток получает ошибку и сеанс переподключается), а `TCP_USER_TIMEOUT` не даёт неподтверждённым данным
+     * висеть дольше 35 с. Не получилось — остаются системные значения.
+     */
+    private fun tuneKeepAlive(s: Socket) {
+        try {
+            val pfd = android.os.ParcelFileDescriptor.fromSocket(s)
+            try {
+                val fd = pfd.fileDescriptor
+                val tcp = android.system.OsConstants.IPPROTO_TCP
+                android.system.Os.setsockoptInt(fd, tcp, TCP_KEEPIDLE, 15)
+                android.system.Os.setsockoptInt(fd, tcp, TCP_KEEPINTVL, 5)
+                android.system.Os.setsockoptInt(fd, tcp, TCP_KEEPCNT, 3)
+                android.system.Os.setsockoptInt(fd, tcp, TCP_USER_TIMEOUT, 35_000)
+            } finally {
+                pfd.close()
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "не удалось настроить keepalive: $e")
+        }
+    }
+
     private fun connect() {
         val s = Socket()
         socket = s
@@ -359,6 +405,7 @@ class RdpClient(
         s.keepAlive = true
         limitSegmentSize(s)
         s.connect(InetSocketAddress(cfg.host, cfg.port), 7000)
+        tuneKeepAlive(s)
         s.soTimeout = 20000
         inp = BufferedInputStream(s.getInputStream(), 1 shl 16)
         out = s.getOutputStream()
@@ -377,7 +424,9 @@ class RdpClient(
             if (protocol == PROTOCOL_HYBRID) {
                 val cert = ssl.session.peerCertificates[0] as X509Certificate
                 val (domain, user) = splitUser(cfg.username)
+                authenticating = true
                 CredSsp.authenticate(inp, out, Der.subjectPublicKey(cert.publicKey.encoded), user, domain, cfg.password, cfg.host, random)
+                authenticating = false
             }
         } else {
             throw RdpException("Сервер требует устаревшую защиту RDP, она не поддерживается")
@@ -1192,6 +1241,11 @@ class RdpClient(
         /** Linux `TCP_MAXSEG` (в `OsConstants` его нет) и объявляемый серверу MSS: 1200 + заголовки заметно меньше пути через VPN. */
         private const val TCP_MAXSEG = 2
         private const val TCP_MSS = 1200
+        /** Linux-константы TCP, которых нет в `OsConstants`. */
+        private const val TCP_KEEPIDLE = 4
+        private const val TCP_KEEPINTVL = 5
+        private const val TCP_KEEPCNT = 6
+        private const val TCP_USER_TIMEOUT = 18
         /** Имя динамического канала камеры, анонсируемое серверу (любое, главное — без пробелов). */
         /** Каналы устройств камер: «Camera0», «Camera1»… по порядку в [EcamCamera.catalog]. */
         private const val ECAM_DEVICE_PREFIX = "Camera"
