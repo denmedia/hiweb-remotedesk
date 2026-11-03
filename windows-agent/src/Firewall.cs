@@ -126,7 +126,27 @@ namespace HiWebAgent
                 if (ok == null) return "Эту подсеть блокировать нельзя: " + c;
                 args.Add(ok);
             }
-            var psi = new ProcessStartInfo(Assembly.GetExecutingAssembly().Location, string.Join(" ", args.ToArray()));
+            int exit;
+            string failure = StartElevated(args, out exit);
+            if (failure != null) return failure;
+            applied = exit == ExitOk || exit == ExitFirewallOff;
+            switch (exit)
+            {
+                case ExitOk: return null;
+                case ExitFirewallOff: return "Правило добавлено, но брандмауэр Windows выключен — оно не работает, пока он не включён";
+                case ExitBadArgs: return "Недопустимая подсеть";
+                default: return "Не удалось изменить правила брандмауэра (подробности — в журнале агента)";
+            }
+        }
+
+        /// <summary>
+        /// Запускает повышенную копию агента с аргументами [args] и ждёт её завершения (запрос UAC — до 3 минут). null —
+        /// процесс отработал, его код — в [exit]; иначе текст ошибки (отказ от UAC, нет ответа). Вызывать из фонового потока.
+        /// </summary>
+        public static string StartElevated(IEnumerable<string> args, out int exit)
+        {
+            exit = ExitError;
+            var psi = new ProcessStartInfo(Assembly.GetExecutingAssembly().Location, string.Join(" ", new List<string>(args).ToArray()));
             psi.UseShellExecute = true;
             psi.Verb = "runas";
             psi.WindowStyle = ProcessWindowStyle.Hidden;
@@ -136,14 +156,8 @@ namespace HiWebAgent
                 {
                     if (p == null) return "Не удалось запустить повышенный процесс";
                     if (!p.WaitForExit(UAC_WAIT_MS)) return "Нет ответа на запрос Windows о правах администратора";
-                    applied = p.ExitCode == ExitOk || p.ExitCode == ExitFirewallOff;
-                    switch (p.ExitCode)
-                    {
-                        case ExitOk: return null;
-                        case ExitFirewallOff: return "Правило добавлено, но брандмауэр Windows выключен — оно не работает, пока он не включён";
-                        case ExitBadArgs: return "Недопустимая подсеть";
-                        default: return "Не удалось изменить правила брандмауэра (подробности — в журнале агента)";
-                    }
+                    exit = p.ExitCode;
+                    return null;
                 }
             }
             catch (Win32Exception e)
@@ -159,6 +173,7 @@ namespace HiWebAgent
         /// <summary>Тело повышенной копии: <c>--guard-fw block|unblock [--enable-fw] подсеть…</c>. Возвращает код завершения.</summary>
         public static int RunElevated(string[] args)
         {
+            if (args.Length >= 2 && (args[1] == HelperInstaller.InstallVerb || args[1] == HelperInstaller.RemoveVerb)) return HelperInstaller.RunElevated(args);
             if (args.Length < 3) return ExitBadArgs;
             string verb = args[1];
             bool enable = false;
@@ -203,14 +218,28 @@ namespace HiWebAgent
             }
         }
 
-        static void AddBlock(dynamic policy, string cidr)
+        /// <summary>Блокировка для помощника (служба с правами администратора): true — такое правило уже было и действовало.</summary>
+        public static bool BanRange(string cidr)
+        {
+            return AddBlock(NewPolicy(), cidr);
+        }
+
+        public static void UnbanRange(string cidr)
+        {
+            dynamic policy = NewPolicy();
+            policy.Rules.Remove(NamePrefix + cidr);
+        }
+
+        /// <summary>Добавляет правило блокировки; true — правило уже было включено (ничего не изменилось).</summary>
+        static bool AddBlock(dynamic policy, string cidr)
         {
             string name = NamePrefix + cidr;
             try
             {
                 dynamic existing = policy.Rules.Item(name);
+                bool wasOn = existing.Enabled;
                 existing.Enabled = true;
-                return;
+                return wasOn;
             }
             catch (Exception)
             {
@@ -227,6 +256,7 @@ namespace HiWebAgent
             rule.RemoteAddresses = cidr;
             rule.Enabled = true;
             policy.Rules.Add(rule);
+            return false;
         }
 
         /// <summary>
@@ -234,6 +264,11 @@ namespace HiWebAgent
         /// не 3389, собственным правилом на нужный порт. Остальные входящие подключения, не разрешённые правилами,
         /// после включения блокируются — это обычная настройка Windows.
         /// </summary>
+        public static void EnableFirewallNow()
+        {
+            EnableFirewall(NewPolicy());
+        }
+
         static void EnableFirewall(dynamic policy)
         {
             int port = RdpPort();

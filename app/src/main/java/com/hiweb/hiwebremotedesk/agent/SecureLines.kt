@@ -4,7 +4,8 @@ package com.hiweb.hiwebremotedesk.agent
  * Подписанные строки связи с агентом по локальной сети (см. LanLink.cs): «mac json», где
  * mac = HMAC(K, dir|seq|json), K = HMAC(secret, session|n1|n2). Планшет пишет с dir «t», агент — с «a»;
  * seq — номер строки в своём направлении, поэтому подмена, повтор и пропуск строки обнаруживаются.
- * Строки не шифруются, кроме содержимого экрана: его агент шифрует AES-256-CBC ключом HMAC(K, enc) ([decrypt]).
+ * Строки не шифруются, кроме содержимого экрана и файловых сообщений: их шифруют AES-256-CBC ключом HMAC(K, enc)
+ * ([decrypt] для присланного агентом, [encrypt] для отправляемого ему).
  */
 class SecureLines(private val key: ByteArray) {
     private var sent = 0L
@@ -17,6 +18,18 @@ class SecureLines(private val key: ByteArray) {
         c.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(encKey, "AES"), javax.crypto.spec.IvParameterSpec(iv))
         c.doFinal(data)
     }.getOrNull()
+
+    /** Шифрует данные для агента со случайным iv: возвращает {iv, шифротекст}. */
+    fun encrypt(data: ByteArray): Pair<ByteArray, ByteArray> {
+        val iv = ByteArray(16).also(random::nextBytes)
+        return iv to encrypt(data, iv)
+    }
+
+    internal fun encrypt(data: ByteArray, iv: ByteArray): ByteArray {
+        val c = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(javax.crypto.Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(encKey, "AES"), javax.crypto.spec.IvParameterSpec(iv))
+        return c.doFinal(data)
+    }
 
     @Synchronized
     fun sign(body: String): String {
@@ -38,6 +51,8 @@ class SecureLines(private val key: ByteArray) {
     }
 
     companion object {
+        private val random = java.security.SecureRandom()
+
         fun authMac(secret: ByteArray, pc: String, n1: String, n2: String) = AgentPairing.mac(secret, "auth|$pc|$n1|$n2")
         fun okMac(secret: ByteArray, n1: String, n2: String) = AgentPairing.mac(secret, "ok|$n1|$n2")
         fun sessionKey(secret: ByteArray, n1: String, n2: String): ByteArray = hmac(secret, "session|$n1|$n2")

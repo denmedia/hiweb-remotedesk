@@ -29,6 +29,22 @@ class GfxChannel(
     companion object {
         const val CHANNEL_NAME = "Microsoft::Windows::RDS::Graphics"
 
+        /** Сколько первых кадров сеанса описывается в журнале подробно. */
+        private const val DBG_FRAMES = 40
+
+        /** Типы NAL-блоков Annex B (1 — P-кадр, 5 — IDR, 7/8 — SPS/PPS) — для журнала. */
+        internal fun nalTypes(bitstream: ByteArray): String {
+            val types = ArrayList<Int>()
+            var i = 0
+            while (i + 3 < bitstream.size && types.size < 12) {
+                if (bitstream[i].toInt() == 0 && bitstream[i + 1].toInt() == 0 && bitstream[i + 2].toInt() == 1) {
+                    types.add(bitstream[i + 3].toInt() and 0x1F)
+                    i += 3
+                } else i++
+            }
+            return types.joinToString(",")
+        }
+
         private const val CMD_WIRE_TO_SURFACE_1 = 0x0001
         private const val CMD_WIRE_TO_SURFACE_2 = 0x0002
         private const val CMD_DELETE_ENCODING_CONTEXT = 0x0003
@@ -97,6 +113,12 @@ class GfxChannel(
     private val avcLock = java.util.concurrent.locks.ReentrantLock()
     private val avcDone = avcLock.newCondition()
     private var avcPending = 0
+
+    // Диагностика начала сеанса: по каждому из первых кадров — что пришло, кто ждал и сколько. Нужна, чтобы отличить
+    // «Windows замолчала» от «клиент перестал разбирать»: статистика раз в 5 с молчит, если кадров нет.
+    private var dbgFrameCmds = 0
+    private var dbgFrameBytes = 0
+    private var dbgFrames = 0
 
     override fun onOpen(write: (ByteArray) -> Unit) {
         this.write = write
@@ -262,8 +284,13 @@ class GfxChannel(
     /** Конец кадра: ждёт аппаратный декодер, отдаёт изменённое на экран и подтверждает кадр серверу. */
     private fun endFrame(frameId: Long) {
         val t0 = System.nanoTime()
+        val pendingBefore = avcPending
         awaitAvc()
         val t1 = System.nanoTime()
+        if (dbgFrames < DBG_FRAMES || dbgFrames % 200 == 0) {
+            log("gfx: кадр №${dbgFrames + 1} (id $frameId): команд $dbgFrameCmds, ${dbgFrameBytes} Б, у декодера было $pendingBefore, ждали ${(t1 - t0) / 1_000_000} мс")
+        }
+        dbgFrames++; dbgFrameCmds = 0; dbgFrameBytes = 0
         synchronized(lock) {
             frameOpen = false
             flush()
@@ -340,7 +367,13 @@ class GfxChannel(
     }
 
     private fun decodeToSurface(id: Int, codec: Int, rect: AvcRegion?, data: ByteArray) {
-        val s = surfaces[id] ?: return
+        dbgFrameCmds++; dbgFrameBytes += data.size
+        val s = surfaces[id]
+        if (s == null) {
+            if (dbgFrames < DBG_FRAMES) log("gfx: блок кодека 0x${codec.toString(16)} для неизвестной поверхности $id пропущен")
+            return
+        }
+        if (dbgFrames < DBG_FRAMES) log("gfx: блок кодека 0x${codec.toString(16)} → поверхность $id ${s.width}x${s.height}, ${data.size} Б, область ${rect?.let { "${it.left},${it.top}-${it.right},${it.bottom}" } ?: "-"}")
         if (seenCodecs.add(codec)) log("gfx: первый блок кодека 0x${codec.toString(16)}, ${data.size} Б")
         when (codec) {
             CODEC_CAPROGRESSIVE -> {
@@ -418,6 +451,9 @@ class GfxChannel(
             s.avc = decoder
         }
         if (avcFramesIn++ == 0L) log("gfx: первый кадр AVC420, ${stream.regions.size} областей, ${stream.bitstream.size} Б")
+        if (dbgFrames < DBG_FRAMES) {
+            log("avc: кадр ${avcFramesIn}: NAL ${nalTypes(stream.bitstream)}, области ${stream.regions.take(4).joinToString { "${it.left},${it.top}-${it.right},${it.bottom}" }}${if (stream.regions.size > 4) " …(${stream.regions.size})" else ""}")
+        }
         avcLock.lock()
         try { avcPending++ } finally { avcLock.unlock() }
         if (!decoder.decode(stream.bitstream, AvcFrame(s, stream.regions))) avcReturned()

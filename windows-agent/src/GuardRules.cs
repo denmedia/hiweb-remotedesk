@@ -236,6 +236,21 @@ namespace HiWebAgent
         /// <summary>Заносить сразу всю подсеть адреса (/24, IPv6 — /64), а не один адрес: удобно, когда провайдер меняет адрес в пределах подсети.</summary>
         public bool LearnSubnet;
 
+        /// <summary>Автоматически блокировать подсеть после <see cref="BanAfter"/> неудачных попыток входа (нужен помощник блокировки).</summary>
+        public bool AutoBan = true;
+
+        /// <summary>Сколько неудачных попыток входа за <see cref="ThreatDetector.BanWindowMs"/> с одной подсети ведут к блокировке.</summary>
+        public int BanAfter = DefaultBanAfter;
+
+        public const int DefaultBanAfter = 5;
+        public const int MinBanAfter = 2;
+        public const int MaxBanAfter = 50;
+
+        public static int ClampBanAfter(int n)
+        {
+            return Math.Max(MinBanAfter, Math.Min(MaxBanAfter, n));
+        }
+
         public bool WhitelistMode
         {
             get { return Mode == GuardMode.Whitelist; }
@@ -412,6 +427,9 @@ namespace HiWebAgent
         public const long RealertMs = 60 * 60 * 1000;
         public const long LogonGraceMs = 30 * 1000;
 
+        /// <summary>Окно, в котором считаются попытки для автоматической блокировки (дольше, чем для тревоги: медленный подбор тоже должен остановиться).</summary>
+        public const long BanWindowMs = 60 * 60 * 1000;
+
         /// <summary>Канал планшета мог открыться чуть раньше записи о входе в журнале.</summary>
         const long TABLET_SLACK_MS = 5 * 1000;
         const long HISTORY_MS = 24 * 60 * 60 * 1000;
@@ -523,6 +541,39 @@ namespace HiWebAgent
             return result;
         }
 
+        /// <summary>Результат разбора неудачной попытки входа: что о ней сказать устройствам и пора ли блокировать.</summary>
+        public sealed class FailInfo
+        {
+            public string Ip;
+            public string Cidr;       // подсеть, которую заблокирует автоблокировка
+            public int Count;         // неудач с этой подсети за BanWindowMs, считая эту (для своих и знакомых адресов — 0)
+            public bool Local;        // адрес из своей сети
+            public bool Known;        // адрес из белого списка
+            public bool BanDue;       // автоблокировка включена, порог достигнут, адрес чужой
+        }
+
+        /// <summary>
+        /// Разбирает неудачную попытку входа [e] — зовётся после <see cref="Feed"/> для того же события. null — не попытка
+        /// или не адрес. Свои (локальные) и знакомые (белый список) адреса не блокируются, но о попытке всё равно сообщается.
+        /// </summary>
+        public FailInfo Describe(RdpEvent e)
+        {
+            IPAddress ip;
+            if (e.Kind != GuardKind.Fail || !IpTools.TryParse(e.Ip, out ip)) return null;
+            var info = new FailInfo();
+            info.Ip = ip.ToString();
+            info.Cidr = OfferedBlock(ip);
+            info.Local = IpTools.IsLocal(ip);
+            info.Known = whitelist.Contains(ip);
+            if (!info.Local && !info.Known)
+            {
+                List<long> list;
+                info.Count = fails.TryGetValue(IpTools.Subnet(ip), out list) ? CountIn(list, e.Time, BanWindowMs) : 0;
+            }
+            info.BanDue = settings.AutoBan && info.Count >= settings.BanAfter;
+            return info;
+        }
+
         /// <summary>Что предлагать заблокировать: подсеть, а если в ней есть знакомый адрес — только сам адрес.</summary>
         public string OfferedBlock(IPAddress ip)
         {
@@ -551,9 +602,112 @@ namespace HiWebAgent
 
         static int CountIn(List<long> list, long now)
         {
+            return CountIn(list, now, WindowMs);
+        }
+
+        static int CountIn(List<long> list, long now, long window)
+        {
             int n = 0;
-            foreach (long t in list) if (t >= now - WindowMs && t <= now) n++;
+            foreach (long t in list) if (t >= now - window && t <= now) n++;
             return n;
+        }
+    }
+
+    /// <summary>Ответ помощника блокировки.</summary>
+    sealed class HelperReply
+    {
+        /// <summary>Помощник на связи (служба установлена и запущена).</summary>
+        public bool Reached;
+
+        /// <summary>Запрос выполнен.</summary>
+        public bool Ok;
+
+        /// <summary>Что после «ok»/«err» в ответе; при недоступном помощнике — причина.</summary>
+        public string Detail = "";
+
+        public bool Has(string token)
+        {
+            foreach (string part in Detail.Split(' ')) if (part == token) return true;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Язык помощника блокировки — службы с правами администратора, которая по запросу агента добавляет и убирает
+    /// правила брандмауэра. Запрос — одна строка: <c>ban подсеть</c>, <c>unban подсеть</c> или <c>status</c>; ответ — одна
+    /// строка: <c>ok</c>, <c>ok exists</c> (правило уже было), <c>ok fwoff</c> (правило записано, но брандмауэр выключен),
+    /// <c>ok версия fw=on|off</c> на status и <c>err причина</c>. Запросам службе доверять нельзя (их шлёт процесс обычного
+    /// пользователя), поэтому она сужает допустимое: только подсети /24 (IPv6 — /64) и уже, только публичные.
+    /// </summary>
+    static class HelperProtocol
+    {
+        public const string PipeName = "HiWebAgentGuard";
+        public const string ServiceName = "HiWebAgentGuard";
+        public const int MaxLine = 200;
+
+        public const int MinPrefixV4 = 24;
+        public const int MinPrefixV6 = 64;
+
+        /// <summary>Подсеть, которую помощник согласен блокировать, в каноническом виде, иначе null.</summary>
+        public static string NormalizeTarget(string text)
+        {
+            string cidr = IpTools.NormalizeBlock(text);
+            if (cidr == null) return null;
+            IPAddress net;
+            int prefix;
+            if (!IpTools.TryParseCidr(cidr, out net, out prefix)) return null;
+            bool v4 = net.AddressFamily == AddressFamily.InterNetwork;
+            return prefix >= (v4 ? MinPrefixV4 : MinPrefixV6) ? cidr : null;
+        }
+
+        /// <summary>Разбирает строку запроса. false — не понята; для ban/unban проверенная подсеть — в [cidr].</summary>
+        public static bool TryParseRequest(string line, out string verb, out string cidr)
+        {
+            verb = "";
+            cidr = null;
+            if (line == null || line.Length > MaxLine) return false;
+            string[] parts = line.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 1 && parts[0] == "status")
+            {
+                verb = "status";
+                return true;
+            }
+            if (parts.Length != 2 || parts[0] != "ban" && parts[0] != "unban") return false;
+            cidr = NormalizeTarget(parts[1]);
+            if (cidr == null) return false;
+            verb = parts[0];
+            return true;
+        }
+
+        public static string Ok(string detail)
+        {
+            return string.IsNullOrEmpty(detail) ? "ok" : "ok " + detail;
+        }
+
+        public static string Err(string reason)
+        {
+            return "err " + (reason ?? "").Replace('\r', ' ').Replace('\n', ' ');
+        }
+
+        /// <summary>Разбор ответа: false — не ответ помощника; [ok] — запрос выполнен, [detail] — всё, что после «ok»/«err».</summary>
+        public static bool TryParseReply(string line, out bool ok, out string detail)
+        {
+            ok = false;
+            detail = "";
+            if (line == null) return false;
+            string t = line.Trim();
+            if (t == "ok" || t.StartsWith("ok "))
+            {
+                ok = true;
+                detail = t.Length > 3 ? t.Substring(3).Trim() : "";
+                return true;
+            }
+            if (t == "err" || t.StartsWith("err "))
+            {
+                detail = t.Length > 4 ? t.Substring(4).Trim() : "";
+                return true;
+            }
+            return false;
         }
     }
 }

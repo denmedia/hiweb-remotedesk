@@ -6,6 +6,7 @@ import com.hiweb.hiwebremotedesk.data.DeviceRepository
 import com.hiweb.hiwebremotedesk.data.GuardJournal
 import com.hiweb.hiwebremotedesk.data.GuardJson
 import com.hiweb.hiwebremotedesk.data.GuardStore
+import com.hiweb.hiwebremotedesk.data.RecentIds
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -26,6 +27,9 @@ data class GuardResult(val deviceId: String, val action: String, val cidr: Strin
  */
 object GuardHub {
     private const val TAG = "Guard"
+    private const val FAIL_MAX_AGE_MS = 10 * 60 * 1000L
+
+    private val recent = RecentIds()
 
     private val _results = MutableSharedFlow<GuardResult>(extraBufferCapacity = 8)
 
@@ -70,6 +74,17 @@ object GuardHub {
                 fresh.forEach { GuardNotifications.postThreat(context, deviceId, name, it, firewallOn) }
                 // Угрозу решили на самом ПК или с другого устройства: уведомление больше не нужно.
                 incoming.filter { !it.open }.forEach { GuardNotifications.cancel(context, it.id) }
+            }
+            "guard_fail" -> GuardJson.fail(msg)?.let { n ->
+                // Устаревшее (агент не досылает попытки, но связь могла зависнуть) уже не новость.
+                if (System.currentTimeMillis() - n.time < FAIL_MAX_AGE_MS && recent.firstTime("$deviceId|${n.id}")) {
+                    GuardNotifications.postFail(context, deviceId, DeviceRepository.get(context).get(deviceId)?.name.orEmpty(), n)
+                }
+            }
+            "guard_ban" -> GuardJson.ban(msg)?.let { n ->
+                if (recent.firstTime("$deviceId|${n.id}")) {
+                    GuardNotifications.postBan(context, deviceId, DeviceRepository.get(context).get(deviceId)?.name.orEmpty(), n)
+                }
             }
             "guard_result" -> {
                 val result = GuardResult(
@@ -122,13 +137,32 @@ object GuardHub {
         command(deviceId, JSONObject().put("t", "guard").put("do", "untrust").put("cidr", cidr))
 
     /** Режим защиты и автоматическое занесение адресов планшета; null — не менять. Новое состояние придёт в `guard_state`. */
-    fun configure(deviceId: String, mode: String? = null, autoLearn: Boolean? = null, learnSubnet: Boolean? = null): Boolean {
+    fun configure(
+        deviceId: String,
+        mode: String? = null,
+        autoLearn: Boolean? = null,
+        learnSubnet: Boolean? = null,
+        autoBan: Boolean? = null,
+        banAfter: Int? = null,
+    ): Boolean {
         val cmd = JSONObject().put("t", "guard").put("do", "settings")
         mode?.let { cmd.put("mode", it) }
         autoLearn?.let { cmd.put("autoLearn", it) }
         learnSubnet?.let { cmd.put("learnSubnet", it) }
+        autoBan?.let { cmd.put("autoBan", it) }
+        banAfter?.let { cmd.put("banAfter", it) }
         return command(deviceId, cmd)
     }
+
+    /**
+     * Установить («install») или удалить («remove») помощника блокировки на ПК: Windows на ПК запросит права администратора
+     * (в открытом сеансе запрос виден в самом сеансе). Итог придёт сообщением `guard_result` с `do` = `helper`.
+     */
+    fun helper(deviceId: String, install: Boolean, enableFirewall: Boolean = false): Boolean =
+        command(
+            deviceId,
+            JSONObject().put("t", "guard").put("do", "helper").put("op", if (install) "install" else "remove").put("enableFw", enableFirewall),
+        )
 
     fun dismiss(deviceId: String, threatId: String): Boolean =
         command(deviceId, JSONObject().put("t", "guard").put("do", "dismiss").put("id", threatId))

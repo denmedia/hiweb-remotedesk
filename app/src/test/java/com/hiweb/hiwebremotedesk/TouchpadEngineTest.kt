@@ -127,9 +127,9 @@ class TouchpadEngineTest {
         frame(30f to 5f, 40f to 5f)
         for (i in 1..24) frame((30f - i) to 5f, (40f - i) to 5f)
         lift()
-        // Горизонтальный свайп двумя пальцами — навигация, а не горизонтальная прокрутка: пальцы влево — вперёд.
-        assertTrue(log.none { it.startsWith("H") })
-        assertEquals(listOf("+38", "+4de", "-4de", "-38"), log.filter { it.startsWith("+") || it.startsWith("-") })
+        // Горизонтальный свайп двумя пальцами — горизонтальная прокрутка (контент следует за пальцами): пальцы влево — положительные единицы.
+        assertTrue(log.filter { it.startsWith("H") }.sumOf { it.drop(1).toInt() } > 0)
+        assertTrue(log.none { it.startsWith("V") || it.startsWith("+") })
     }
 
     @Test

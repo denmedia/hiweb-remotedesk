@@ -32,7 +32,9 @@ namespace HiWebAgent
         readonly Func<string, PairedDevice> get;
         readonly Action<PairedDevice> save;
         readonly Func<Dictionary<string, object>> status;
-        readonly JavaScriptSerializer json = new JavaScriptSerializer();
+        readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+        // Файловые запросы обрабатываются в пуле потоков, но не больше нескольких сразу: чтение большого файла не должно занять все потоки.
+        static readonly SemaphoreSlim fsGate = new SemaphoreSlim(6);
         readonly ConcurrentDictionary<string, Session> sessions = new ConcurrentDictionary<string, Session>();
         volatile bool stopped;
 
@@ -104,6 +106,15 @@ namespace HiWebAgent
         /// обработчик сам переносит работу в нужный поток.
         /// </summary>
         public Action<Dictionary<string, object>, Action<Dictionary<string, object>>> GuardCommand;
+
+        /// <summary>Файловые операции для устройств (сообщения fs); null — доступ к файлам не поддерживается.</summary>
+        public FileService Files;
+
+        /// <summary>Сообщает всем устройствам на связи актуальные возможности (например, после смены открытых папок).</summary>
+        public void SendCaps()
+        {
+            Send(Caps());
+        }
 
         /// <summary>
         /// Шлёт снимок экрана (JPEG) для превью ПК на устройства, зашифрованным. Блокирует до отправки, поэтому
@@ -286,11 +297,13 @@ namespace HiWebAgent
                         Log.Write("lan: bad message signature");
                         break;
                     }
-                    Handle(Parse(body), channel);
+                    Handle(Parse(body), channel, device.Key);
                 }
             }
             finally
             {
+                FileService files = Files;
+                if (files != null) files.CloseDevice(device.Key);
                 session.Lines = null;
                 session.Client = null;
                 client.Close();
@@ -321,9 +334,15 @@ namespace HiWebAgent
             }
         }
 
-        void Handle(Dictionary<string, object> msg, SecureLines channel)
+        void Handle(Dictionary<string, object> msg, SecureLines channel, string deviceKey)
         {
             if (msg == null) return;
+            if (Str(msg, "t") == "fs")
+            {
+                // Чтение из сокета не должно ждать диск: запрос выполняется отдельно, ответ уходит тем же каналом по номеру id.
+                ThreadPool.QueueUserWorkItem(delegate { HandleFiles(msg, channel, deviceKey); });
+                return;
+            }
             if (Str(msg, "t") == "guard")
             {
                 var command = GuardCommand;
@@ -356,6 +375,59 @@ namespace HiWebAgent
             t.Start();
         }
 
+        /// <summary>
+        /// Файловый запрос устройства: тело зашифровано ключом сеанса (iv, data), внутри — заголовок и данные
+        /// (<see cref="FsWire"/>). Ответ идёт тем же номером id.
+        /// </summary>
+        void HandleFiles(Dictionary<string, object> msg, SecureLines channel, string deviceKey)
+        {
+            object id;
+            if (!msg.TryGetValue("id", out id) || id == null) return;
+            fsGate.Wait();
+            try
+            {
+                FileService files = Files;
+                byte[] plain = null;
+                try
+                {
+                    plain = channel.Decrypt(Convert.FromBase64String(Str(msg, "data") ?? ""), Convert.FromBase64String(Str(msg, "iv") ?? ""));
+                }
+                catch (Exception e)
+                {
+                    Log.Write("lan fs: " + e.Message);
+                }
+                FsReply reply;
+                Dictionary<string, object> header;
+                byte[] payload;
+                if (files == null) reply = FsError("off");
+                else if (plain == null || !FsWire.Unpack(plain, out header, out payload)) reply = FsError("bad");
+                else reply = files.Handle(deviceKey, header, payload);
+                byte[][] sealedData = channel.Encrypt(FsWire.Pack(reply.Header, reply.Payload));
+                var answer = new Dictionary<string, object>();
+                answer["t"] = "fs";
+                answer["id"] = id;
+                answer["iv"] = Convert.ToBase64String(sealedData[0]);
+                answer["data"] = Convert.ToBase64String(sealedData[1]);
+                channel.Send(json.Serialize(answer));
+            }
+            catch (Exception e)
+            {
+                Log.Write("lan fs: " + e.GetBaseException().Message);
+            }
+            finally
+            {
+                fsGate.Release();
+            }
+        }
+
+        static FsReply FsError(string code)
+        {
+            var r = new FsReply();
+            r.Header["ok"] = false;
+            r.Header["err"] = code;
+            return r;
+        }
+
         static Dictionary<string, object> Caps()
         {
             var caps = new Dictionary<string, object>();
@@ -363,6 +435,7 @@ namespace HiWebAgent
             caps["ver"] = AgentInfo.Version;
             caps["host"] = Environment.MachineName;
             caps["power"] = Power.Available();
+            caps["fs"] = FileSharing.CapsValue();
             return caps;
         }
 
@@ -460,6 +533,26 @@ namespace HiWebAgent
                 aes.Key = encKey;
                 aes.IV = iv;
                 using (var enc = aes.CreateEncryptor()) return enc.TransformFinalBlock(data, 0, data.Length);
+            }
+        }
+
+        /// <summary>Расшифровывает данные, зашифрованные устройством тем же ключом (<see cref="Encrypt(byte[])"/> наоборот); null — данные испорчены.</summary>
+        public byte[] Decrypt(byte[] data, byte[] iv)
+        {
+            try
+            {
+                using (var aes = new System.Security.Cryptography.AesCryptoServiceProvider())
+                {
+                    aes.Mode = System.Security.Cryptography.CipherMode.CBC;
+                    aes.Padding = System.Security.Cryptography.PaddingMode.PKCS7;
+                    aes.Key = encKey;
+                    aes.IV = iv;
+                    using (var dec = aes.CreateDecryptor()) return dec.TransformFinalBlock(data, 0, data.Length);
+                }
+            }
+            catch (Exception)
+            {
+                return null;
             }
         }
 

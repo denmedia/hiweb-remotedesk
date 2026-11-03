@@ -180,6 +180,35 @@ namespace HiWebAgent
         }
     }
 
+    /// <summary>Неудачная попытка входа, о которой надо сообщить устройствам сразу (каждая, не только подозрительная).</summary>
+    sealed class FailNote
+    {
+        public string Id;
+        public long Time;
+        public string Ip;
+        public string Cidr;        // подсеть, которую блокирует автоблокировка
+        public int Count;          // попыток с этой подсети за час, считая эту (у своих и знакомых адресов — 0)
+        public bool Local;
+        public bool Known;
+        public bool AutoBan;       // автоблокировка включена
+        public int BanAfter;       // порог автоблокировки
+        public bool WillBan;       // эта попытка достигла порога: блокировка запущена
+    }
+
+    /// <summary>Подсеть заблокирована (или блокировка не удалась): сообщение устройствам.</summary>
+    sealed class BanNote
+    {
+        public string Id;
+        public long Time;
+        public string Cidr;
+        public string Ip;          // адрес, с которого шли попытки (пусто для блокировки вручную без угрозы)
+        public int Count;          // попыток к моменту блокировки (0 — блокировка вручную)
+        public bool Auto;          // сработала автоблокировка
+        public bool Ok;
+        public bool FirewallOff;   // правило записано, но брандмауэр выключен — оно не действует
+        public string Error;
+    }
+
     /// <summary>Что изменилось в защите: передаётся подписчикам (планшет, значок в трее, окно агента).</summary>
     sealed class GuardUpdate
     {
@@ -187,6 +216,8 @@ namespace HiWebAgent
         public List<Threat> Threats = new List<Threat>();
         public bool State;                       // изменились заблокированные подсети, белый список, настройки или брандмауэр
         public List<Threat> Announce = new List<Threat>();   // новые угрозы, о которых стоит сказать сразу
+        public List<FailNote> Fails = new List<FailNote>();  // неудачные попытки входа, пришедшие только что
+        public List<BanNote> Bans = new List<BanNote>();     // блокировки, выполненные только что (и неудавшиеся автоблокировки)
     }
 
     /// <summary>
@@ -208,6 +239,10 @@ namespace HiWebAgent
         /// <summary>Об угрозе из истории журнала агент сразу не сообщает, если она старше: планшет узнает о ней при синхронизации.</summary>
         const long ANNOUNCE_MAX_AGE_MS = 60 * 60 * 1000;
         const int FIREWALL_REFRESH_MS = 5 * 60 * 1000;
+        /// <summary>Неудавшуюся блокировку подсети повторяют не чаще: помощника может не быть, а попытки идут каждые полминуты.</summary>
+        const long BAN_RETRY_MS = 10 * 60 * 1000;
+        /// <summary>Сообщения о неудачных попытках с одной подсети не чаще раза в это время (счётчик в следующем всё равно верный).</summary>
+        const long FAIL_NOTE_GAP_MS = 500;
 
         readonly SynchronizationContext ui;
         readonly JavaScriptSerializer json = new JavaScriptSerializer();
@@ -224,6 +259,11 @@ namespace HiWebAgent
         RdpEventSource source;
         List<BlockedRange> blocked = new List<BlockedRange>();
         bool firewallOn = true;
+        bool helperOn;
+        /// <summary>Подсети, блокировку которых помощник выполняет прямо сейчас.</summary>
+        readonly HashSet<string> banning = new HashSet<string>();
+        readonly Dictionary<string, long> lastBanTry = new Dictionary<string, long>();
+        readonly Dictionary<string, long> lastFailNote = new Dictionary<string, long>();
         long since;
         long entrySeq;
         int lastFirewallRefresh;
@@ -287,6 +327,22 @@ namespace HiWebAgent
         public bool LearnSubnet
         {
             get { return settings.LearnSubnet; }
+        }
+
+        public bool AutoBan
+        {
+            get { return settings.AutoBan; }
+        }
+
+        public int BanAfter
+        {
+            get { return settings.BanAfter; }
+        }
+
+        /// <summary>Помощник блокировки установлен и отвечает: блокировки идут без запроса UAC.</summary>
+        public bool HelperOn
+        {
+            get { return helperOn; }
         }
 
         /// <summary>Число угроз, по которым пользователь ещё ничего не решил.</summary>
@@ -402,8 +458,130 @@ namespace HiWebAgent
             GuardEntry entry = Record(e);
             if (!update.Entries.Contains(entry)) update.Entries.Add(entry);
             AddThreats(detector.Feed(e), update);
+            NoteFail(e, live, update);
             if (e.Time > since) since = e.Time;
             dirty = true;
+        }
+
+        // ------------------------------------------------------------------ автоблокировка и сообщения о неудачных входах
+
+        /// <summary>
+        /// Неудачная попытка входа: запускает блокировку подсети, если достигнут порог (<see cref="GuardSettings.BanAfter"/>),
+        /// и (для живых событий) готовит сообщение устройствам. Попытки из истории журнала устройствам не повторяются.
+        /// </summary>
+        void NoteFail(RdpEvent e, bool live, GuardUpdate update)
+        {
+            ThreatDetector.FailInfo info = detector.Describe(e);
+            if (info == null) return;
+            long now = PairedDevice.NowMs();
+            bool started = info.BanDue && now - e.Time < ThreatDetector.BanWindowMs && StartBan(info);
+            if (!live) return;
+            long last;
+            if (!started && lastFailNote.TryGetValue(info.Cidr, out last) && now - last < FAIL_NOTE_GAP_MS) return;
+            lastFailNote[info.Cidr] = now;
+            var note = new FailNote();
+            note.Id = "fail|" + e.Time + "|" + info.Ip + "|" + info.Count;
+            note.Time = e.Time;
+            note.Ip = info.Ip;
+            note.Cidr = info.Cidr;
+            note.Count = info.Count;
+            note.Local = info.Local;
+            note.Known = info.Known;
+            note.AutoBan = settings.AutoBan;
+            note.BanAfter = settings.BanAfter;
+            note.WillBan = started;
+            update.Fails.Add(note);
+        }
+
+        /// <summary>Подсеть уже заблокирована правилом брандмауэра агента (включённым).</summary>
+        bool IsBlocked(string ip)
+        {
+            IPAddress parsed;
+            if (!IpTools.TryParse(ip, out parsed)) return false;
+            foreach (BlockedRange b in blocked) if (b.Enabled && IpTools.InCidr(parsed, b.Cidr)) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Просит помощника заблокировать подсеть. false — не запущено: уже заблокирована, идёт блокировка или недавно
+        /// не вышло (повтор не чаще <see cref="BAN_RETRY_MS"/>).
+        /// </summary>
+        bool StartBan(ThreatDetector.FailInfo info)
+        {
+            string cidr = info.Cidr;
+            long now = PairedDevice.NowMs();
+            if (banning.Contains(cidr) || IsBlocked(info.Ip)) return false;
+            long last;
+            if (lastBanTry.TryGetValue(cidr, out last) && now - last < BAN_RETRY_MS) return false;
+            lastBanTry[cidr] = now;
+            banning.Add(cidr);
+            string ip = info.Ip;
+            int count = info.Count;
+            Log.Write("guard: auto-ban " + cidr + " after " + count + " failed logons");
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                HelperReply reply = HelperClient.Ban(cidr);
+                List<BlockedRange> after = reply.Ok ? FirewallRules.Blocked() : null;
+                bool on = FirewallRules.Enabled();
+                ui.Post(delegate { FinishBan(cidr, ip, count, reply, after, on); }, null);
+            });
+            return true;
+        }
+
+        void FinishBan(string cidr, string ip, int count, HelperReply reply, List<BlockedRange> after, bool fwOn)
+        {
+            banning.Remove(cidr);
+            if (disposed) return;
+            var update = new GuardUpdate();
+            long now = PairedDevice.NowMs();
+            var note = new BanNote();
+            note.Id = "ban|" + cidr + "|" + now;
+            note.Time = now;
+            note.Cidr = cidr;
+            note.Ip = ip;
+            note.Count = count;
+            note.Auto = true;
+            if (reply.Reached && reply.Ok)
+            {
+                if (after != null) SetFirewall(after, fwOn, update);
+                MarkBlocked(cidr, update);
+                dirty = true;
+                note.Ok = true;
+                note.FirewallOff = reply.Has("fwoff");
+                Log.Write("guard: banned " + cidr + (reply.Has("exists") ? " (already)" : "") + (note.FirewallOff ? ", firewall off" : ""));
+                // Правило уже было (агент только что перезапущен и не знал о нём): ничего нового, шума не нужно.
+                if (!reply.Has("exists")) update.Bans.Add(note);
+            }
+            else
+            {
+                note.Error = reply.Reached
+                    ? "Помощник блокировки отказал: " + reply.Detail
+                    : "Помощник блокировки не установлен или не запущен — подсеть не заблокирована. Установите его: окно «Защита подключений» на ПК, вкладка «Заблокировано».";
+                Log.Write("guard: ban " + cidr + " failed: " + reply.Detail);
+                long lastFailed;
+                // Об одной и той же неудаче — не чаще раза в час, иначе при долгой атаке уведомления шли бы каждые 10 минут.
+                if (!lastBanFailNote.TryGetValue(cidr, out lastFailed) || now - lastFailed > 60 * 60 * 1000)
+                {
+                    lastBanFailNote[cidr] = now;
+                    update.Bans.Add(note);
+                }
+            }
+            Raise(update);
+        }
+
+        readonly Dictionary<string, long> lastBanFailNote = new Dictionary<string, long>();
+
+        /// <summary>Угрозы с этой подсети, ждавшие решения, закрываются как заблокированные.</summary>
+        void MarkBlocked(string cidr, GuardUpdate update)
+        {
+            foreach (Threat t in threats)
+            {
+                if (t.Status != Threat.StatusNew) continue;
+                IPAddress ip;
+                if (t.Cidr != cidr && !(IpTools.TryParse(t.Ip, out ip) && IpTools.InCidr(ip, cidr))) continue;
+                t.Status = Threat.StatusBlocked;
+                if (!update.Threats.Contains(t)) update.Threats.Add(t);
+            }
         }
 
         /// <summary>Записывает событие в журнал; неудачные попытки с того же адреса подряд сливаются в одну запись.</summary>
@@ -486,7 +664,8 @@ namespace HiWebAgent
 
         void Raise(GuardUpdate update)
         {
-            if (update.Entries.Count == 0 && update.Threats.Count == 0 && update.Announce.Count == 0 && !update.State) return;
+            if (update.Entries.Count == 0 && update.Threats.Count == 0 && update.Announce.Count == 0 && update.Fails.Count == 0
+                && update.Bans.Count == 0 && !update.State) return;
             var h = Updated;
             if (h == null) return;
             try { h(update); }
@@ -572,18 +751,25 @@ namespace HiWebAgent
         /// <summary>
         /// Меняет настройки защиты: режим и автоматическое занесение (null — не менять). Возвращает null или текст ошибки.
         /// </summary>
-        public string Configure(string mode, bool? autoLearn, bool? learnSubnet)
+        public string Configure(string mode, bool? autoLearn, bool? learnSubnet, bool? autoBan = null, int? banAfter = null)
         {
             if (mode != null && !GuardMode.IsValid(mode)) return "Неизвестный режим защиты";
+            if (banAfter.HasValue && (banAfter.Value < GuardSettings.MinBanAfter || banAfter.Value > GuardSettings.MaxBanAfter))
+            {
+                return "Число попыток до блокировки — от " + GuardSettings.MinBanAfter + " до " + GuardSettings.MaxBanAfter;
+            }
             bool changed = false;
             if (mode != null && mode != settings.Mode) { settings.Mode = mode; changed = true; }
             if (autoLearn.HasValue && autoLearn.Value != settings.AutoLearn) { settings.AutoLearn = autoLearn.Value; changed = true; }
             if (learnSubnet.HasValue && learnSubnet.Value != settings.LearnSubnet) { settings.LearnSubnet = learnSubnet.Value; changed = true; }
+            if (autoBan.HasValue && autoBan.Value != settings.AutoBan) { settings.AutoBan = autoBan.Value; changed = true; }
+            if (banAfter.HasValue && banAfter.Value != settings.BanAfter) { settings.BanAfter = banAfter.Value; changed = true; }
             if (!changed) return null;
             var update = new GuardUpdate();
             update.State = true;
             dirty = true;
-            Log.Write("guard: mode " + settings.Mode + ", autoLearn " + settings.AutoLearn + ", learnSubnet " + settings.LearnSubnet);
+            Log.Write("guard: mode " + settings.Mode + ", autoLearn " + settings.AutoLearn + ", learnSubnet " + settings.LearnSubnet
+                + ", autoBan " + settings.AutoBan + " after " + settings.BanAfter);
             Raise(update);
             return null;
         }
@@ -626,7 +812,18 @@ namespace HiWebAgent
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool applied;
-                string error = FirewallRules.RunWithUac("block", new[] { canonical }, enableFirewall, out applied);
+                string error;
+                // Помощник блокирует без запроса UAC; но включить брандмауэр или заблокировать широкую подсеть он не умеет.
+                HelperReply viaHelper = !enableFirewall && HelperProtocol.NormalizeTarget(canonical) != null ? HelperClient.Ban(canonical) : null;
+                if (viaHelper != null && viaHelper.Ok)
+                {
+                    applied = true;
+                    error = viaHelper.Has("fwoff") ? "Правило добавлено, но брандмауэр Windows выключен — оно не работает, пока он не включён" : null;
+                }
+                else
+                {
+                    error = FirewallRules.RunWithUac("block", new[] { canonical }, enableFirewall, out applied);
+                }
                 List<BlockedRange> now = FirewallRules.Blocked();
                 bool on = FirewallRules.Enabled();
                 ui.Post(delegate
@@ -634,18 +831,16 @@ namespace HiWebAgent
                     var update = new GuardUpdate();
                     if (applied)
                     {
-                        IPAddress net;
-                        int prefix;
-                        IpTools.TryParseCidr(canonical, out net, out prefix);
-                        foreach (Threat t in threats)
-                        {
-                            if (t.Status != Threat.StatusNew) continue;
-                            IPAddress ip;
-                            if (t.Cidr != canonical && !(IpTools.TryParse(t.Ip, out ip) && IpTools.InCidr(ip, canonical))) continue;
-                            t.Status = Threat.StatusBlocked;
-                            update.Threats.Add(t);
-                        }
+                        MarkBlocked(canonical, update);
                         dirty = true;
+                        var note = new BanNote();
+                        note.Time = PairedDevice.NowMs();
+                        note.Id = "ban|" + canonical + "|" + note.Time;
+                        note.Cidr = canonical;
+                        note.Ip = "";
+                        note.Ok = true;
+                        note.FirewallOff = !on;
+                        update.Bans.Add(note);
                     }
                     SetFirewall(now, on, update);
                     Raise(update);
@@ -665,7 +860,10 @@ namespace HiWebAgent
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool applied;
-                string error = FirewallRules.RunWithUac("unblock", new[] { canonical }, false, out applied);
+                string error = null;
+                HelperReply viaHelper = HelperProtocol.NormalizeTarget(canonical) != null ? HelperClient.Unban(canonical) : null;
+                if (viaHelper != null && viaHelper.Ok) applied = true;
+                else error = FirewallRules.RunWithUac("unblock", new[] { canonical }, false, out applied);
                 List<BlockedRange> now = FirewallRules.Blocked();
                 bool on = FirewallRules.Enabled();
                 ui.Post(delegate
@@ -688,7 +886,7 @@ namespace HiWebAgent
             });
         }
 
-        /// <summary>Перечитывает правила и состояние брандмауэра (долго: сотни правил через COM — в фоне).</summary>
+        /// <summary>Перечитывает правила и состояние брандмауэра и наличие помощника (долго: сотни правил через COM — в фоне).</summary>
         public void RefreshFirewall()
         {
             lastFirewallRefresh = Environment.TickCount;
@@ -696,11 +894,56 @@ namespace HiWebAgent
             {
                 List<BlockedRange> now = FirewallRules.Blocked();
                 bool on = FirewallRules.Enabled();
+                HelperReply helper = HelperClient.Status();
                 ui.Post(delegate
                 {
                     var update = new GuardUpdate();
                     SetFirewall(now, on, update);
+                    SetHelper(helper.Reached && helper.Ok, update);
                     Raise(update);
+                }, null);
+            });
+        }
+
+        void SetHelper(bool on, GuardUpdate update)
+        {
+            if (on == helperOn) return;
+            helperOn = on;
+            update.State = true;
+            Log.Write("guard: helper " + (on ? "available" : "not available"));
+        }
+
+        /// <summary>
+        /// Устанавливает помощника блокировки: один запрос UAC на ПК. [enableFirewall] — заодно включить брандмауэр.
+        /// [done] получает null или текст ошибки, вызывается в потоке интерфейса.
+        /// </summary>
+        public void InstallHelper(bool enableFirewall, Action<string> done)
+        {
+            RunHelperChange(delegate { return HelperInstaller.InstallWithUac(enableFirewall); }, done);
+        }
+
+        public void RemoveHelper(Action<string> done)
+        {
+            RunHelperChange(delegate { return HelperInstaller.RemoveWithUac(); }, done);
+        }
+
+        void RunHelperChange(Func<string> change, Action<string> done)
+        {
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string error = change();
+                HelperReply helper = HelperClient.Status();
+                List<BlockedRange> now = FirewallRules.Blocked();
+                bool on = FirewallRules.Enabled();
+                ui.Post(delegate
+                {
+                    var update = new GuardUpdate();
+                    SetFirewall(now, on, update);
+                    SetHelper(helper.Reached && helper.Ok, update);
+                    // Помощник только что поставили: следующая же попытка снова разрешена.
+                    lastBanTry.Clear();
+                    Raise(update);
+                    done(error);
                 }, null);
             });
         }
@@ -734,6 +977,9 @@ namespace HiWebAgent
             msg["mode"] = settings.Mode;
             msg["autoLearn"] = settings.AutoLearn;
             msg["learnSubnet"] = settings.LearnSubnet;
+            msg["autoBan"] = settings.AutoBan;
+            msg["banAfter"] = settings.BanAfter;
+            msg["helper"] = helperOn;
             var list2 = new List<object>();
             foreach (WhitelistEntry w in whitelist.Entries)
             {
@@ -767,6 +1013,41 @@ namespace HiWebAgent
                 arr.Add(o);
             }
             msg["threats"] = arr;
+            return msg;
+        }
+
+        /// <summary>Неудачная попытка входа: устройства показывают уведомление на каждую.</summary>
+        public Dictionary<string, object> FailMessage(FailNote n)
+        {
+            var msg = new Dictionary<string, object>();
+            msg["t"] = "guard_fail";
+            msg["id"] = n.Id;
+            msg["ts"] = n.Time;
+            msg["ip"] = n.Ip;
+            msg["cidr"] = n.Cidr;
+            msg["count"] = n.Count;
+            msg["local"] = n.Local;
+            msg["known"] = n.Known;
+            msg["autoBan"] = n.AutoBan;
+            msg["banAfter"] = n.BanAfter;
+            msg["willBan"] = n.WillBan;
+            return msg;
+        }
+
+        /// <summary>Подсеть заблокирована (или автоблокировка не удалась).</summary>
+        public Dictionary<string, object> BanMessage(BanNote n)
+        {
+            var msg = new Dictionary<string, object>();
+            msg["t"] = "guard_ban";
+            msg["id"] = n.Id;
+            msg["ts"] = n.Time;
+            msg["cidr"] = n.Cidr;
+            msg["ip"] = n.Ip ?? "";
+            msg["count"] = n.Count;
+            msg["auto"] = n.Auto;
+            msg["ok"] = n.Ok;
+            msg["fwOff"] = n.FirewallOff;
+            msg["error"] = n.Error ?? "";
             return msg;
         }
 
@@ -830,6 +1111,8 @@ namespace HiWebAgent
                 root["mode"] = settings.Mode;
             root["autoLearn"] = settings.AutoLearn;
             root["learnSubnet"] = settings.LearnSubnet;
+            root["autoBan"] = settings.AutoBan;
+            root["banAfter"] = settings.BanAfter;
             var wl = new List<object>();
             foreach (WhitelistEntry w in whitelist.Entries)
             {
@@ -899,6 +1182,9 @@ namespace HiWebAgent
                 if (mode != null && GuardMode.IsValid(mode)) settings.Mode = mode;
                 if (root.ContainsKey("autoLearn")) settings.AutoLearn = Flag(root, "autoLearn");
                 settings.LearnSubnet = Flag(root, "learnSubnet");
+                // Файл до автоблокировки: по умолчанию она включена, порог — стандартный.
+                if (root.ContainsKey("autoBan")) settings.AutoBan = Flag(root, "autoBan");
+                if (root.ContainsKey("banAfter")) settings.BanAfter = GuardSettings.ClampBanAfter((int)Num(root, "banAfter"));
                 foreach (object raw in List(root, "whitelist"))
                 {
                     var o = raw as Dictionary<string, object>;

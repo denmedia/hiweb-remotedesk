@@ -331,11 +331,33 @@ class RdpClient(
         else -> e.message ?: e.javaClass.simpleName
     }
 
+    /**
+     * Просит сервер слать TCP-сегменты не длиннее [TCP_MSS] байт (MSS объявляется в SYN, поэтому до `connect`).
+     * Подключение часто идёт через VPN на стороне ПК: путь с MTU около 1440 при MTU 1500 у адаптера, и крупные
+     * пакеты (полноэкранный кадр H.264 в сотни КБ) там застревают, а мелкие проходят — картинка замирает через
+     * секунды после начала. Не получилось — не страшно, остаётся обычный MSS.
+     */
+    private fun limitSegmentSize(s: Socket) {
+        try {
+            s.bind(null) // создаёт сам сокет, иначе у `Socket()` ещё нет дескриптора
+            val pfd = android.os.ParcelFileDescriptor.fromSocket(s)
+            try {
+                android.system.Os.setsockoptInt(pfd.fileDescriptor, android.system.OsConstants.IPPROTO_TCP, TCP_MAXSEG, TCP_MSS)
+            } finally {
+                pfd.close()
+            }
+            Log.i(TAG, "MSS ограничен до $TCP_MSS")
+        } catch (e: Throwable) {
+            Log.w(TAG, "не удалось ограничить размер TCP-сегмента: $e")
+        }
+    }
+
     private fun connect() {
         val s = Socket()
         socket = s
         s.tcpNoDelay = true
         s.keepAlive = true
+        limitSegmentSize(s)
         s.connect(InetSocketAddress(cfg.host, cfg.port), 7000)
         s.soTimeout = 20000
         inp = BufferedInputStream(s.getInputStream(), 1 shl 16)
@@ -1167,6 +1189,9 @@ class RdpClient(
 
     companion object {
         private const val TAG = "RDP"
+        /** Linux `TCP_MAXSEG` (в `OsConstants` его нет) и объявляемый серверу MSS: 1200 + заголовки заметно меньше пути через VPN. */
+        private const val TCP_MAXSEG = 2
+        private const val TCP_MSS = 1200
         /** Имя динамического канала камеры, анонсируемое серверу (любое, главное — без пробелов). */
         /** Каналы устройств камер: «Camera0», «Camera1»… по порядку в [EcamCamera.catalog]. */
         private const val ECAM_DEVICE_PREFIX = "Camera"

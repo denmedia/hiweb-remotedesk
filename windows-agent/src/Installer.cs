@@ -74,6 +74,13 @@ namespace HiWebAgent
         public static void Uninstall(bool fromAgent)
         {
             if (!fromAgent) StopRunningAgent();
+            // Помощник блокировки — служба с правами системы: без агента она не нужна. Снимается одним запросом UAC;
+            // отказ не мешает удалению самого агента (служба останется, её можно убрать вручную: sc delete HiWebAgentGuard).
+            if (HelperInstaller.ServiceExists())
+            {
+                string failure = HelperInstaller.RemoveWithUac();
+                if (failure != null) Log.Write("uninstall: helper not removed: " + failure);
+            }
             using (RegistryKey run = Registry.CurrentUser.OpenSubKey(RunKey, true))
             {
                 if (run != null) run.DeleteValue(RunValue, false);

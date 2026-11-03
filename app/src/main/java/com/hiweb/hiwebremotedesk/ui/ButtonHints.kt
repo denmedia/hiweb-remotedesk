@@ -1,6 +1,7 @@
 package com.hiweb.hiwebremotedesk.ui
 
 import com.hiweb.hiwebremotedesk.agent.AgentPower
+import com.hiweb.hiwebremotedesk.agent.FilesAccess
 import com.hiweb.hiwebremotedesk.data.OsType
 import com.hiweb.hiwebremotedesk.data.PcState
 
@@ -69,6 +70,32 @@ object ButtonHints {
             else -> ButtonHint("Действие недоступно", "Агент сообщил, что Windows не разрешает «${action.title.lowercase()}» на этом ПК.")
         }
     }
+
+    /** Значок «Файлы» неактивен: что мешает и что сделать. [access] не [FilesAccess.READY]. */
+    fun files(access: FilesAccess): ButtonHint = when (access) {
+        FilesAccess.OFFLINE -> ButtonHint(
+            "Файлы ПК недоступны",
+            "Папки ПК видны на планшете, только когда HiWeb Agent на ПК на связи: ПК должен быть включён и в той же сети, что " +
+                "и планшет. Как только ПК появится в сети, значок станет активным.",
+        )
+        FilesAccess.OLD_AGENT -> ButtonHint(
+            "Нужен агент 1.11 или новее",
+            "Доступ к файлам ПК умеет HiWeb Agent версии 1.11 и новее, а на этом ПК стоит более старый. " + INSTALL_AGENT,
+        )
+        else -> ButtonHint(
+            "Доступ к файлам не включён на ПК",
+            "На ПК щёлкните значок HiWeb Agent в трее и выберите «Доступ к файлам…»: добавьте одну или несколько папок и для " +
+                "каждой выберите, только чтение или ещё и запись. Они появятся на планшете как отдельные диски в приложении «Файлы» " +
+                "— экран ПК транслировать не нужно.",
+        )
+    }
+
+    /** Файловый менеджер не открылся сам на диске ПК: где искать диск вручную. */
+    fun filesManual(pcName: String): ButtonHint = ButtonHint(
+        "Откройте диск ПК вручную",
+        "Откройте на планшете приложение «Файлы» (или любое окно выбора файла), вызовите боковое меню: папки ПК «$pcName» " +
+            "стоят там отдельными дисками под своими названиями.",
+    )
 
     /** Щит защиты подключений неактивен: агент не присылал данных. */
     fun guard(): ButtonHint = ButtonHint(

@@ -180,6 +180,16 @@ Android-клиент удалённого рабочего стола (RDP) дл
   `SwitchListenerService`), который уходит агенту в `pair`; планшет слушает стандартный порт и все заданные для ПК
   (`NetworkPorts.agentPorts`, набор подстраивается при `SwitchListenerService.startIfPaired`, его зовёт и сохранение ПК);
   агент узнаёт новый порт при следующем сеансе RDP; приложение не может слушать порты ниже 1024.
+- **Поделиться ПК и добавление по QR-коду** (по образцу denmedia-ip-cams): кнопка «Поделиться» (значок справа от названия на
+  `DeviceCard`, `onShare`) открывает `ui/DeviceShareDialog` — QR-код на весь экран (по нажатию — полноэкранный, макс. яркость окна),
+  «Отправить картинкой» (PNG в `cacheDir/shared`, `FileProvider` `${applicationId}.fileprovider`, `res/xml/file_paths.xml`). Кнопка
+  «Добавить по QR-коду» — под кнопками добавления в боковой панели планшета и маленьким FAB на телефоне → `ui/QrScanDialog` (CameraX
+  `ImageAnalysis` + ZXing, либо «Из изображения» через `PickVisualMedia`) → форма ПК с заполненными полями
+  (`DeviceEditDialog(draft = …)`: устройство остаётся новым, id выдаётся при сохранении). Формат — `data/DeviceShareCode`:
+  `HWRD1:` + Base64url(deflate(JSON)), ключи как в `DeviceRepository`, значения по умолчанию опускаются; не передаются id, сертификат
+  и папка общего диска. **Пароль по умолчанию в код не кладётся** (переключатель «Передать пароль» в диалоге, QR часто уходит в
+  мессенджер). Новое поле `Device`, которое должно переезжать на другой планшет, добавлять в `DeviceShareCode.toJson/fromJson`
+  (тест — `DeviceShareCodeTest`). Зависимости: `zxing-core`, `camera-camera2/lifecycle/view` (в `libs.versions.toml`).
 - **Ручная проверка обновления приложения** — пункт «Проверить обновление» в меню «⋮» главного экрана (обе панели,
   `TopBar` и `TopBarCompact` в `HomeScreen`) → `ui/UpdateDialog`. Логика: `data/AppUpdate.kt` (`GET api.github.com/repos/denmedia/
   hiweb-remotedesk/releases/latest`, без токена; версия из `tag_name` без `v`, сравнение по числам через точку; APK — первый asset
@@ -223,6 +233,22 @@ Android-клиент удалённого рабочего стола (RDP) дл
   Без агента остаются прежние кнопки питания через сеанс RDP (`PowerKeys`) или SSH для Ubuntu.
   Превью ПК без сеанса: агент (`ScreenShot.cs`) раз в 15 мин шлёт по LAN `screen` — JPEG экрана, зашифрованный
   `SecureLines.Encrypt` (AES); `AgentHub` расшифровывает и кладёт в `ThumbnailStore.saveJpeg`.
+- **Папки ПК как диски на планшете без трансляции экрана** (агент 1.11+, протокол — раздел «Доступ к файлам» в `PROTOCOL.md`):
+  владелец в агенте (пункт меню «Доступ к файлам…», `SharesForm.cs`) включает доступ (по умолчанию выключен) и добавляет одну или
+  несколько папок, у каждой свой режим «только чтение» / «чтение и запись». Файлы агента: `FilesPolicy.cs` (`ShareConfig`/`ShareDef` —
+  настройки, `SharePaths` — разбор и защита путей: «..», «:», имена устройств, симлинки/junction, каталог данных агента),
+  `FileService.cs` (операции `list/stat/read/put_*/mkdir/rename/delete/space`, загрузка через временный `.hiweb-*.part`, удаление в
+  корзину; `FsWire` — тело сообщения), `FileSharing.cs` (реестр `HKCU\Software\HiWebAgent` → `Files`, событие `Changed` → `LanLink.SendCaps`).
+  Сообщения `fs` идут по LAN-каналу `LanLink` (зашифрованы ключом сеанса, как `screen`), `caps.fs` сообщает планшету включённость и список
+  дисков (`id`, `name`, `w`) без путей на ПК. Права проверяет сам агент: запись в «только чтение» он отклонит, что бы ни прислал планшет.
+  Планшет: `agent/PcFiles.kt` (клиент операций и `FsWire`), `AgentHub.fsCall` (шифрование, ожидание ответа до 30 с; `AgentPresence.files`),
+  `agent/PcDocumentsProvider.kt` (`DocumentsProvider`, authority `<applicationId>.pcfiles`, по корню на каждую открытую папку каждого
+  ПК на связи; чтение — `openProxyFileDescriptor` + `ReadWindow`, запись — временный файл и загрузка при закрытии), `agent/PcDocId.kt`
+  (идентификатор `<id ПК>|<id папки>|<путь>`, `ListingCache`, `ReadWindow`), `agent/FilesAccess.kt` (состояние кнопки и `PcRoots`),
+  `agent/PcFilesLauncher.kt` (значок папки на `DeviceCard` открывает «Файлы» на диске ПК; подсказки неактивного значка — `ButtonHints.files`).
+  Копирование и перемещение внутри ПК флагами не объявлены — система делает их чтением и записью через планшет. Новую файловую операцию
+  добавлять в `FileService` (с проверкой `share.Write` для изменяющих), `PcFiles`, провайдер и тесты обеих сторон; шифрование и подпись
+  сверять с .NET-агентом эталонными значениями (см. `PcFilesTest`).
 - **Состояние ПК и пробуждение**: агент (`PcStatus.cs`) шлёт `status` (блокировка, кто в сеансе, простой, уход в
   сон/гибернацию/выключение/перезагрузку/выход, MAC для WoL) и по LAN, и по DVC. Планшет хранит последнее
   сообщение (`data/PcStateStore.kt`), состояние карточки выводит `PcStatusRules` (`data/PcStatus.kt`) из него,
@@ -282,8 +308,8 @@ Android-клиент удалённого рабочего стола (RDP) дл
   `TerminalServices-LocalSessionManager/Operational` (21/25 вход, 23 выход, 24 отключение); журнал «Безопасность»
   без администратора недоступен. Файлы агента: `GuardRules.cs` (адреса/подсети `IpTools`, белый список `Whitelist`, настройки `GuardSettings` и правила
   `ThreatDetector` — чистая логика без интерфейса), `Guard.cs` (`RdpEventSource`, `ConnectionGuard`: история при запуске, журнал и угрозы
-  в `%LOCALAPPDATA%\HiWebAgent\guard.json`, команды), `Firewall.cs` (правила брандмауэра), `GuardForm.cs` (окно и
-  `GuardText`). Угрозы: `bruteforce` (3 неудачи за 10 мин с подсети /24) и `unknown_logon` (вход, после которого планшет
+  в `%LOCALAPPDATA%\HiWebAgent\guard.json`, команды), `Firewall.cs` (правила брандмауэра), `GuardHelper.cs` (помощник блокировки: клиент, установка, служба),
+  `GuardForm.cs` (окно и `GuardText`). Угрозы: `bruteforce` (3 неудачи за 10 мин с подсети /24) и `unknown_logon` (вход, после которого планшет
   не открыл канал за 30 с; открыл — адрес запоминается в белом списке, в истории — по `channel opened` из `agent.log`).
   **Белый список и режим** (агент 1.9.5+, `GuardSettings`: `Mode` normal/whitelist, `AutoLearn`, `LearnSubnet`): адреса и подсети
   `WhitelistEntry` (ручные и автоматические) не проверяются и не блокируются; в режиме whitelist любая неудача с адреса вне списка —
@@ -292,6 +318,21 @@ Android-клиент удалённого рабочего стола (RDP) дл
   планшета `trust` (ip/cidr), `untrust`, `settings`; приложение: `GuardState.mode == null` — агент старше, настройки скрыты.
   Блокировки «всё, кроме белого списка» через брандмауэр нет: автозанесение и блокировка исключают друг друга (адрес вне списка не
   дойдёт до входа), а ошибка отрезала бы владельца, который сидит на RDP из интернета, — режим только предупреждает.
+  **Автоблокировка и помощник** (агент 1.10+; `GuardSettings.AutoBan` по умолчанию включена, `BanAfter` = 5, 2–50; пишутся в `guard.json`):
+  `ThreatDetector.Describe` считает неудачи по подсети за `BanWindowMs` (час; тревога `bruteforce` — по-прежнему 3 за 10 минут),
+  `ConnectionGuard.NoteFail/StartBan/FinishBan` просят заблокировать подсеть (`OfferedBlock`) у **помощника** (`GuardHelper.cs`) — службы
+  `HiWebAgentGuard` от SYSTEM из копии exe в `%ProgramFiles%\HiWeb Agent` (ставится одним UAC: `--guard-fw install-helper --sid …
+  [--enable-fw]`, снимается `remove-helper` и при удалении агента, `Installer.Uninstall`). Без помощника автоблокировка не может ничего —
+  UAC-запрос из фона на ПК, где владельца нет, смысла не имеет (так решил пользователь). Канал `\\.\pipe\HiWebAgentGuard`: ACL —
+  SYSTEM/администраторы/SID установившего, сеть запрещена; протокол и допустимые подсети (только публичные /24, IPv6 /64 и уже) —
+  `HelperProtocol` в `GuardRules.cs` (чистая логика под `tests\test.cmd`). `PipeOptions.FirstPipeInstance` в .NET 4.x не работает
+  (`ArgumentException`, канал не создаётся) — не возвращать. Ручные `Block/Unblock` идут через помощника, а без него — через UAC.
+  Устройствам рассылаются `guard_fail` (на каждую живую неудачу, с одной подсети не чаще 0,5 с) и `guard_ban` (успех и неудача
+  автоблокировки, ручная блокировка); на планшете — `GuardHub` (отсев дублей по `id` из двух каналов — `RecentIds`),
+  `GuardNotifications.postFail/postBan` (канал `pc_guard_fail` отдельный, уведомление одной подсети заменяется), настройки —
+  карточка «Автоблокировка» в `GuardDialog`, у агента — вкладка «Заблокировано» окна защиты. Проверка без UAC: службу можно поднять
+  в тестовом процессе через `OnStart` (рефлексия), поддельный помощник — сервер на том же канале; реальные `sc create`/COM-правила
+  без UAC не проверить.
   Блокировка — правило входящего трафика брандмауэра группы «HiWeb Agent»; менять брандмауэр без администратора
   нельзя, поэтому агент запускает свой exe с `--guard-fw …` через `runas` (UAC на ПК, `Program.Main` обрабатывает ключ
   первым делом). Выключенный брандмауэр правил не применяет: на ПК он может быть выключен,
@@ -337,8 +378,13 @@ Android-клиент удалённого рабочего стола (RDP) дл
   собрать все `src\*.cs` вместе с отдельной точкой входа, которая ловит `UnhandledException`/`ThreadException` и
   закрывает `AgentApp` через 12 с (`-main:`), и убедиться, что исключений нет. Необработанные исключения агента
   пишутся в `agent.log` (`crash:`/`error:`), а падение видно ещё и в журнале Windows (Application, `HiWebAgent.exe`).
-- Проверки правил защиты агента (адреса, подсети, обнаружение): `windows-agent\tests\test.cmd` (собирает
-  `src\GuardRules.cs` с тестами тем же `csc`; в сборку агента `tests\` не входит). Запускать из PowerShell:
+- Проверки правил защиты агента (адреса, подсети, обнаружение) и доступа к файлам (`FilesTests.cs`: настройки, пути, junction, права,
+  загрузка): `windows-agent\tests\test.cmd` (собирает `src\GuardRules.cs`, `FilesPolicy.cs`, `FileService.cs` с тестами тем же `csc`;
+  в сборку агента `tests\` не входит). Сквозная проверка файлов на эмуляторе без настоящего ПК: приложение на эмуляторе (везде `-s emulator-5554`;
+  `run-as` кладёт в `shared_prefs` `agent_pairing.xml` с ключом и `devices.xml` с ПК), `adb forward tcp:47853 tcp:47853`, а на этом ПК —
+  отдельная точка входа, собранная из копии `src\*.cs` в scratchpad (журнал во временной папке, настройки файлов подменены рефлексией в
+  `FileSharing.current`), с настоящими `LanLink` и `FileService`, подключающаяся к 127.0.0.1:47853; смотреть приложение «Файлы»
+  (`com.google.android.documentsui`). Реестр и `agent.log` настоящего агента при этом не трогать. Запускать из PowerShell:
   `& cmd /c ".\test.cmd"` — из Bash `cmd //c` его не находит.
 - Репозиторий: https://github.com/denmedia/hiweb-remotedesk (публичный, ветка `main`). Релиз: поднять
   `versionCode`/`versionName`, `:app:assembleRelease`, APK `HiWebRemoteDesk-<версия>.apk` → `gh release create v<версия>`.

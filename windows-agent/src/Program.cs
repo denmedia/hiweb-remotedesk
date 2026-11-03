@@ -24,6 +24,8 @@ namespace HiWebAgent
         {
             // Повышенная копия для блокировки подсетей (запускается агентом через UAC): без трея и окон.
             if (args.Length > 0 && args[0] == FirewallRules.ElevatedArg) return FirewallRules.RunElevated(args);
+            // Служба помощника блокировки (её запускает Windows из Program Files): тоже без трея и окон.
+            if (args.Length > 0 && args[0] == HelperInstaller.ServiceArg) return HelperInstaller.RunService(args);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             string self = Assembly.GetExecutingAssembly().Location;

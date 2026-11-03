@@ -74,6 +74,10 @@ fun GuardDialog(
     onUntrust: (cidr: String) -> Unit,
     /** Режим защиты и запоминание адреса планшета; null — не менять. */
     onConfigure: (mode: String?, autoLearn: Boolean?, learnSubnet: Boolean?) -> Unit,
+    /** Автоблокировка: включить/выключить и порог неудачных попыток; null — не менять. */
+    onConfigureBan: (autoBan: Boolean?, banAfter: Int?) -> Unit,
+    /** Установить (true) или удалить (false) помощника блокировки на ПК; второй параметр — заодно включить брандмауэр. */
+    onHelper: (install: Boolean, enableFirewall: Boolean) -> Unit,
     onKeep: (threatId: String) -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -82,6 +86,7 @@ fun GuardDialog(
     var adding by remember { mutableStateOf(false) }
     var removing by remember { mutableStateOf<String?>(null) }
     var strictAsk by remember { mutableStateOf(false) }
+    var helperAsk by remember { mutableStateOf(false) }
     val state = data.state
     val firewallOff = state != null && !state.firewallOn
     val open = data.openThreats.sortedByDescending { it.time }
@@ -144,6 +149,32 @@ fun GuardDialog(
                             onTrust = { onTrust(t.ip) },
                             onTrustSubnet = { onTrust(GuardText.subnetOf(t.ip)) },
                             onKeep = { onKeep(t.id) },
+                        )
+                    }
+                }
+                if (state != null && state.supportsAutoBan) {
+                    if (state.autoBan && !state.helper) {
+                        item {
+                            Banner(
+                                "Автоблокировка включена, но помощник на ПК не установлен: подсеть не будет заблокирована сама. Установите его ниже (один запрос Windows на ПК).",
+                                DangerRed,
+                            )
+                        }
+                    }
+                    item { Header("Автоблокировка") }
+                    item {
+                        BanCard(
+                            state, linked,
+                            onAutoBan = { onConfigureBan(it, null) },
+                            onBanAfter = { onConfigureBan(null, it) },
+                            onHelper = { if (state.helper) onHelper(false, false) else helperAsk = true },
+                        )
+                    }
+                } else if (state != null && state.supportsWhitelist) {
+                    item {
+                        Text(
+                            "Автоблокировка есть у HiWeb Agent версии 1.10 и новее: откройте сеанс — приложение предложит обновить агент.",
+                            color = TextSecondary, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp),
                         )
                     }
                 }
@@ -266,6 +297,39 @@ fun GuardDialog(
             dismissButton = { TextButton(onClick = { blocking = null }) { Text("Отмена", color = TextSecondary) } },
         )
     }
+    if (helperAsk) {
+        var enableFirewall by remember { mutableStateOf(true) }
+        AlertDialog(
+            onDismissRequest = { helperAsk = false },
+            containerColor = Surface,
+            title = { Text("Установить помощника блокировки?", color = TextPrimary) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Помощник — небольшая служба Windows с правами администратора. Он ставится один раз и потом по запросу агента блокирует " +
+                            "подсети, с которых подбирают пароль, без запросов на ПК — даже когда вас нет рядом. Он умеет только это, принимает запросы " +
+                            "лишь от вашей учётной записи и блокирует только публичные подсети не шире /24.",
+                        color = TextSecondary,
+                    )
+                    Text(
+                        "Windows на ПК запросит права администратора — подтвердите запрос на ПК (в открытом сеансе он появится на рабочем столе).",
+                        color = TextSecondary,
+                    )
+                    if (firewallOff) {
+                        Row(Modifier.fillMaxWidth().clickable { enableFirewall = !enableFirewall }, verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = enableFirewall, onCheckedChange = { enableFirewall = it },
+                                colors = CheckboxDefaults.colors(checkedColor = Accent, uncheckedColor = TextSecondary),
+                            )
+                            Text("Включить брандмауэр Windows (иначе блокировки не будут работать)", color = TextPrimary, fontSize = 14.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { helperAsk = false; onHelper(true, firewallOff && enableFirewall) }) { Text("Установить", color = Accent) } },
+            dismissButton = { TextButton(onClick = { helperAsk = false }) { Text("Отмена", color = TextSecondary) } },
+        )
+    }
     if (strictAsk) {
         val n = state?.whitelist?.size ?: 0
         AlertDialog(
@@ -369,6 +433,36 @@ private fun ThreatCard(t: GuardThreat, linked: Boolean, onBlock: () -> Unit, onT
             PillButton("Вся подсеть", SurfaceButton, enabled = linked, modifier = Modifier.weight(1f), onClick = onTrustSubnet)
             PillButton("Оставить", SurfaceButton, enabled = linked, modifier = Modifier.weight(1f), onClick = onKeep)
         }
+    }
+}
+
+/** Автоблокировка: включение, порог неудачных попыток и состояние помощника блокировки на ПК. */
+@Composable
+private fun BanCard(state: GuardState, linked: Boolean, onAutoBan: (Boolean) -> Unit, onBanAfter: (Int) -> Unit, onHelper: () -> Unit) {
+    val shape = RoundedCornerShape(14.dp)
+    Column(
+        Modifier.fillMaxWidth().clip(shape).background(SurfaceCard).padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text("Блокировать подсеть автоматически", color = TextSecondary, fontSize = 12.sp)
+        Choice(listOf("Включена", "Выключена"), if (state.autoBan) 0 else 1, linked) { onAutoBan(it == 0) }
+        if (state.autoBan) {
+            val options = GuardText.banAfterOptions(state.banAfter)
+            Text("После неудачных попыток входа (за час, с одной подсети)", color = TextSecondary, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+            Choice(options.map { it.toString() }, options.indexOf(state.banAfter), linked) { onBanAfter(options[it]) }
+            Text(
+                "Свои и знакомые адреса не блокируются. Подсеть блокируется целиком (/24, IPv6 — /64), если в ней нет знакомого адреса, иначе — один адрес.",
+                color = TextSecondary, fontSize = 12.sp,
+            )
+        }
+        Text(
+            if (state.helper) "Помощник блокировки на ПК: установлен, блокировки идут без запросов." else "Помощник блокировки на ПК: не установлен.",
+            color = if (state.helper) TextSecondary else DangerRed, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp),
+        )
+        PillButton(
+            if (state.helper) "Удалить помощника" else "Установить помощника", if (state.helper) SurfaceButton else Accent,
+            enabled = linked, modifier = Modifier.fillMaxWidth(), onClick = onHelper,
+        )
     }
 }
 

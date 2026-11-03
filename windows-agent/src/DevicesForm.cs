@@ -195,12 +195,12 @@ namespace HiWebAgent
         }
     }
 
-    /// <summary>Однострочный диалог ввода: имя устройства, не длиннее 40 символов.</summary>
+    /// <summary>Однострочный диалог ввода: имя устройства или «диска», не длиннее 40 символов.</summary>
     sealed class RenameDialog : ThemedForm
     {
         readonly ThemedInput input = new ThemedInput();
 
-        RenameDialog(string title, string value)
+        RenameDialog(string title, string value, string note)
         {
             Text = title;
             FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -209,7 +209,7 @@ namespace HiWebAgent
             int m = Ui.Px(this, 22);
             ClientSize = new Size(Ui.Px(this, 440), Ui.Px(this, 190));
 
-            var hint = MakeLabel("Так устройство называется в меню агента.", true);
+            var hint = MakeLabel(note, true);
             hint.SetBounds(m, m, ClientSize.Width - m * 2, Font.Height + 4);
 
             input.Font = Font;
@@ -238,7 +238,13 @@ namespace HiWebAgent
         /// <summary>Новое имя или null, если пользователь отменил ввод.</summary>
         public static string Ask(IWin32Window owner, string title, string value)
         {
-            using (var dialog = new RenameDialog(title, value))
+            return Ask(owner, title, value, "Так устройство называется в меню агента.");
+        }
+
+        /// <summary>То же с подсказкой под заголовком.</summary>
+        public static string Ask(IWin32Window owner, string title, string value, string note)
+        {
+            using (var dialog = new RenameDialog(title, value, note))
             {
                 return dialog.ShowDialog(owner) == DialogResult.OK ? dialog.input.Box.Text.Trim() : null;
             }

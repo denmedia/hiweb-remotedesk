@@ -40,6 +40,9 @@ namespace HiWebAgent
         readonly ToolStripMenuItem screenItem = new ToolStripMenuItem("Обновлять превью ПК на планшете (снимок экрана раз в 15 мин)");
         readonly System.Windows.Forms.Timer screenTimer = new System.Windows.Forms.Timer();
         readonly System.Windows.Forms.Timer screenSoon = new System.Windows.Forms.Timer();
+        readonly ToolStripMenuItem filesItem = new ToolStripMenuItem("Доступ к файлам…");
+        SharesForm sharesForm;
+        readonly FileService files;
         readonly ToolStripMenuItem guardItem = new ToolStripMenuItem("Защита подключений…");
         readonly ToolStripMenuItem guardWatchItem = new ToolStripMenuItem("Следить за подключениями по RDP и предупреждать о подозрительных");
         readonly ConnectionGuard guard;
@@ -110,6 +113,7 @@ namespace HiWebAgent
                 if (screenItem.Checked) RequestScreen(1000);
             };
             guardItem.Click += delegate { ShowGuard(null); };
+            filesItem.Click += delegate { ShowShares(); };
             guardWatchItem.CheckOnClick = true;
             guardWatchItem.Checked = ReadSetting("GuardRdp", 1) != 0;
             guardWatchItem.CheckedChanged += delegate
@@ -127,7 +131,7 @@ namespace HiWebAgent
             switchItem.Font = new Font(switchItem.Font, FontStyle.Bold);
             switchItem.Click += delegate { SwitchToCurrent(); };
             devicesItem.Click += delegate { ShowDevices(); };
-            menu.Items.AddRange(new ToolStripItem[] { switchItem, devicesItem, guardItem, new ToolStripSeparator(), statusItem, forwardItem, accessItem, checkItem, touchItem, screenItem, guardWatchItem, new ToolStripSeparator(), versionItem, uninstallItem, exitItem });
+            menu.Items.AddRange(new ToolStripItem[] { switchItem, devicesItem, filesItem, guardItem, new ToolStripSeparator(), statusItem, forwardItem, accessItem, checkItem, touchItem, screenItem, guardWatchItem, new ToolStripSeparator(), versionItem, uninstallItem, exitItem });
             menu.Opening += delegate
             {
                 accessItem.Visible = watcher.Status != UserNotificationListenerAccessStatus.Allowed;
@@ -184,6 +188,17 @@ namespace HiWebAgent
                 return list;
             };
             lan.GuardCommand = (msg, reply) => ui.Post(delegate { OnGuardCommand(msg, reply); }, null);
+            // Данные самого агента (журналы, настройки защиты) наружу не отдаются, даже если открыта папка, в которой они лежат.
+            lock (SharePaths.Forbidden) SharePaths.Forbidden.Add(AgentInfo.InstallDir);
+            files = new FileService(FileSharing.Current);
+            lan.Files = files;
+            FileSharing.Changed += delegate
+            {
+                // Устройства узнают о новых «дисках» сразу, не дожидаясь очередного caps.
+                ThreadPool.QueueUserWorkItem(delegate { lan.SendCaps(); });
+                ui.Post(delegate { UpdateFilesItem(); if (sharesForm != null) sharesForm.RefreshAll(); }, null);
+            };
+            UpdateFilesItem();
             lan.Start();
 
             guard = new ConnectionGuard(ui);
@@ -493,6 +508,16 @@ namespace HiWebAgent
             if (u.State) Broadcast(guardState);
             if (u.Entries.Count > 0) Broadcast(guard.EntriesMessage(u.Entries));
             if (u.Threats.Count > 0) Broadcast(guard.ThreatsMessage(u.Threats));
+            // Устройства уведомляют о каждой неудачной попытке входа и о каждой блокировке.
+            foreach (FailNote f in u.Fails) Broadcast(guard.FailMessage(f));
+            foreach (BanNote b in u.Bans)
+            {
+                Broadcast(guard.BanMessage(b));
+                // Щелчок по подсказке открывает окно защиты (без выбора угрозы).
+                lastThreatId = null;
+                balloonIsThreat = true;
+                tray.ShowBalloonTip(15000, GuardText.BanTitle(b), GuardText.BanText(b), b.Ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+            }
             foreach (Threat t in u.Announce)
             {
                 lastThreatId = t.Id;
@@ -509,6 +534,30 @@ namespace HiWebAgent
         {
             Send(msg);
             ThreadPool.QueueUserWorkItem(delegate { lan.Send(msg); });
+        }
+
+        void UpdateFilesItem()
+        {
+            ShareConfig config = FileSharing.Current();
+            filesItem.Text = config.Enabled && config.Shares.Count > 0
+                ? "Доступ к файлам… (открыто папок: " + config.Shares.Count + ")"
+                : "Доступ к файлам…";
+        }
+
+        void ShowShares()
+        {
+            if (sharesForm == null)
+            {
+                sharesForm = new SharesForm();
+                sharesForm.FormClosed += delegate { sharesForm = null; };
+                sharesForm.Show();
+            }
+            else
+            {
+                sharesForm.RefreshAll();
+                if (sharesForm.WindowState == FormWindowState.Minimized) sharesForm.WindowState = FormWindowState.Normal;
+            }
+            sharesForm.Activate();
         }
 
         void UpdateGuardItem()
@@ -568,7 +617,15 @@ namespace HiWebAgent
                     reply(GuardResult(action, untrustTarget, guard.Untrust(untrustTarget)));
                     break;
                 case "settings":
-                    reply(GuardResult(action, "", guard.Configure(Str(msg, "mode"), OptBool(msg, "autoLearn"), OptBool(msg, "learnSubnet"))));
+                    object after;
+                    int? banAfter = msg.TryGetValue("banAfter", out after) && after != null ? (int?)Convert.ToInt32(after) : null;
+                    reply(GuardResult(action, "", guard.Configure(Str(msg, "mode"), OptBool(msg, "autoLearn"), OptBool(msg, "learnSubnet"),
+                        OptBool(msg, "autoBan"), banAfter)));
+                    break;
+                case "helper":
+                    // Установка и удаление помощника блокировки: запрос UAC на ПК (в сеансе RDP он виден в самом сеансе).
+                    if (Str(msg, "op") == "remove") guard.RemoveHelper(error => reply(GuardResult(action, "remove", error)));
+                    else guard.InstallHelper(Bool(msg, "enableFw", false), error => reply(GuardResult(action, "install", error)));
                     break;
                 case "dismiss":
                     guard.Dismiss(Str(msg, "id"));

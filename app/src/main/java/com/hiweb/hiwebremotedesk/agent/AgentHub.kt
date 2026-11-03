@@ -12,7 +12,12 @@ import java.io.OutputStreamWriter
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicLong
 
 /** Действия питания, которые агент умеет выполнять на ПК; [wire] — имя в протоколе. */
 enum class AgentPower(val wire: String, val title: String, val question: String, val inProgress: String) {
@@ -27,8 +32,16 @@ enum class AgentPower(val wire: String, val title: String, val question: String,
     }
 }
 
-/** ПК, агент которого сейчас на связи по локальной сети. */
-data class AgentPresence(val version: String, val host: String, val power: Set<AgentPower>)
+/** Открытая на ПК папка: на планшете она «диск» в приложении «Файлы». [id] — идентификатор в протоколе, не путь на ПК. */
+data class AgentShare(val id: String, val name: String, val write: Boolean)
+
+/** Что агент сообщил о доступе к файлам: включён ли он на ПК и какие папки открыты. */
+data class AgentFiles(val enabled: Boolean, val shares: List<AgentShare>)
+
+/**
+ * ПК, агент которого сейчас на связи по локальной сети. [files] — null, если агент старше 1.11 и файлов не умеет.
+ */
+data class AgentPresence(val version: String, val host: String, val power: Set<AgentPower>, val files: AgentFiles? = null)
 
 /**
  * Агенты на ПК, подключившиеся к планшету по локальной сети (TCP, порты — [com.hiweb.hiwebremotedesk.data.NetworkPorts.agentPorts],
@@ -45,12 +58,17 @@ object AgentHub {
 
     private class Link(val socket: Socket, val lines: SecureLines, val out: OutputStreamWriter) {
         val pending = ConcurrentHashMap<String, (String?) -> Unit>()
+        /** Файловые запросы, ждущие ответа, по номеру запроса. */
+        val fsPending = ConcurrentHashMap<Long, CompletableFuture<FsWire.Message>>()
 
         fun send(msg: JSONObject) = synchronized(this) {
             out.write(lines.sign(msg.toString()) + "\n")
             out.flush()
         }
     }
+
+    private const val FS_TIMEOUT_MS = 30_000L
+    private val fsIds = AtomicLong()
 
     private val links = ConcurrentHashMap<String, Link>()
     private val servers = ConcurrentHashMap<Int, ServerSocket>()
@@ -108,6 +126,34 @@ object AgentHub {
     fun stop() {
         servers.keys.toList().forEach(::stopPort)
         links.values.forEach { runCatching { it.socket.close() } }
+    }
+
+    /**
+     * Файловый запрос агенту ПК (протокол — windows-agent/PROTOCOL.md, «Файлы»): шифрует и подписывает его ключом сеанса,
+     * блокирует поток до ответа. Бросает [FsException]: `offline` — агент не на связи или связь оборвалась, `timeout` —
+     * агент не ответил за [timeoutMs]. Ошибки самой операции (`ok: false`) разбирает [PcFiles]. Только из фонового потока.
+     */
+    fun fsCall(deviceId: String, header: org.json.JSONObject, payload: ByteArray = ByteArray(0), timeoutMs: Long = FS_TIMEOUT_MS): FsWire.Message {
+        val link = links[deviceId] ?: throw FsException("offline", FsErrors.text("offline", null))
+        val id = fsIds.incrementAndGet()
+        val future = CompletableFuture<FsWire.Message>()
+        link.fsPending[id] = future
+        try {
+            val (iv, data) = link.lines.encrypt(FsWire.pack(header, payload))
+            val b64 = java.util.Base64.getEncoder()
+            try {
+                link.send(JSONObject().put("t", "fs").put("id", id).put("iv", b64.encodeToString(iv)).put("data", b64.encodeToString(data)))
+            } catch (e: Exception) {
+                throw FsException("offline", FsErrors.text("offline", null))
+            }
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            throw FsException("timeout", FsErrors.text("timeout", null))
+        } catch (e: ExecutionException) {
+            throw (e.cause as? FsException ?: FsException("io", FsErrors.text("io", null)))
+        } finally {
+            link.fsPending.remove(id)
+        }
     }
 
     /**
@@ -180,8 +226,23 @@ object AgentHub {
             runCatching { socket.close() }
             if (links.remove(pc, link)) _presence.update { it - pc }
             link.pending.values.forEach { it("Связь с агентом прервалась") }
+            link.fsPending.values.forEach { it.completeExceptionally(FsException("offline", FsErrors.text("offline", null))) }
             Log.i(TAG, "agent of $pc disconnected")
         }
+    }
+
+    /** Поле `fs` сообщения caps; null (агент старше 1.11 его не шлёт) — файлов нет. */
+    internal fun parseFiles(fs: JSONObject?): AgentFiles? {
+        if (fs == null) return null
+        val arr = fs.optJSONArray("shares")
+        val shares = buildList {
+            for (i in 0 until (arr?.length() ?: 0)) {
+                val o = arr!!.optJSONObject(i) ?: continue
+                val id = o.optString("id")
+                if (id.isNotEmpty()) add(AgentShare(id, o.optString("name").ifBlank { id }, o.optBoolean("w")))
+            }
+        }
+        return AgentFiles(fs.optBoolean("on"), shares)
     }
 
     private fun handle(pc: String, link: Link, msg: JSONObject) {
@@ -189,8 +250,17 @@ object AgentHub {
             "caps" -> {
                 val arr = msg.optJSONArray("power")
                 val power = buildSet { for (i in 0 until (arr?.length() ?: 0)) AgentPower.fromWire(arr!!.optString(i))?.let { add(it) } }
-                val presence = AgentPresence(msg.optString("ver"), msg.optString("host"), power)
+                val presence = AgentPresence(msg.optString("ver"), msg.optString("host"), power, parseFiles(msg.optJSONObject("fs")))
                 _presence.update { it + (pc to presence) }
+            }
+            "fs" -> {
+                val id = msg.optLong("id", -1)
+                val future = link.fsPending[id] ?: return
+                val b64 = java.util.Base64.getDecoder()
+                val reply = runCatching {
+                    link.lines.decrypt(b64.decode(msg.optString("iv")), b64.decode(msg.optString("data")))?.let(FsWire::unpack)
+                }.getOrNull()
+                if (reply == null) future.completeExceptionally(FsException("io", "Ответ ПК испорчен.")) else future.complete(reply)
             }
             "status" -> onStatus(pc, msg)
             "screen" -> {

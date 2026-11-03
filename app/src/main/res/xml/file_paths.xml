@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Файлы, которые приложение отдаёт другим приложениям через FileProvider -->
+<paths>
+    <!-- Картинка с QR-кодом ПК для «Поделиться» -->
+    <cache-path name="shared" path="shared/" />
+</paths>

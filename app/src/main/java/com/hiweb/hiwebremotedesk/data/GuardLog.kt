@@ -68,6 +68,37 @@ data class GuardThreat(
 
 data class GuardBlocked(val cidr: String, val enabled: Boolean)
 
+/**
+ * Неудачная попытка входа на ПК (сообщение `guard_fail`): агент шлёт её на каждую попытку, планшет показывает уведомление.
+ * [count] — попыток с этой подсети за час, считая эту (0 у своих и знакомых адресов); [willBan] — эта попытка достигла порога.
+ */
+data class GuardFailNote(
+    val id: String,
+    val time: Long,
+    val ip: String,
+    val cidr: String,
+    val count: Int,
+    val local: Boolean,
+    val known: Boolean,
+    val autoBan: Boolean,
+    val banAfter: Int,
+    val willBan: Boolean,
+)
+
+/** Подсеть заблокирована или автоблокировка не удалась (сообщение `guard_ban`). [count] = 0 — блокировка вручную. */
+data class GuardBanNote(
+    val id: String,
+    val time: Long,
+    val cidr: String,
+    val ip: String,
+    val count: Int,
+    val auto: Boolean,
+    val ok: Boolean,
+    /** Правило записано, но брандмауэр на ПК выключен — оно не действует. */
+    val firewallOff: Boolean,
+    val error: String,
+)
+
 /** Запись белого списка на ПК: адрес или подсеть; [manual] — добавлена пользователем, иначе запомнена по подключению планшета. */
 data class GuardWhitelistEntry(val cidr: String, val manual: Boolean, val time: Long = 0L)
 
@@ -84,8 +115,15 @@ data class GuardState(
     /** Запоминать сразу всю подсеть, а не один адрес. */
     val learnSubnet: Boolean = false,
     val whitelist: List<GuardWhitelistEntry> = emptyList(),
+    /** Блокировать подсеть автоматически после [banAfter] неудачных попыток. */
+    val autoBan: Boolean = true,
+    /** Порог автоблокировки; 0 — агент старше 1.10, автоблокировки у него нет (настройки в приложении скрыты). */
+    val banAfter: Int = 0,
+    /** Помощник блокировки установлен на ПК: блокировка идёт без запроса UAC, в том числе сама. */
+    val helper: Boolean = false,
 ) {
     val supportsWhitelist: Boolean get() = mode != null
+    val supportsAutoBan: Boolean get() = banAfter > 0
     val whitelistMode: Boolean get() = mode == MODE_WHITELIST
 
     companion object {
@@ -138,6 +176,22 @@ object GuardJournal {
     }
 }
 
+/**
+ * Недавно виденные идентификаторы сообщений. Агент рассылает неудачные входы и блокировки и по сеансу RDP, и по локальной
+ * сети: планшет, на связи по обоим путям, получает каждое сообщение дважды, а уведомление нужно одно.
+ */
+class RecentIds(private val capacity: Int = 128) {
+    private val ids = LinkedHashSet<String>()
+
+    /** true — идентификатор видим впервые (и запоминается), false — повтор. */
+    @Synchronized
+    fun firstTime(id: String): Boolean {
+        if (!ids.add(id)) return false
+        while (ids.size > capacity) ids.remove(ids.first())
+        return true
+    }
+}
+
 /** Тексты о подключениях и угрозах для списка, диалога и уведомлений. */
 object GuardText {
     fun time(ms: Long): String = SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(Date(ms))
@@ -163,6 +217,45 @@ object GuardText {
         val base = "$who вошёл в сеанс с ${t.ip}, но планшет к сеансу не подключился."
         return if (t.afterFail) "$base Перед этим было ${t.count} неудачных попыток входа — пароль могли подобрать!" else base
     }
+
+    fun failTitle(n: GuardFailNote): String = when {
+        n.willBan -> "Блокировка подсети после неудачных попыток входа"
+        n.local -> "Неудачный вход по RDP (своя сеть)"
+        n.known -> "Неудачный вход по RDP (знакомый адрес)"
+        else -> "Неудачный вход по RDP"
+    }
+
+    fun failText(n: GuardFailNote): String {
+        val who = when {
+            n.local -> "Неверный пароль, адрес ${n.ip} из своей сети"
+            n.known -> "Неверный пароль, знакомый адрес ${n.ip}"
+            n.count > 1 -> "Неверный пароль, попытка №${n.count} с ${n.ip} (подсеть ${n.cidr})"
+            else -> "Неверный пароль, попытка с ${n.ip} (подсеть ${n.cidr})"
+        }
+        if (n.local || n.known) return who
+        return when {
+            n.willBan -> "$who. Достигнут порог в ${n.banAfter}: подсеть блокируется"
+            n.autoBan -> "$who. До блокировки: ${(n.banAfter - n.count).coerceAtLeast(0)}"
+            else -> "$who. Автоблокировка выключена"
+        }
+    }
+
+    fun banTitle(n: GuardBanNote): String = when {
+        !n.ok -> "Не удалось заблокировать ${n.cidr}"
+        n.auto -> "Подсеть заблокирована автоматически"
+        else -> "Подсеть заблокирована"
+    }
+
+    fun banText(n: GuardBanNote): String {
+        if (!n.ok) return n.error.ifBlank { "Не удалось заблокировать ${n.cidr}" }
+        val base = if (n.auto) "${n.cidr} заблокирована после ${n.count} неудачных попыток входа" else "Заблокирована подсеть ${n.cidr}"
+        return if (n.firewallOff) "$base. Брандмауэр Windows на ПК выключен — правило не действует, пока он не включён" else base
+    }
+
+    /** Значения порога автоблокировки для выбора: стандартные и, если с ПК задано другое, оно тоже. */
+    fun banAfterOptions(current: Int): List<Int> = (BAN_AFTER_PRESETS + current).filter { it > 0 }.distinct().sorted()
+
+    val BAN_AFTER_PRESETS = listOf(2, 3, 5, 10, 20)
 
     fun entryText(e: GuardEntry): String {
         val user = if (e.user.isBlank()) "" else " (${e.user})"

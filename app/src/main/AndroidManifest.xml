@@ -102,6 +102,29 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/key_capture_service" />
         </service>
+        <!-- Папки ПК, открытые агентом, как «диски» в файловом менеджере и выборе файлов (PcDocumentsProvider).
+             Обращаться напрямую может только система (MANAGE_DOCUMENTS); приложениям доступ выдаётся по каждому файлу. -->
+        <provider
+            android:name=".agent.PcDocumentsProvider"
+            android:authorities="${applicationId}.pcfiles"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <!-- Отправка картинки с QR-кодом ПК («Поделиться») в другие приложения -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

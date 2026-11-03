@@ -69,6 +69,22 @@ namespace HiWebAgent
             }
         }
 
+        public static string BanTitle(BanNote n)
+        {
+            if (!n.Ok) return "Не удалось заблокировать " + n.Cidr;
+            return n.Auto ? "Подсеть заблокирована автоматически" : "Подсеть заблокирована";
+        }
+
+        public static string BanText(BanNote n)
+        {
+            if (!n.Ok) return n.Error ?? "";
+            string text = n.Auto
+                ? n.Cidr + " заблокирована после " + n.Count + " неудачных попыток входа"
+                : "Заблокирована подсеть " + n.Cidr;
+            if (n.FirewallOff) text += ". Брандмауэр Windows выключен — правило не действует, пока он не включён";
+            return text;
+        }
+
         public static string StatusText(string status)
         {
             switch (status)
@@ -96,7 +112,13 @@ namespace HiWebAgent
         readonly ThemedList whiteList = new ThemedList();
         readonly SegmentTabs modeTabs = new SegmentTabs();
         readonly SegmentTabs learnTabs = new SegmentTabs();
+        readonly SegmentTabs banTabs = new SegmentTabs();
+        readonly SegmentTabs banAfterTabs = new SegmentTabs();
+        readonly Panel banSettings = new Panel();
         readonly Panel whiteSettings = new Panel();
+        readonly int[] banAfterPresets = { 2, 3, 5, 10, 20 };
+        int[] banAfterShown;
+        readonly PillButton helperButton;
         readonly Label firewallNote = new Label();
         readonly PillButton blockButton;
         readonly PillButton trustButton;
@@ -139,6 +161,14 @@ namespace HiWebAgent
             whiteSettings.Controls.Add(SettingRow("Запоминать адрес планшета", learnTabs));
             whiteSettings.Controls.Add(SettingRow("Режим защиты", modeTabs));
 
+            banTabs.Items = new[] { "Включена", "Выключена" };
+            banTabs.SelectedIndexChanged += delegate { if (!refreshing) ChangeBan(); };
+            banAfterTabs.SelectedIndexChanged += delegate { if (!refreshing) ChangeBanAfter(); };
+            banSettings.Dock = DockStyle.Top;
+            banSettings.BackColor = Color.Transparent;
+            banSettings.Controls.Add(SettingRow("После неудачных попыток", banAfterTabs));
+            banSettings.Controls.Add(SettingRow("Автоблокировка подсети", banTabs));
+
             var card = new Card();
             card.Dock = DockStyle.Fill;
             card.Controls.Add(threatList);
@@ -146,6 +176,7 @@ namespace HiWebAgent
             card.Controls.Add(blockedList);
             card.Controls.Add(whiteList);
             card.Controls.Add(whiteSettings);
+            card.Controls.Add(banSettings);
 
             var header = MakeLabel("Защита подключений", false);
             header.Font = new Font(Font.FontFamily, Font.Size * 1.65f, FontStyle.Bold, Font.Unit);
@@ -175,8 +206,9 @@ namespace HiWebAgent
             unblockButton = new PillButton("Разблокировать…", PillKind.Primary, "\uE785", delegate { UnblockSelected(); });
             addWhiteButton = new PillButton("Добавить…", PillKind.Primary, "\uE710", delegate { AddToWhitelist(); });
             removeWhiteButton = new PillButton("Убрать из списка", PillKind.Normal, "\uE74D", delegate { RemoveFromWhitelist(); });
+            helperButton = new PillButton("Установить помощника…", PillKind.Primary, "\uE72E", delegate { ChangeHelper(); });
             var closeButton = new PillButton("Закрыть", PillKind.Normal, null, delegate { Close(); });
-            foreach (PillButton b in new[] { blockButton, trustButton, trustSubnetButton, dismissButton, unblockButton, addWhiteButton, removeWhiteButton })
+            foreach (PillButton b in new[] { blockButton, trustButton, trustSubnetButton, dismissButton, unblockButton, helperButton, addWhiteButton, removeWhiteButton })
             {
                 bar.LeftFlow.Controls.Add(b);
             }
@@ -217,7 +249,7 @@ namespace HiWebAgent
         {
             threatList.Visible = tabs.SelectedIndex == 0;
             entryList.Visible = tabs.SelectedIndex == 1;
-            blockedList.Visible = tabs.SelectedIndex == 2;
+            blockedList.Visible = banSettings.Visible = tabs.SelectedIndex == 2;
             whiteList.Visible = whiteSettings.Visible = tabs.SelectedIndex == 3;
         }
 
@@ -242,16 +274,19 @@ namespace HiWebAgent
 
         void FitSettings()
         {
-            int total = 0;
-            foreach (Control row in whiteSettings.Controls)
+            foreach (Panel panel in new[] { whiteSettings, banSettings })
             {
-                var control = row.Tag as SegmentTabs;
-                if (control == null) continue;
-                row.Height = control.Height + Ui.Px(this, 6);
-                row.Controls[0].Height = control.Height;
-                total += row.Height;
+                int total = 0;
+                foreach (Control row in panel.Controls)
+                {
+                    var control = row.Tag as SegmentTabs;
+                    if (control == null) continue;
+                    row.Height = control.Height + Ui.Px(this, 6);
+                    row.Controls[0].Height = control.Height;
+                    total += row.Height;
+                }
+                panel.Height = total;
             }
-            whiteSettings.Height = total;
         }
 
         protected override void OnShown(EventArgs e)
@@ -268,6 +303,18 @@ namespace HiWebAgent
                     ? "Белый список: тревога на любую попытку входа с адреса, которого нет в списке. Знакомые адреса и подсети (и своя сеть) не проверяются. Блокировка — через брандмауэр, с подтверждением на ПК."
                     : "Обычный режим: тревога после " + ThreatDetector.FailThreshold + " неудачных попыток за 10 минут и при входе, к которому планшет не подключился. Адреса из списка не проверяются.";
                 firewallNote.ForeColor = Theme.P.Muted;
+                return;
+            }
+            if (tabs.SelectedIndex == 2)
+            {
+                bool problem = !guard.HelperOn && guard.AutoBan || !guard.FirewallOn;
+                firewallNote.Text = !guard.HelperOn
+                    ? (guard.AutoBan ? "Автоблокировка включена, но помощник не установлен: подсеть не будет заблокирована сама. " : "")
+                        + "Помощник — маленькая служба Windows: ставится один раз (запрос прав администратора), потом блокирует подсети без запросов, даже когда вас нет у ПК."
+                    : !guard.FirewallOn
+                        ? "Брандмауэр Windows выключен: правила блокировки не действуют, пока он не включён. Включить его можно при блокировке вручную (RDP останется доступен)."
+                        : "Помощник на связи: подсеть блокируется сама после " + guard.BanAfter + " неудачных попыток входа за час (свои и знакомые адреса не блокируются).";
+                firewallNote.ForeColor = problem ? Theme.P.Danger : Theme.P.Muted;
                 return;
             }
             firewallNote.Text = guard.FirewallOn
@@ -365,6 +412,9 @@ namespace HiWebAgent
             refreshing = true;
             modeTabs.SelectedIndex = guard.Mode == GuardMode.Whitelist ? 1 : 0;
             learnTabs.SelectedIndex = !guard.AutoLearn ? 0 : guard.LearnSubnet ? 2 : 1;
+            banTabs.SelectedIndex = guard.AutoBan ? 0 : 1;
+            ShowBanAfter();
+            helperButton.Text = guard.HelperOn ? "Удалить помощника…" : "Установить помощника…";
             refreshing = false;
             UpdateNote();
             UpdateButtons();
@@ -400,7 +450,8 @@ namespace HiWebAgent
             bool onThreats = tabs.SelectedIndex == 0;
             bool open = t != null && t.Status == Threat.StatusNew;
             blockButton.Visible = trustButton.Visible = trustSubnetButton.Visible = dismissButton.Visible = onThreats;
-            unblockButton.Visible = tabs.SelectedIndex == 2;
+            unblockButton.Visible = helperButton.Visible = tabs.SelectedIndex == 2;
+            helperButton.Enabled = !busy;
             addWhiteButton.Visible = removeWhiteButton.Visible = tabs.SelectedIndex == 3;
             blockButton.Enabled = open && !busy;
             trustButton.Enabled = open && !busy;
@@ -495,6 +546,73 @@ namespace HiWebAgent
         void ChangeLearn()
         {
             guard.Configure(null, learnTabs.SelectedIndex != 0, learnTabs.SelectedIndex == 2);
+        }
+
+        void ChangeBan()
+        {
+            guard.Configure(null, null, null, banTabs.SelectedIndex == 0, null);
+        }
+
+        void ChangeBanAfter()
+        {
+            if (banAfterShown == null || banAfterTabs.SelectedIndex < 0 || banAfterTabs.SelectedIndex >= banAfterShown.Length) return;
+            guard.Configure(null, null, null, null, banAfterShown[banAfterTabs.SelectedIndex]);
+        }
+
+        /// <summary>Порог автоблокировки: стандартные значения и, если задано другое (например, с планшета), оно тоже.</summary>
+        void ShowBanAfter()
+        {
+            var values = new List<int>(banAfterPresets);
+            if (!values.Contains(guard.BanAfter)) values.Add(guard.BanAfter);
+            values.Sort();
+            int[] shown = values.ToArray();
+            if (banAfterShown == null || !SameValues(banAfterShown, shown))
+            {
+                banAfterShown = shown;
+                var titles = new string[shown.Length];
+                for (int i = 0; i < shown.Length; i++) titles[i] = shown[i].ToString();
+                banAfterTabs.Items = titles;
+            }
+            banAfterTabs.SelectedIndex = Array.IndexOf(banAfterShown, guard.BanAfter);
+        }
+
+        static bool SameValues(int[] a, int[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        /// <summary>Установка помощника блокировки (один запрос UAC) или удаление, если он уже есть.</summary>
+        void ChangeHelper()
+        {
+            if (busy) return;
+            if (guard.HelperOn)
+            {
+                if (ThemedBox.Show(this, "Удалить помощника блокировки? Автоблокировка перестанет работать; уже заблокированные подсети останутся заблокированными.\nWindows запросит права администратора.",
+                    AgentInfo.Product, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+                Run(delegate(Action<string> done) { guard.RemoveHelper(done); });
+                return;
+            }
+            bool enableFirewall = false;
+            string text = "Помощник — небольшая служба Windows с правами администратора. Он ставится один раз и потом по запросу агента добавляет правила брандмауэра "
+                + "для подсетей, с которых подбирают пароль, без запросов на ПК. Он умеет только это и принимает запросы лишь от вашей учётной записи: "
+                + "блокирует публичные подсети не шире /24.\nWindows запросит права администратора.";
+            if (!guard.FirewallOn)
+            {
+                DialogResult answer = ThemedBox.Show(this,
+                    text + "\n\nБрандмауэр Windows на этом ПК выключен, и правила блокировки не будут работать. Включить его при установке? "
+                    + "Входящий RDP останется разрешён; остальные входящие подключения, которые не разрешены правилами, будут блокироваться.\n\n"
+                    + "Да — установить и включить брандмауэр\nНет — только установить",
+                    AgentInfo.Product, MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (answer == DialogResult.Cancel) return;
+                enableFirewall = answer == DialogResult.Yes;
+            }
+            else if (ThemedBox.Show(this, text + "\n\nУстановить?", AgentInfo.Product, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            {
+                return;
+            }
+            Run(delegate(Action<string> done) { guard.InstallHelper(enableFirewall, done); });
         }
 
         void AddToWhitelist()

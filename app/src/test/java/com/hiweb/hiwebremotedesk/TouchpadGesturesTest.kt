@@ -43,36 +43,98 @@ class TouchpadGesturesTest {
         gestures.scrollRelease(100)
     }
 
+    private fun horizontalTotal() = log.filter { it.startsWith("H") }.sumOf { it.drop(1).toInt() }
+
     @Test
-    fun horizontal_swipe_right_goes_back_with_alt_left() {
+    fun horizontal_two_finger_swipe_scrolls_horizontally_without_keys() {
+        // 300 px жеста = 5 щелчков, тачпад ослаблен вдвое: 2,5 щелчка = 300 единиц.
         horizontalSwipe(-300f)
-        assertEquals(listOf("+38", "+4be", "-4be", "-38"), log)
+        assertTrue("sum=${horizontalTotal()}", horizontalTotal() in -300..-299)
+        assertTrue(log.all { it.startsWith("H") }) // только колесо, без клавиш и вертикали
     }
 
     @Test
-    fun horizontal_swipe_left_goes_forward_with_alt_right() {
+    fun horizontal_swipe_direction_follows_sign_of_distance() {
         horizontalSwipe(300f)
-        assertEquals(listOf("+38", "+4de", "-4de", "-38"), log)
+        assertTrue("sum=${horizontalTotal()}", horizontalTotal() in 299..300)
     }
 
     @Test
-    fun short_horizontal_swipe_does_nothing() {
+    fun short_horizontal_swipe_still_scrolls_a_little() {
         horizontalSwipe(-60f)
-        assertTrue(log.isEmpty())
+        assertTrue("sum=${horizontalTotal()}", horizontalTotal() in -60..-59)
     }
 
     @Test
-    fun horizontal_swipe_does_not_scroll_or_fling() {
-        horizontalSwipe(-300f)
-        assertTrue(log.none { it.startsWith("V") || it.startsWith("H") })
-        assertTrue(!gestures.isFlinging)
+    fun fast_horizontal_swipe_continues_by_inertia() {
+        repeat(12) { gestures.scrollDistance(-30f, 0f, it * 8L) }
+        gestures.scrollRelease(12 * 8L)
+        assertTrue(gestures.isFlinging)
+        log.clear()
+        gestures.flingStep(12 * 8L + 16)
+        assertTrue(log.isNotEmpty() && log.all { it.startsWith("H") && it.drop(1).toInt() < 0 })
     }
 
     @Test
-    fun vertical_scroll_with_sideways_drift_is_not_navigation() {
+    fun mostly_vertical_swipe_with_sideways_component_stays_vertical() {
+        // 150 px вбок на 400 px вниз — угол меньше порога диагонали: горизонталь отбрасывается.
         horizontalSwipe(-150f, TouchpadGestures.PIXELS_PER_NOTCH_V * -20f)
         assertTrue(log.none { it.startsWith("+") })
         assertTrue(log.any { it.startsWith("V") })
+        assertTrue(log.none { it.startsWith("H") })
+    }
+
+    @Test
+    fun finger_jitter_does_not_scroll_sideways_during_vertical_scroll() {
+        // Пальцы едут вниз и «дрожат» вбок на ±12 px: чистый сдвиг вбок не набирается.
+        repeat(30) { gestures.scrollDistance(if (it % 2 == 0) 12f else -12f, 20f, it * 8L) }
+        gestures.scrollRelease(30 * 8L)
+        assertTrue(log.any { it.startsWith("V") })
+        assertTrue(log.none { it.startsWith("H") })
+    }
+
+    @Test
+    fun finger_jitter_does_not_scroll_vertically_during_horizontal_scroll() {
+        repeat(30) { gestures.scrollDistance(-30f, if (it % 2 == 0) 6f else -6f, it * 8L) }
+        gestures.scrollRelease(30 * 8L)
+        assertTrue(log.any { it.startsWith("H") })
+        assertTrue(log.none { it.startsWith("V") })
+    }
+
+    @Test
+    fun clear_diagonal_swipe_scrolls_both_axes() {
+        // 300 px вбок и 400 px вниз (в вертикальных щелчках: 15 и 20) — явная диагональ.
+        horizontalSwipe(-300f, TouchpadGestures.PIXELS_PER_NOTCH_V * -20f)
+        val v = log.filter { it.startsWith("V") }.sumOf { it.drop(1).toInt() }
+        assertTrue("v=$v", v > 0)
+        assertTrue("h=${horizontalTotal()}", horizontalTotal() in -300..-299) // 5 щелчков × 0,5 × 120
+    }
+
+    @Test
+    fun vertical_scroll_turning_diagonal_starts_scrolling_sideways() {
+        repeat(10) { gestures.scrollDistance(0f, 20f, it * 8L) }
+        assertTrue(log.none { it.startsWith("H") })
+        repeat(20) { gestures.scrollDistance(-30f, 20f, (10 + it) * 8L) }
+        assertTrue("h=${horizontalTotal()}", horizontalTotal() < 0)
+    }
+
+    @Test
+    fun diagonal_mode_is_reset_between_gestures() {
+        horizontalSwipe(-300f, TouchpadGestures.PIXELS_PER_NOTCH_V * -20f) // диагональ, затем отрыв пальцев
+        log.clear()
+        repeat(10) { gestures.scrollDistance(-6f, 20f, 500L + it * 8L) } // новый жест: почти вертикальный
+        assertTrue(log.any { it.startsWith("V") })
+        assertTrue(log.none { it.startsWith("H") })
+    }
+
+    @Test
+    fun diagonal_swipe_inertia_moves_both_axes() {
+        repeat(12) { gestures.scrollDistance(-30f, 40f, it * 8L) }
+        gestures.scrollRelease(12 * 8L)
+        log.clear()
+        gestures.flingStep(12 * 8L + 16)
+        assertTrue(log.any { it.startsWith("V") })
+        assertTrue(log.any { it.startsWith("H") })
     }
 
     @Test

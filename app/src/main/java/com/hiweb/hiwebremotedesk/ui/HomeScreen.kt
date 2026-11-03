@@ -39,6 +39,7 @@ import androidx.compose.material.icons.outlined.AdminPanelSettings
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.DesktopWindows
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.QrCodeScanner
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Tune
@@ -126,6 +127,9 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
     var discovery by remember { mutableStateOf(false) }
     var permissionsOpen by remember { mutableStateOf(false) }
     var updateOpen by remember { mutableStateOf(false) }
+    var sharing by remember { mutableStateOf<Device?>(null) }
+    var qrScan by remember { mutableStateOf(false) }
+    var qrDraft by remember { mutableStateOf<Device?>(null) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val permissionsTick = rememberPermissionsTick()
     // После закрытия окна права могли измениться (выдали в настройках), поэтому пересчитываем и по нему.
@@ -221,6 +225,8 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                         onLogout = { powerConfirm = it to PowerAction.LOGOUT },
                         onSettings = { editing = it },
                         onAgentPower = { d, p -> agentConfirm = d to p },
+                        onShare = { sharing = it },
+                        onQr = { qrScan = true },
                     )
                 }
             } else {
@@ -244,6 +250,7 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                         onFilter = vm::setFilter,
                         onAdd = { adding = true },
                         onDiscover = { discovery = true; vm.startScan() },
+                        onQr = { qrScan = true },
                         modifier = Modifier.width(320.dp).fillMaxHeight(),
                     )
                     Box(Modifier.fillMaxSize()) {
@@ -265,6 +272,8 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                             onLogout = { powerConfirm = it to PowerAction.LOGOUT },
                             onSettings = { editing = it },
                             onAgentPower = { d, p -> agentConfirm = d to p },
+                            onShare = { sharing = it },
+                            onQr = { qrScan = true },
                         )
                     }
                 }
@@ -282,6 +291,21 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
         DeviceEditDialog(
             device = null, newId = vm.repo::newId, onSave = vm::save, onDelete = null,
             onResetCertificate = null, onDismiss = { adding = false },
+        )
+    }
+    // QR-код с настройками ПК для другого устройства
+    sharing?.let { d -> DeviceShareDialog(device = d, onDismiss = { sharing = null }) }
+    // Сканирование QR-кода: ПК открывается в форме добавления, где его можно проверить и сохранить
+    if (qrScan) {
+        QrScanDialog(
+            onScanned = { d -> qrScan = false; qrDraft = d },
+            onDismiss = { qrScan = false },
+        )
+    }
+    qrDraft?.let { d ->
+        DeviceEditDialog(
+            device = null, draft = d, newId = vm.repo::newId, onSave = vm::save, onDelete = null,
+            onResetCertificate = null, onDismiss = { qrDraft = null },
         )
     }
     editing?.let { d ->
@@ -370,6 +394,8 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                 // Успех у этих команд виден по обновившемуся списку и настройкам; сказать нужно, только если агент отказал.
                 (r.action == "trust" || r.action == "untrust" || r.action == "settings") && !r.ok ->
                     r.error.ifBlank { "Агент не принял команду" }
+                r.action == "helper" && r.ok -> if (r.cidr == "remove") "Помощник блокировки удалён" else "Помощник блокировки установлен"
+                r.action == "helper" -> r.error.ifBlank { "Не удалось изменить помощника блокировки" }
                 else -> null
             }
             if (text != null) snackbar.showSnackbar(text)
@@ -395,6 +421,15 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
                 onUntrust = { cidr -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.untrust(id, cidr), "${com.hiweb.hiwebremotedesk.data.GuardText.cidr(cidr)} убирается из белого списка на ПК") },
                 onConfigure = { mode, autoLearn, learnSubnet ->
                     send(com.hiweb.hiwebremotedesk.agent.GuardHub.configure(id, mode, autoLearn, learnSubnet), "Настройки защиты отправлены")
+                },
+                onConfigureBan = { autoBan, banAfter ->
+                    send(com.hiweb.hiwebremotedesk.agent.GuardHub.configure(id, autoBan = autoBan, banAfter = banAfter), "Настройки автоблокировки отправлены")
+                },
+                onHelper = { install, enableFirewall ->
+                    send(
+                        com.hiweb.hiwebremotedesk.agent.GuardHub.helper(id, install, enableFirewall),
+                        "Подтвердите запрос Windows на ПК (права администратора)",
+                    )
                 },
                 onKeep = { threat -> send(com.hiweb.hiwebremotedesk.agent.GuardHub.dismiss(id, threat), "Угроза оставлена без действий") },
                 onDismiss = { com.hiweb.hiwebremotedesk.data.GuardNavigation.open.value = null },
@@ -434,11 +469,14 @@ private fun DeviceGrid(
     onLogout: (Device) -> Unit,
     onSettings: (Device) -> Unit,
     onAgentPower: (Device, AgentPower) -> Unit,
+    onShare: (Device) -> Unit,
+    onQr: () -> Unit,
 ) {
     if (visible.isEmpty()) {
         EmptyState(hasDevices = hasDevices, onAdd = onAdd, onDiscover = onDiscover, compact = compact)
         return
     }
+    val context = androidx.compose.ui.platform.LocalContext.current
     Box(Modifier.fillMaxSize()) {
         val padding = if (compact) 12.dp else 16.dp
         LazyVerticalGrid(
@@ -465,9 +503,12 @@ private fun DeviceGrid(
                     agentPower = agents[d.id]?.power,
                     onAgentPower = { onAgentPower(d, it) },
                     // Щит виден у всех ПК с Windows, активен — когда агент на связи или уже присылал журнал.
+                    filesAccess = if (d.os == OsType.WINDOWS) com.hiweb.hiwebremotedesk.agent.FilesAccess.of(agents[d.id]) else null,
+                    onFiles = { com.hiweb.hiwebremotedesk.agent.PcFilesLauncher.open(context, d.id, agents[d.id]) },
                     guardThreats = if (d.os == OsType.WINDOWS && (guard[d.id] != null || d.id in agents)) guard[d.id]?.openThreats?.size ?: 0 else null,
                     showGuard = d.os == OsType.WINDOWS,
                     onGuard = { onGuard(d) },
+                    onShare = { onShare(d) },
                 )
             }
         }
@@ -477,7 +518,12 @@ private fun DeviceGrid(
                 horizontalAlignment = Alignment.End,
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                // Поиск по сети: на телефоне это отдельная кнопка, а не половина нижнего блока панели.
+                // QR-код, поиск по сети: на телефоне это отдельные кнопки, а не нижний блок боковой панели.
+                FloatingActionButton(
+                    onClick = onQr,
+                    containerColor = SurfaceButton,
+                    contentColor = TextPrimary,
+                ) { Icon(Icons.Outlined.QrCodeScanner, QR_ADD_LABEL) }
                 FloatingActionButton(
                     onClick = onDiscover,
                     containerColor = SurfaceButton,
@@ -721,6 +767,7 @@ private fun Sidebar(
     onFilter: (DeviceFilter) -> Unit,
     onAdd: () -> Unit,
     onDiscover: () -> Unit,
+    onQr: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier.background(Surface).padding(top = 12.dp)) {
@@ -774,9 +821,12 @@ private fun Sidebar(
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().padding(14.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            BottomAction(Icons.Outlined.AddCircleOutline, "Добавить", Modifier.weight(1f), onAdd)
-            BottomAction(Icons.Filled.Sync, "Добавить\nавтоматически", Modifier.weight(1f), onDiscover)
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                BottomAction(Icons.Outlined.AddCircleOutline, "Добавить", Modifier.weight(1f), onAdd)
+                BottomAction(Icons.Filled.Sync, "Добавить\nавтоматически", Modifier.weight(1f), onDiscover)
+            }
+            QrAddAction(onQr)
         }
     }
 }
@@ -813,6 +863,21 @@ private fun SidebarRow(
         } else {
             Text("$count", color = TextSecondary, fontSize = 15.sp)
         }
+    }
+}
+
+/** Широкая кнопка «Добавить по QR-коду» под кнопками добавления в боковой панели. */
+@Composable
+private fun QrAddAction(onClick: () -> Unit) {
+    val shape = RoundedCornerShape(14.dp)
+    Row(
+        Modifier.fillMaxWidth().height(52.dp).clip(shape).background(SurfaceButton).border(1.dp, Outline, shape).clickable(onClick = onClick),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Outlined.QrCodeScanner, null, tint = Accent, modifier = Modifier.size(26.dp))
+        Spacer(Modifier.width(10.dp))
+        Text(QR_ADD_LABEL, color = TextPrimary, fontSize = 14.sp)
     }
 }
 

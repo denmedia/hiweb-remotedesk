@@ -15,8 +15,8 @@ android {
         applicationId = "com.hiweb.hiwebremotedesk"
         minSdk = 33
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -74,6 +74,11 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.jsch)
+    // QR-код с настройками ПК: создание и чтение (ZXing), сканер с камеры устройства (CameraX)
+    implementation(libs.zxing.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     testImplementation(libs.junit)
     // В JVM-тестах org.json из android.jar — заглушка; нужен настоящий (разбор ответа GitHub в AppUpdateTest)

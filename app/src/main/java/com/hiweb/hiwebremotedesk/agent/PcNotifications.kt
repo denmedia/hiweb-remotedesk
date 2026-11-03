@@ -17,6 +17,7 @@ object PcNotifications {
     const val CHANNEL_SESSION = "session"
     const val CHANNEL_SWITCH = "switch_listener"
     const val CHANNEL_SECURITY = "pc_security"
+    const val CHANNEL_GUARD_FAIL = "pc_guard_fail"
     const val SESSION_NOTIFICATION_ID = 1
     const val SWITCH_NOTIFICATION_ID = 2
     const val SWITCH_REQUEST_ID = 3
@@ -32,6 +33,12 @@ object PcNotifications {
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL_SECURITY, "Безопасность ПК", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Подбор пароля и входы по RDP с неизвестных адресов (нужен HiWeb Agent на ПК)"
+            },
+        )
+        // Каждая неудачная попытка входа — отдельный канал: его можно приглушить, не теряя сообщений о блокировках.
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_GUARD_FAIL, "Неудачные входы на ПК", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Каждая неудачная попытка входа по RDP на ПК (нужен HiWeb Agent 1.10 или новее)"
             },
         )
         nm.createNotificationChannel(

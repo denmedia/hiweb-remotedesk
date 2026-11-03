@@ -120,7 +120,7 @@ private fun PasswordField(value: String, onChange: (String) -> Unit, label: Stri
     )
 }
 
-/** Добавление и редактирование устройства (device == null — новое). */
+/** Добавление и редактирование устройства (device == null — новое; [draft] — новое с заполненными полями). */
 @Composable
 fun DeviceEditDialog(
     device: Device?,
@@ -129,45 +129,48 @@ fun DeviceEditDialog(
     onDelete: (() -> Unit)?,
     onResetCertificate: (() -> Unit)?,
     onDismiss: () -> Unit,
+    /** Заготовка нового устройства (из QR-кода): поля заполнены, но устройство по-прежнему новое. */
+    draft: Device? = null,
 ) {
-    var name by remember { mutableStateOf(device?.name ?: "") }
-    var host by remember { mutableStateOf(device?.host ?: "") }
-    var os by remember { mutableStateOf(device?.os ?: OsType.WINDOWS) }
-    var port by remember { mutableStateOf((device?.port ?: 3389).toString()) }
-    var user by remember { mutableStateOf(device?.username ?: "") }
-    var pass by remember { mutableStateOf(device?.password ?: "") }
-    var useNla by remember { mutableStateOf(device?.useNla ?: true) }
-    var scale by remember { mutableStateOf((device?.scalePercent ?: 100).toFloat()) }
-    var colorDepth by remember { mutableStateOf(device?.colorDepth ?: Device.DEFAULT_COLOR_DEPTH) }
-    var scrollPercent by remember { mutableStateOf((device?.scrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
-    var inertiaPercent by remember { mutableStateOf((device?.inertiaPercent ?: StrengthLevels.DEFAULT).toFloat()) }
-    var mouseSpeedPercent by remember { mutableStateOf((device?.mouseSpeedPercent ?: StrengthLevels.DEFAULT).toFloat()) }
-    var mouseWheelPercent by remember { mutableStateOf((device?.mouseWheelPercent ?: StrengthLevels.DEFAULT).toFloat()) }
-    var stylusScrollPercent by remember { mutableStateOf((device?.stylusScrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
-    var fileTransfer by remember { mutableStateOf(device?.fileTransfer ?: true) }
-    var hardwareVideo by remember { mutableStateOf(device?.hardwareVideo ?: true) }
-    var windowsGfx by remember { mutableStateOf(device?.windowsGfx ?: false) }
-    var nativeTouch by remember { mutableStateOf(device?.nativeTouch) }
-    var stylusMode by remember { mutableStateOf(device?.stylusMode ?: StylusMode.PEN) }
-    var stylusButton by remember { mutableStateOf(device?.stylusButton ?: StylusButtonAction.RIGHT) }
-    var palmRejection by remember { mutableStateOf(device?.palmRejection ?: true) }
-    var microphone by remember { mutableStateOf(device?.microphone ?: false) }
-    var audioCompression by remember { mutableStateOf(device?.audioCompression ?: false) }
-    var location by remember { mutableStateOf(device?.location ?: false) }
-    var camera by remember { mutableStateOf(device?.camera ?: false) }
-    val cameraOff = remember { mutableStateListOf<String>().apply { addAll(device?.cameraOff.orEmpty()) } }
-    val cameraRotation = remember { mutableStateMapOf<String, Int>().apply { putAll(device?.cameraRotation.orEmpty()) } }
-    var driveEnabled by remember { mutableStateOf(device?.driveEnabled ?: false) }
-    var driveUri by remember { mutableStateOf(device?.driveUri) }
-    var driveName by remember { mutableStateOf(device?.driveName ?: Device.DEFAULT_DRIVE_NAME) }
-    var driveReadOnly by remember { mutableStateOf(device?.driveReadOnly ?: false) }
-    var wakeMac by remember { mutableStateOf(device?.wakeMac ?: "") }
-    var agentPort by remember { mutableStateOf(device?.agentPort?.toString() ?: "") }
-    var sshPort by remember { mutableStateOf(device?.sshPort?.toString() ?: "") }
+    val seed = device ?: draft
+    var name by remember { mutableStateOf(seed?.name ?: "") }
+    var host by remember { mutableStateOf(seed?.host ?: "") }
+    var os by remember { mutableStateOf(seed?.os ?: OsType.WINDOWS) }
+    var port by remember { mutableStateOf((seed?.port ?: 3389).toString()) }
+    var user by remember { mutableStateOf(seed?.username ?: "") }
+    var pass by remember { mutableStateOf(seed?.password ?: "") }
+    var useNla by remember { mutableStateOf(seed?.useNla ?: true) }
+    var scale by remember { mutableStateOf((seed?.scalePercent ?: 100).toFloat()) }
+    var colorDepth by remember { mutableStateOf(seed?.colorDepth ?: Device.DEFAULT_COLOR_DEPTH) }
+    var scrollPercent by remember { mutableStateOf((seed?.scrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var inertiaPercent by remember { mutableStateOf((seed?.inertiaPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var mouseSpeedPercent by remember { mutableStateOf((seed?.mouseSpeedPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var mouseWheelPercent by remember { mutableStateOf((seed?.mouseWheelPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var stylusScrollPercent by remember { mutableStateOf((seed?.stylusScrollPercent ?: StrengthLevels.DEFAULT).toFloat()) }
+    var fileTransfer by remember { mutableStateOf(seed?.fileTransfer ?: true) }
+    var hardwareVideo by remember { mutableStateOf(seed?.hardwareVideo ?: true) }
+    var windowsGfx by remember { mutableStateOf(seed?.windowsGfx ?: false) }
+    var nativeTouch by remember { mutableStateOf(seed?.nativeTouch) }
+    var stylusMode by remember { mutableStateOf(seed?.stylusMode ?: StylusMode.PEN) }
+    var stylusButton by remember { mutableStateOf(seed?.stylusButton ?: StylusButtonAction.RIGHT) }
+    var palmRejection by remember { mutableStateOf(seed?.palmRejection ?: true) }
+    var microphone by remember { mutableStateOf(seed?.microphone ?: false) }
+    var audioCompression by remember { mutableStateOf(seed?.audioCompression ?: false) }
+    var location by remember { mutableStateOf(seed?.location ?: false) }
+    var camera by remember { mutableStateOf(seed?.camera ?: false) }
+    val cameraOff = remember { mutableStateListOf<String>().apply { addAll(seed?.cameraOff.orEmpty()) } }
+    val cameraRotation = remember { mutableStateMapOf<String, Int>().apply { putAll(seed?.cameraRotation.orEmpty()) } }
+    var driveEnabled by remember { mutableStateOf(seed?.driveEnabled ?: false) }
+    var driveUri by remember { mutableStateOf(seed?.driveUri) }
+    var driveName by remember { mutableStateOf(seed?.driveName ?: Device.DEFAULT_DRIVE_NAME) }
+    var driveReadOnly by remember { mutableStateOf(seed?.driveReadOnly ?: false) }
+    var wakeMac by remember { mutableStateOf(seed?.wakeMac ?: "") }
+    var agentPort by remember { mutableStateOf(seed?.agentPort?.toString() ?: "") }
+    var sshPort by remember { mutableStateOf(seed?.sshPort?.toString() ?: "") }
     val wakeMacError = wakeMac.isNotBlank() && WakeOnLan.parseMac(wakeMac) == null
     var tried by remember { mutableStateOf(false) }
     // Ручной выбор имеет приоритет: после него автоопределение больше не меняет систему и порт.
-    var osManual by remember { mutableStateOf(device != null) }
+    var osManual by remember { mutableStateOf(seed != null) }
     var portManual by remember { mutableStateOf(device != null) }
     var detecting by remember { mutableStateOf(false) }
     var detectNote by remember { mutableStateOf<String?>(null) }
@@ -557,7 +560,9 @@ fun DeviceEditDialog(
                                     Text(
                                         "Звук ПК и микрофон передаются сжатыми (ADPCM, G.711) — поток в 2–4 раза меньше, " +
                                             "полезно при медленной связи. Качество чуть ниже. Если ПК не предложит " +
-                                            "подходящего формата, звук идёт как обычно. Применяется при следующем подключении.",
+                                            "подходящего формата, звук идёт как обычно. Применяется при следующем подключении. " +
+                                            "Опыт: на Windows 11 (сборка 26100) звуковая служба ПК с этим режимом падает и звука нет — " +
+                                            "держите выключенным.",
                                         color = TextSecondary, fontSize = 12.sp,
                                     )
                                 }

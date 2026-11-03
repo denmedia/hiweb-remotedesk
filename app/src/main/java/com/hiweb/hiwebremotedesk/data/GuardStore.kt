@@ -99,6 +99,26 @@ object GuardJson {
         )
     }
 
+    /** Сообщение `guard_fail`; null — нет идентификатора (не сообщение агента). */
+    fun fail(o: JSONObject): GuardFailNote? {
+        val id = o.optString("id").ifEmpty { return null }
+        return GuardFailNote(
+            id = id, time = o.optLong("ts"), ip = o.optString("ip"), cidr = o.optString("cidr"), count = o.optInt("count"),
+            local = o.optBoolean("local"), known = o.optBoolean("known"), autoBan = o.optBoolean("autoBan", true),
+            banAfter = o.optInt("banAfter"), willBan = o.optBoolean("willBan"),
+        )
+    }
+
+    /** Сообщение `guard_ban`; null — нет идентификатора или подсети. */
+    fun ban(o: JSONObject): GuardBanNote? {
+        val id = o.optString("id").ifEmpty { return null }
+        val cidr = o.optString("cidr").ifEmpty { return null }
+        return GuardBanNote(
+            id = id, time = o.optLong("ts"), cidr = cidr, ip = o.optString("ip"), count = o.optInt("count"), auto = o.optBoolean("auto"),
+            ok = o.optBoolean("ok"), firewallOff = o.optBoolean("fwOff"), error = o.optString("error"),
+        )
+    }
+
     fun state(o: JSONObject): GuardState {
         val blocked = o.optJSONArray("blocked")
         val whitelist = o.optJSONArray("whitelist")
@@ -111,6 +131,10 @@ object GuardJson {
             mode = if (o.has("mode")) o.optString("mode", GuardState.MODE_NORMAL) else null,
             autoLearn = o.optBoolean("autoLearn", true),
             learnSubnet = o.optBoolean("learnSubnet", false),
+            // Агент старше 1.10 этих полей не шлёт: banAfter = 0 — автоблокировки у него нет.
+            autoBan = o.optBoolean("autoBan", true),
+            banAfter = o.optInt("banAfter", 0).coerceAtLeast(0),
+            helper = o.optBoolean("helper", false),
             whitelist = (0 until (whitelist?.length() ?: 0)).mapNotNull { i ->
                 whitelist!!.optJSONObject(i)?.let { w ->
                     val cidr = w.optString("cidr").ifEmpty { return@let null }
@@ -146,7 +170,9 @@ object GuardJson {
             val state = JSONObject().put("fw", s.firewallOn).put("blocked", blocked)
             // Без «mode» (старый агент) поле не пишем: после загрузки с диска поддержка белого списка не появится из ниоткуда.
             s.mode?.let { state.put("mode", it) }
-            o.put("state", state.put("autoLearn", s.autoLearn).put("learnSubnet", s.learnSubnet).put("whitelist", whitelist))
+            state.put("autoLearn", s.autoLearn).put("learnSubnet", s.learnSubnet).put("whitelist", whitelist)
+            state.put("autoBan", s.autoBan).put("banAfter", s.banAfter).put("helper", s.helper)
+            o.put("state", state)
         }
         return o
     }

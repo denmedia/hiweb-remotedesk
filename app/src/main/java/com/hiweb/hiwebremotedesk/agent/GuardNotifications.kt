@@ -9,6 +9,8 @@ import android.content.Intent
 import android.graphics.drawable.Icon
 import com.hiweb.hiwebremotedesk.MainActivity
 import com.hiweb.hiwebremotedesk.R
+import com.hiweb.hiwebremotedesk.data.GuardBanNote
+import com.hiweb.hiwebremotedesk.data.GuardFailNote
 import com.hiweb.hiwebremotedesk.data.GuardText
 import com.hiweb.hiwebremotedesk.data.GuardThreat
 
@@ -71,6 +73,53 @@ object GuardNotifications {
         )
         builder.addAction(button(context, "Это я", action(context, ACTION_TRUST, deviceId, t, id + 3)))
         context.getSystemService(NotificationManager::class.java).notify(id, builder.build())
+    }
+
+    /**
+     * Неудачная попытка входа: уведомление на каждую. Уведомление одной подсети заменяется следующим (с новым счётчиком и
+     * звуком), а не копится стопкой: при подборе пароля попыток десятки.
+     */
+    fun postFail(context: Context, deviceId: String, deviceName: String, n: GuardFailNote) {
+        if (!PcNotifications.canPost(context)) return
+        PcNotifications.ensureChannels(context)
+        val id = idFor("fail|" + n.cidr)
+        val text = GuardText.failText(n)
+        val notification = Notification.Builder(context, PcNotifications.CHANNEL_GUARD_FAIL)
+            .setSmallIcon(R.drawable.ic_stat_pc)
+            .setContentTitle("${GuardText.failTitle(n)}: ${deviceName.ifBlank { "ПК" }}")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setSubText(deviceName)
+            .setWhen(n.time)
+            .setShowWhen(true)
+            .setCategory(Notification.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setContentIntent(openApp(context, deviceId, id))
+            .build()
+        context.getSystemService(NotificationManager::class.java).notify(id, notification)
+    }
+
+    /** Подсеть заблокирована (сама или вручную) либо автоблокировка не удалась. Уведомление о попытках с этой подсети убирается. */
+    fun postBan(context: Context, deviceId: String, deviceName: String, n: GuardBanNote) {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        if (n.ok) nm.cancel(idFor("fail|" + n.cidr))
+        if (!PcNotifications.canPost(context)) return
+        PcNotifications.ensureChannels(context)
+        val id = idFor("ban|" + n.cidr)
+        val text = GuardText.banText(n)
+        val notification = Notification.Builder(context, PcNotifications.CHANNEL_SECURITY)
+            .setSmallIcon(R.drawable.ic_stat_pc)
+            .setContentTitle("${GuardText.banTitle(n)}: ${deviceName.ifBlank { "ПК" }}")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setSubText(deviceName)
+            .setWhen(n.time)
+            .setShowWhen(true)
+            .setCategory(Notification.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setContentIntent(openApp(context, deviceId, id))
+            .build()
+        nm.notify(id, notification)
     }
 
     /** Заменяет уведомление угрозы состоянием команды: ждём подтверждения на ПК. */

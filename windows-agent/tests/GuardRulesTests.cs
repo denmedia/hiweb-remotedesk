@@ -71,6 +71,8 @@ static class GuardRulesTests
         Learning();
         WhitelistMode();
         Settings();
+        AutoBan();
+        Helper();
         Console.WriteLine("passed " + passed + ", failed " + failed);
         Environment.Exit(failed == 0 ? 0 : 1);
     }
@@ -398,6 +400,112 @@ static class GuardRulesTests
         Eq("198.51.100.5/32", offer.OfferedBlock(ip), "в подсети есть знакомая подсеть поменьше — блокируем один адрес");
         IpTools.TryParse("203.0.113.5", out ip);
         Eq("203.0.113.0/24", offer.OfferedBlock(ip), "в чужой подсети блокируем подсеть");
+    }
+
+    /// <summary>Подаёт [count] неудач с [ip] с шагом [step] мс и возвращает разбор последней.</summary>
+    static ThreatDetector.FailInfo Fails(ThreatDetector d, string ip, int count, long start, long step)
+    {
+        ThreatDetector.FailInfo last = null;
+        for (int i = 0; i < count; i++)
+        {
+            RdpEvent e = Ev(GuardKind.Fail, start + i * step, ip);
+            d.Feed(e);
+            last = d.Describe(e);
+        }
+        return last;
+    }
+
+    static void AutoBan()
+    {
+        var s = new GuardSettings();
+        Check(s.AutoBan && s.BanAfter == 5, "автоблокировка по умолчанию включена, порог 5");
+        Eq(2, GuardSettings.ClampBanAfter(0), "порог не меньше 2");
+        Eq(50, GuardSettings.ClampBanAfter(1000), "порог не больше 50");
+
+        // Порог: до пятой попытки с подсети блокировать рано, на пятой пора.
+        var d = Detector(new Whitelist(), new List<string>());
+        ThreatDetector.FailInfo info = Fails(d, "198.51.100.7", 4, T0, 30 * 1000);
+        Check(!info.BanDue, "4 неудачи — ещё не блокируем");
+        Eq(4, info.Count, "счётчик на четвёртой попытке");
+        Eq("198.51.100.0/24", info.Cidr, "блокируется подсеть /24");
+        RdpEvent fifth = Ev(GuardKind.Fail, T0 + 4 * 30 * 1000, "198.51.100.8");
+        d.Feed(fifth);
+        info = d.Describe(fifth);
+        Check(info.BanDue, "5-я неудача (с соседнего адреса той же подсети) — блокируем");
+        Eq(5, info.Count, "считается по подсети, а не по адресу");
+
+        // Порог настраивается; отключённая автоблокировка не блокирует никогда, но счёт идёт.
+        s = new GuardSettings();
+        s.BanAfter = 2;
+        d = Detector(new Whitelist(), s, new List<string>());
+        Check(Fails(d, "203.0.113.9", 2, T0, 1000).BanDue, "порог 2 — блокируем на второй попытке");
+        s = new GuardSettings();
+        s.AutoBan = false;
+        d = Detector(new Whitelist(), s, new List<string>());
+        info = Fails(d, "203.0.113.9", 20, T0, 1000);
+        Check(!info.BanDue && info.Count == 20, "автоблокировка выключена: не блокируем, счётчик считается");
+
+        // Окно: попытки реже, чем раз в час, до порога не складываются.
+        d = Detector(new Whitelist(), new List<string>());
+        info = Fails(d, "203.0.113.9", 5, T0, 20 * MIN);
+        Check(!info.BanDue && info.Count == 4, "попытки раз в 20 минут: в окне часа (с границей) только 4 из 5");
+        info = Fails(d, "203.0.113.10", 5, T0 + 10 * 60 * MIN, 30 * 1000);
+        Check(info.BanDue, "новая серия через несколько часов блокируется отдельно");
+
+        // Свои и знакомые адреса не блокируются, но о попытке сообщается.
+        d = Detector(new Whitelist(), new List<string>());
+        info = Fails(d, "192.168.1.20", 10, T0, 1000);
+        Check(info != null && info.Local && !info.BanDue && info.Count == 0, "своя сеть: не блокируем");
+        d = Detector(Listed("198.51.100.5/32"), new List<string>());
+        info = Fails(d, "198.51.100.5", 10, T0, 1000);
+        Check(info.Known && !info.BanDue, "адрес из белого списка: не блокируем");
+        // Знакомый адрес в подсети: блокировка чужого соседа сужается до одного адреса.
+        info = Fails(d, "198.51.100.77", 5, T0, 1000);
+        Check(info.BanDue && info.Cidr == "198.51.100.77/32", "в подсети есть знакомый адрес — блокируем только сам адрес");
+
+        // Не попытка входа и не адрес — не разбирается.
+        d = Detector(new Whitelist(), new List<string>());
+        Check(d.Describe(Ev(GuardKind.Logon, T0, "198.51.100.7")) == null, "вход — не неудача");
+        Check(d.Describe(Ev(GuardKind.Fail, T0, "LOCAL")) == null, "не адрес — не разбирается");
+    }
+
+    static void Helper()
+    {
+        string verb, cidr;
+        Check(HelperProtocol.TryParseRequest("ban 198.51.100.0/24", out verb, out cidr) && verb == "ban" && cidr == "198.51.100.0/24", "ban подсети /24");
+        Check(HelperProtocol.TryParseRequest("ban 198.51.100.77", out verb, out cidr) && cidr == "198.51.100.77/32", "ban одного адреса");
+        Check(HelperProtocol.TryParseRequest("ban 198.51.100.77/24", out verb, out cidr) && cidr == "198.51.100.0/24", "host-биты обнуляются");
+        Check(HelperProtocol.TryParseRequest("unban 203.0.113.0/24", out verb, out cidr) && verb == "unban", "unban");
+        Check(HelperProtocol.TryParseRequest("status", out verb, out cidr) && verb == "status", "status");
+        Check(HelperProtocol.TryParseRequest("ban 2001:db8:1:2::/64", out verb, out cidr) && cidr == "2001:db8:1:2::/64", "IPv6 /64");
+
+        // То, что помощник блокировать отказывается (запросы шлёт процесс пользователя).
+        Check(!HelperProtocol.TryParseRequest("ban 198.51.0.0/16", out verb, out cidr), "шире /24 нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban 0.0.0.0/0", out verb, out cidr), "весь интернет нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban 192.168.1.0/24", out verb, out cidr), "свою сеть нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban 127.0.0.1", out verb, out cidr), "петлю нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban 100.64.0.5", out verb, out cidr), "Tailscale/CGNAT нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban 2001:db8::/48", out verb, out cidr), "IPv6 шире /64 нельзя");
+        Check(!HelperProtocol.TryParseRequest("ban abc", out verb, out cidr), "не адрес");
+        Check(!HelperProtocol.TryParseRequest("ban", out verb, out cidr), "без аргумента");
+        Check(!HelperProtocol.TryParseRequest("ban 198.51.100.0/24 extra", out verb, out cidr), "лишние слова");
+        Check(!HelperProtocol.TryParseRequest("delete 198.51.100.0/24", out verb, out cidr), "неизвестная команда");
+        Check(!HelperProtocol.TryParseRequest("status now", out verb, out cidr), "status с аргументом");
+        Check(!HelperProtocol.TryParseRequest("", out verb, out cidr) && !HelperProtocol.TryParseRequest(null, out verb, out cidr), "пустая строка");
+        Check(!HelperProtocol.TryParseRequest("ban " + new string('1', 300), out verb, out cidr), "слишком длинная строка");
+        Check(!HelperProtocol.TryParseRequest("ban 198.51.100.0/24; netsh advfirewall set allprofiles state off", out verb, out cidr), "инъекция команды");
+
+        // Ответы.
+        bool ok;
+        string detail;
+        Check(HelperProtocol.TryParseReply(HelperProtocol.Ok(""), out ok, out detail) && ok && detail == "", "ok без подробностей");
+        Check(HelperProtocol.TryParseReply(HelperProtocol.Ok("exists fwoff"), out ok, out detail) && ok && detail == "exists fwoff", "ok с подробностями");
+        Check(HelperProtocol.TryParseReply(HelperProtocol.Err("limit\r\nx"), out ok, out detail) && !ok && detail == "limit  x", "err без переводов строк");
+        Check(!HelperProtocol.TryParseReply("okay", out ok, out detail), "«okay» — не ответ");
+        Check(!HelperProtocol.TryParseReply(null, out ok, out detail), "нет ответа");
+        var reply = new HelperReply();
+        reply.Detail = "exists fwoff";
+        Check(reply.Has("exists") && reply.Has("fwoff") && !reply.Has("exist"), "HelperReply.Has ищет слово целиком");
     }
 
     static void Settings()

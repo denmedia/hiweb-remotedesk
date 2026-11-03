@@ -17,8 +17,8 @@ enum class DesktopProfile { WINDOWS, GNOME }
 
 /**
  * Жесты тачпада в духе macOS, переведённые в действия удалённого рабочего стола:
- *  - два пальца вверх-вниз и влево-вправо — вертикальная и горизонтальная прокрутка;
- *  - быстрый горизонтальный свайп двумя пальцами — назад или вперёд в браузере (Alt+стрелка): вправо — назад, влево — вперёд;
+ *  - два пальца вверх-вниз и влево-вправо — вертикальная и горизонтальная прокрутка (с инерцией; близкое к одной оси
+ *    движение прокручивает только эту ось, явная диагональ — обе сразу);
  *  - щипок двумя пальцами — масштаб (Ctrl + колесо);
  *  - свайп тремя или четырьмя пальцами (Windows / GNOME в Ubuntu):
  *    вверх — обзор окон (Win+Tab / Super), вниз — рабочий стол (Win+D) или сетка приложений (Super+A),
@@ -52,15 +52,17 @@ class TouchpadGestures(
     /** Базовый коэффициент источника последней прокрутки пальцами (тачпад ослаблен вдвое, сенсорный экран — нет). */
     private var sourceGain = 1f
 
-    private enum class Axis { UNDECIDED, VERTICAL, HORIZONTAL }
+    /** Режим прокрутки двумя пальцами по тачпаду: ось выбирается в начале жеста, см. [fingerScroll]. */
+    private enum class Axis { UNDECIDED, VERTICAL, HORIZONTAL, BOTH }
 
     private var axis = Axis.UNDECIDED
 
-    // Сдвиг двух пальцев с начала жеста в вертикальных щелчках: до выбора оси и (по горизонтали) для навигации.
+    // Чистый сдвиг пальцев с начала жеста в вертикальных щелчках (горизонталь приведена к ним) и отсчёты до выбора режима.
     private var accV = 0f
     private var accH = 0f
     private val pendingTimes = ArrayList<Long>()
     private val pendingV = ArrayList<Float>()
+    private val pendingH = ArrayList<Float>()
 
     // Скорость инерции измеряется по движению пальцев, а коэффициенты прокрутки применяются при выводе:
     // так сила прокрутки не влияет на порог запуска инерции, но пропорционально меняет её длину.
@@ -85,39 +87,52 @@ class TouchpadGestures(
      * продолжиться по инерции (см. [scrollRelease]). Положительные значения — вверх/вправо.
      */
     fun fingerScroll(timeMs: Long, vNotches: Float, hNotches: Float, gain: Float = 1f, hPerV: Float = 1f) {
+        // Дрожание пальцев не должно сдвигать страницу вбок, а явная диагональ — прокручиваться по диагонали.
+        // Поэтому по чистому (с учётом знака, дрожание взаимно гасится) сдвигу с начала жеста выбирается режим:
+        // одна ось (доминирующая) или обе сразу. Из одной оси в обе можно перейти по ходу жеста, назад — нет.
+        accV += vNotches
+        accH += hNotches * hPerV
+        sourceGain = gain
         if (axis == Axis.UNDECIDED) {
-            // Ось жеста выбирается по первым сдвигам: вертикаль — прокрутка, горизонталь — навигация назад/вперёд.
-            accV += vNotches
-            accH += hNotches * hPerV
             pendingTimes += timeMs
             pendingV += vNotches
+            pendingH += hNotches
             if (maxOf(abs(accV), abs(accH)) < AXIS_LOCK_NOTCHES) return
-            axis = if (abs(accH) > abs(accV) * HORIZONTAL_BIAS) Axis.HORIZONTAL else Axis.VERTICAL
-            if (axis == Axis.VERTICAL) {
-                // Накопленное до выбора оси отдаётся одним движением, а отсчёты скорости для инерции — как были.
-                for (i in pendingTimes.indices) fling.onSample(pendingTimes[i], pendingV[i], 0f)
-                sourceGain = gain
-                scrollNotches(true, accV * gain * scrollStrength)
+            axis = when {
+                isDiagonal() -> Axis.BOTH
+                abs(accH) > abs(accV) -> Axis.HORIZONTAL
+                else -> Axis.VERTICAL
             }
+            // Накопленное до выбора режима отдаётся по отсчётам, как оно двигалось.
+            for (i in pendingTimes.indices) scrollSample(pendingTimes[i], pendingV[i], pendingH[i], gain)
             pendingTimes.clear()
             pendingV.clear()
+            pendingH.clear()
             return
         }
-        when (axis) {
-            Axis.VERTICAL -> emitScroll(timeMs, vNotches, gain)
-            Axis.HORIZONTAL -> accH += hNotches * hPerV
-            Axis.UNDECIDED -> Unit
-        }
+        if (axis != Axis.BOTH && isDiagonal()) axis = Axis.BOTH
+        scrollSample(timeMs, vNotches, hNotches, gain)
     }
 
-    private fun emitScroll(timeMs: Long, vNotches: Float, gain: Float) {
-        sourceGain = gain
-        fling.onSample(timeMs, vNotches, 0f)
-        if (vNotches != 0f) scrollNotches(true, vNotches * gain * scrollStrength)
+    /** Слабая ось тоже заметна: сдвиг по ней не меньше порога и не меньше доли сдвига по сильной оси. */
+    private fun isDiagonal(): Boolean {
+        val a = abs(accV)
+        val b = abs(accH)
+        val minor = minOf(a, b)
+        return minor >= DIAGONAL_MIN_NOTCHES && minor >= maxOf(a, b) * DIAGONAL_RATIO
+    }
+
+    /** Один отсчёт прокрутки пальцами по текущему режиму: лишняя ось отбрасывается, остальное идёт и в инерцию. */
+    private fun scrollSample(timeMs: Long, vNotches: Float, hNotches: Float, gain: Float) {
+        val v = if (axis == Axis.HORIZONTAL) 0f else vNotches
+        val h = if (axis == Axis.VERTICAL) 0f else hNotches
+        fling.onSample(timeMs, v, h)
+        if (v != 0f) scrollNotches(true, v * gain * scrollStrength)
+        if (h != 0f) scrollNotches(false, h * gain * scrollStrength)
     }
 
     /**
-     * Прокрутка одним или двумя пальцами по сенсорному экрану: обе оси сразу, без выбора оси и навигации назад/вперёд,
+     * Прокрутка одним или двумя пальцами по сенсорному экрану: обе оси сразу, без выбора оси,
      * с инерцией. Положительные значения — вверх/вправо.
      */
     fun touchScroll(timeMs: Long, vNotches: Float, hNotches: Float) {
@@ -137,18 +152,10 @@ class TouchpadGestures(
 
     /** Пальцы оторваны: прокрутка продолжается по инерции, если они двигались достаточно быстро. */
     fun scrollRelease(timeMs: Long) {
-        if (axis == Axis.HORIZONTAL) {
-            // Палец вправо — накопленное значение отрицательное (см. знаки прокрутки): это «назад».
-            if (abs(accH) >= NAV_NOTCHES) navigate(back = accH < 0)
-            fling.reset()
-        } else {
-            fling.tauScale = inertiaStrength
-            fling.release(timeMs)
-        }
+        fling.tauScale = inertiaStrength
+        fling.release(timeMs)
         scrollEnd()
     }
-
-    private fun navigate(back: Boolean) = combo(KEY_ALT to false, (if (back) KEY_LEFT else KEY_RIGHT) to true)
 
     /** Шаг инерции; возвращает true, пока прокрутка продолжается. */
     fun flingStep(nowMs: Long): Boolean = fling.step(nowMs)
@@ -164,6 +171,7 @@ class TouchpadGestures(
         accH = 0f
         pendingTimes.clear()
         pendingV.clear()
+        pendingH.clear()
     }
 
     /** Отправляет целую часть накопленного значения и возвращает остаток. */
@@ -273,6 +281,16 @@ class TouchpadGestures(
         const val TOUCHPAD_BASE_GAIN = 0.5f
         private const val MAX_WHEEL_UNITS = 240
 
+        /** Сдвиг (в вертикальных щелчках), с которого выбирается режим прокрутки двумя пальцами. */
+        private const val AXIS_LOCK_NOTCHES = 1f
+
+        /**
+         * Диагональ включается, когда слабая ось набрала не меньше этого сдвига (≈20 px по вертикали, 60 px по горизонтали)
+         * и не меньше половины сдвига по сильной оси (угол от оси ≳ 27°): дрожание пальцев этого не набирает.
+         */
+        private const val DIAGONAL_MIN_NOTCHES = 1f
+        private const val DIAGONAL_RATIO = 0.5f
+
         /** Сколько пикселей жеста прокрутки соответствует одному щелчку колеса (по вертикали втрое чувствительнее). */
         const val PIXELS_PER_NOTCH_V = 20f
         const val PIXELS_PER_NOTCH_H = 60f
@@ -289,15 +307,6 @@ class TouchpadGestures(
 
         /** Минимальный свайп в долях размера тачпада. */
         const val SWIPE_THRESHOLD = 0.15f
-
-        /** Сдвиг (в вертикальных щелчках), с которого выбирается ось жеста двумя пальцами. */
-        private const val AXIS_LOCK_NOTCHES = 1f
-
-        /** Горизонталь выбирается, только если она заметно сильнее вертикали (иначе — обычная прокрутка). */
-        private const val HORIZONTAL_BIAS = 1.5f
-
-        /** Горизонтальный свайп короче этого (в вертикальных щелчках) не считается навигацией. */
-        private const val NAV_NOTCHES = 4f
 
         private const val KEY_ALT = 0x38
         private const val KEY_CTRL = 0x1D

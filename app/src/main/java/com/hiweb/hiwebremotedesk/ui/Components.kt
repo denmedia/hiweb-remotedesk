@@ -24,9 +24,11 @@ import androidx.compose.material.icons.outlined.AcUnit
 import androidx.compose.material.icons.outlined.Cancel
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.DesktopWindows
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.RestartAlt
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material3.AlertDialog
@@ -274,6 +276,12 @@ fun DeviceCard(
     /** Показывать ли щит (у ПК с агентом, то есть Windows); без данных он виден, но неактивен. */
     showGuard: Boolean = guardThreats != null,
     onGuard: () -> Unit = {},
+    /** «Поделиться»: открыть QR-код с настройками ПК; null — кнопки нет. */
+    onShare: (() -> Unit)? = null,
+    /** Кнопка «Файлы» (диски ПК в файловом менеджере): null — у этого ПК её нет (не Windows), иначе можно ли открыть файлы сейчас. */
+    filesAccess: com.hiweb.hiwebremotedesk.agent.FilesAccess? = null,
+    /** Открывает файловый менеджер на диске ПК; false — открыть не удалось, карточка подскажет, где искать диск вручную. */
+    onFiles: () -> Boolean = { false },
 ) {
     val shape = RoundedCornerShape(20.dp)
     val state = status.state
@@ -297,12 +305,22 @@ fun DeviceCard(
                 color = if (state.tone == StatusTone.UNKNOWN || state.tone == StatusTone.DOWN) TextSecondary else toneColor(state.tone),
                 fontSize = 14.sp,
                 maxLines = 1,
-                modifier = Modifier.weight(1f, fill = false),
+                overflow = TextOverflow.Ellipsis,
+                // Текст забирает всё свободное место: метка ОС прижата к правому краю, а щит (только у Windows) — следом за ней.
+                modifier = Modifier.weight(1f),
             )
-            Spacer(Modifier.weight(1f))
+            Spacer(Modifier.width(8.dp))
             OsLogo(device.os, 20.dp)
             Spacer(Modifier.width(6.dp))
             Text(device.osLabel, color = TextSecondary, fontSize = 14.sp)
+            if (filesAccess != null) {
+                Spacer(Modifier.width(6.dp))
+                FilesBadge(
+                    enabled = filesAccess == com.hiweb.hiwebremotedesk.agent.FilesAccess.READY,
+                    onDisabledClick = { hint = ButtonHints.files(filesAccess) },
+                    onClick = { if (!onFiles()) hint = ButtonHints.filesManual(device.name) },
+                )
+            }
             if (showGuard) {
                 Spacer(Modifier.width(6.dp))
                 GuardBadge(guardThreats ?: 0, enabled = guardThreats != null, onDisabledClick = { hint = ButtonHints.guard() }, onClick = onGuard)
@@ -311,8 +329,18 @@ fun DeviceCard(
         Spacer(Modifier.height(10.dp))
         PreviewBox(device, status, thumbnail, { hint = ButtonHints.connect(state) }, onConnect)
         Spacer(Modifier.height(10.dp))
-        Text(device.name, color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-        Text(device.host, color = TextSecondary, fontSize = 14.sp, maxLines = 1)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(device.name, color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Text(device.host, color = TextSecondary, fontSize = 14.sp, maxLines = 1)
+            }
+            if (onShare != null) {
+                // QR-код с настройками ПК для другого устройства
+                Box(Modifier.size(40.dp).clip(CircleShape).clickable(onClick = onShare), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Outlined.Share, contentDescription = "Поделиться ПК «${device.name}»", tint = TextSecondary, modifier = Modifier.size(22.dp))
+                }
+            }
+        }
         Spacer(Modifier.height(10.dp))
         // Кнопки питания видны всегда; недоступные неактивны и включаются, как только агент сообщит о режиме.
         // Через агента (на связи) — без открытия сеанса и только режимы из GetPwrCapabilities; без агента сон и
@@ -373,6 +401,17 @@ private class PowerButton(
     /** Что показать при нажатии, пока кнопка неактивна. */
     val hint: ButtonHint,
 )
+
+/** Значок «Файлы» на карточке: открывает диски ПК в файловом менеджере; [enabled] false — агент не на связи, не тот или доступ выключен. */
+@Composable
+private fun FilesBadge(enabled: Boolean, onDisabledClick: () -> Unit, onClick: () -> Unit) {
+    Box(Modifier.size(34.dp).clip(CircleShape).clickable(onClick = if (enabled) onClick else onDisabledClick), contentAlignment = Alignment.Center) {
+        Icon(
+            Icons.Outlined.Folder, contentDescription = "Файлы ПК",
+            tint = if (enabled) TextSecondary else TextDisabled, modifier = Modifier.size(22.dp),
+        )
+    }
+}
 
 /** Щит защиты подключений; красный со счётчиком, пока есть угрозы; [enabled] false — агент ещё не присылал данных. */
 @Composable
