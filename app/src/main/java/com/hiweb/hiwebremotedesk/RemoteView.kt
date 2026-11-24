@@ -848,6 +848,9 @@ class RemoteView(context: Context) : View(context) {
         /** Через сколько палец, не сдвигаясь, даёт правую кнопку (долгое касание, как в iPadOS). */
         const val LONG_PRESS_MS = 500L
 
+        /** Как часто повторять кадры неподвижного контакта в нативном режиме (настоящий экран шлёт их непрерывно). */
+        const val NATIVE_KEEPALIVE_MS = 20L
+
         /** Сколько неподвижное перо над экраном считается «рядом» для отсечения ладони (hover-события идут, только пока оно движется). */
         const val PEN_NEAR_MS = 3_000L
 
@@ -975,8 +978,40 @@ class RemoteView(context: Context) : View(context) {
         abortFingerEmulation()
     }
 
+    /** Подключение, в котором уже был «толчок мышью» перед первым нативным касанием ([primeNativeInput]). */
+    private var primedClient: RdpClient? = null
+
+    /**
+     * После сна ПК Windows не применяет касания RDPEI нового подключения, пока не придёт ввод мышью или клавиатурой: кадры
+     * уходят, но не действуют (журналы планшета и ПК 24.11: касания оживали сразу после пары щелчков в режиме «мышь»).
+     * Поэтому перед первым нативным касанием каждого подключения курсор сдвигается в точку касания — он и так окажется там.
+     */
+    private fun primeNativeInput(x: Int, y: Int) {
+        val c = client ?: return
+        if (primedClient === c) return
+        primedClient = c
+        val w = (bitmap?.width ?: 1).coerceAtLeast(1)
+        c.sendMouse(RdpClient.PTR_MOVE, if (x + 1 < w) x + 1 else (x - 1).coerceAtLeast(0), y)
+        c.sendMouse(RdpClient.PTR_MOVE, x, y)
+        android.util.Log.i("RDP", "rdpei: перед первым касанием курсор сдвинут в $x,$y (ввод мышью для Windows после сна)")
+    }
+
+    /** Экран Windows заблокирован: касания RDPEI там не принимаются, пальцы и перо временно работают мышью. */
+    private var remoteLocked = false
+
+    fun setRemoteLocked(locked: Boolean) {
+        if (locked == remoteLocked) return
+        remoteLocked = locked
+        // Как при смене режима: начатое обрывается, чтобы ни контакт, ни кнопка мыши не остались зажатыми.
+        cancelNativeTouch()
+        abortFingerEmulation()
+    }
+
+    /** Нативный ввод возможен: режим включён и экран Windows не заблокирован. */
+    private fun nativeAllowed() = nativeTouchWanted && !remoteLocked
+
     /** Пальцы идут на ПК настоящими касаниями. */
-    private fun nativeFinger() = nativeTouchWanted && client?.touchReady == true
+    private fun nativeFinger() = nativeAllowed() && client?.touchReady == true
 
     /** Что делает перо в нативном режиме (настройка ПК). */
     private var stylusMode = StylusMode.PEN
@@ -991,15 +1026,28 @@ class RemoteView(context: Context) : View(context) {
     }
 
     /** Перо идёт на ПК настоящим пером (сервер должен его поддерживать, иначе — мышь, как раньше). */
-    private fun nativePen() = nativeTouchWanted && stylusMode == StylusMode.PEN && client?.penReady == true
+    private fun nativePen() = nativeAllowed() && stylusMode == StylusMode.PEN && client?.penReady == true
 
     /** Перо идёт на ПК обычным касанием, как палец. */
-    private fun nativeStylusAsTouch() = nativeTouchWanted && stylusMode == StylusMode.TOUCH && client?.touchReady == true
+    private fun nativeStylusAsTouch() = nativeAllowed() && stylusMode == StylusMode.TOUCH && client?.touchReady == true
 
     /** Номера контактов пера не пересекаются с пальцами: ладонь и перо бывают на экране одновременно. */
     private val stylusContactOffset = 1000
 
+    /** Пока контакт на экране, его кадры повторяются (см. [NativeTouchEngine.keepAlive]): Android неподвижный палец молчит. */
+    private val nativeKeepAlive = object : Runnable {
+        override fun run() {
+            if (nativeTouch.keepAlive(SystemClock.uptimeMillis(), NATIVE_KEEPALIVE_MS)) postDelayed(this, NATIVE_KEEPALIVE_MS)
+        }
+    }
+
+    private fun scheduleNativeKeepAlive() {
+        removeCallbacks(nativeKeepAlive)
+        postDelayed(nativeKeepAlive, NATIVE_KEEPALIVE_MS)
+    }
+
     private fun cancelNativeTouch() {
+        removeCallbacks(nativeKeepAlive)
         removeCallbacks(nativeHold)
         nativeGesture = false
         if (nativeButtonHeld) {
@@ -1043,6 +1091,14 @@ class RemoteView(context: Context) : View(context) {
         if (hypot(x - nativeHoldX, y - nativeHoldY) > slop) removeCallbacks(nativeHold)
     }
 
+    /**
+     * Щелчок в нативном режиме (координаты стола): агент по нему решает, показать ли сенсорную клавиатуру Windows —
+     * сам он касаний сеанса RDP не видит.
+     */
+    var onNativeTap: ((Int, Int) -> Unit)? = null
+    private val fingerTap = NativeTapDetector(LONG_PRESS_MS)
+    private val penTap = NativeTapDetector(LONG_PRESS_MS)
+
     /** Пальцы целиком отдаются Windows: касание — это контакт, жесты разбирает она. */
     private fun nativeFingerTouch(e: MotionEvent, idOffset: Int = 0) {
         when (e.actionMasked) {
@@ -1051,8 +1107,15 @@ class RemoteView(context: Context) : View(context) {
             else -> removeCallbacks(nativeHold) // второй палец, отпускание, отмена
         }
         when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> fingerTap.down(e.x, e.y, e.eventTime)
+            MotionEvent.ACTION_MOVE -> fingerTap.move(e.x, e.y, touchSlop)
+            MotionEvent.ACTION_UP -> if (fingerTap.up(e.eventTime)) onNativeTap?.invoke(nativeX(e.x), nativeY(e.y))
+            else -> fingerTap.cancel()
+        }
+        when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = e.actionIndex
+                primeNativeInput(nativeX(e.getX(i)), nativeY(e.getY(i)))
                 nativeTouch.down(e.getPointerId(i) + idOffset, nativeX(e.getX(i)), nativeY(e.getY(i)), e.eventTime)
             }
             MotionEvent.ACTION_MOVE -> {
@@ -1076,6 +1139,7 @@ class RemoteView(context: Context) : View(context) {
             MotionEvent.ACTION_CANCEL -> nativeTouch.cancelAll(e.eventTime)
         }
         nativeTouch.flush()
+        if (nativeTouch.fingers > 0 || nativeTouch.penActive) scheduleNativeKeepAlive() else removeCallbacks(nativeKeepAlive)
     }
 
     /** Кнопка пера (или ластик) как признак для Windows: у S Pen кнопка приходит как STYLUS_PRIMARY или SECONDARY. */
@@ -1130,12 +1194,19 @@ class RemoteView(context: Context) : View(context) {
             cursorY = lastY.toFloat()
             fingerInput = false
             penInput = true
+            primeNativeInput(lastX, lastY)
         }
         // Придержанное на месте перо — долгое касание: отклик вибрацией, как у пальца.
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> startNativeHold(e.x, e.y)
             MotionEvent.ACTION_MOVE -> moveNativeHold(e.x, e.y, STYLUS_SLOP_DP * resources.displayMetrics.density)
             else -> removeCallbacks(nativeHold)
+        }
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> penTap.down(e.x, e.y, e.eventTime)
+            MotionEvent.ACTION_MOVE -> penTap.move(e.x, e.y, STYLUS_SLOP_DP * resources.displayMetrics.density)
+            MotionEvent.ACTION_UP -> if (penTap.up(e.eventTime)) onNativeTap?.invoke(nativeX(e.x), nativeY(e.y))
+            MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_HOVER_EXIT -> penTap.cancel()
         }
         when (e.actionMasked) {
             MotionEvent.ACTION_HOVER_EXIT -> nativeTouch.penLeave(e.eventTime)
@@ -1161,6 +1232,7 @@ class RemoteView(context: Context) : View(context) {
             }
         }
         nativeTouch.flush()
+        if (nativeTouch.fingers > 0 || nativeTouch.penActive) scheduleNativeKeepAlive() else removeCallbacks(nativeKeepAlive)
         postInvalidateOnAnimation()
     }
 

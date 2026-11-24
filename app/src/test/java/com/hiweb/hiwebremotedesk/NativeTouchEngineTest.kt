@@ -190,4 +190,45 @@ class NativeTouchEngineTest {
         assertEquals(RdpeiFlags.UP or RdpeiFlags.CANCELED, pen[1].point.flags)
         assertEquals(3 to 4, pen[1].point.x to pen[1].point.y)
     }
+
+    @Test
+    fun stationaryFingerIsRepeatedAfterGap() {
+        engine.down(7, 100, 200, 1_000)
+        engine.flush()
+        assertTrue(engine.keepAlive(1_010, 20))          // рано: кадр ушёл 10 мс назад
+        assertEquals(1, touch.size)
+        assertTrue(engine.keepAlive(1_020, 20))
+        assertEquals(2, touch.size)
+        val p = touch[1].points.single()
+        assertEquals(RdpeiFlags.UPDATE or RdpeiFlags.INRANGE or RdpeiFlags.INCONTACT, p.flags)
+        assertEquals(100 to 200, p.x to p.y)
+        assertEquals(1_020L, touch[1].timeMs)
+        engine.up(7, 100, 200, 1_030)
+        engine.flush()
+        assertFalse(engine.keepAlive(1_100, 20))         // пальцев нет — повторять нечего
+        assertEquals(3, touch.size)
+    }
+
+    @Test
+    fun movedFingerKeepsLastPositionInRepeat() {
+        engine.down(1, 0, 0, 0)
+        engine.move(5, listOf(NativePointer(1, 30, 40)))
+        engine.flush()
+        engine.keepAlive(30, 20)
+        assertEquals(30 to 40, touch.last().points.single().let { it.x to it.y })
+    }
+
+    @Test
+    fun touchingPenIsRepeatedAsUpdate() {
+        engine.pen(1, 5, 6, true, 0.5f, false, false)
+        engine.flush()
+        assertTrue(engine.keepAlive(50, 20))
+        assertEquals(2, pen.size)
+        val p = pen[1].point
+        assertEquals(RdpeiFlags.UPDATE or RdpeiFlags.INRANGE or RdpeiFlags.INCONTACT, p.flags)
+        assertEquals(512, p.pressure)
+        engine.penLeave(60)
+        engine.flush()
+        assertFalse(engine.keepAlive(200, 20))
+    }
 }

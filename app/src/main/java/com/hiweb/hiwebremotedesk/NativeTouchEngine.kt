@@ -40,6 +40,13 @@ class NativeTouchEngine(
     private var penX = 0
     private var penY = 0
 
+    /** Последняя точка пера (для повтора неподвижного пера). */
+    private var lastPen: PenPoint? = null
+
+    /** Когда в последний раз уходили кадры пальцев и пера (часы событий, мс). */
+    private var lastTouchAt = Long.MIN_VALUE / 2
+    private var lastPenAt = Long.MIN_VALUE / 2
+
     /** Перо в зоне действия экрана (над ним или на нём). */
     val penActive: Boolean get() = penInRange
 
@@ -119,7 +126,9 @@ class NativeTouchEngine(
         penInRange = true
         penX = x
         penY = y
-        penFrames += PenFrame(time, penPoint(x, y, flags, touching, pressure, barrel, eraser, tiltX, tiltY))
+        val point = penPoint(x, y, flags, touching, pressure, barrel, eraser, tiltX, tiltY)
+        lastPen = point
+        penFrames += PenFrame(time, point)
     }
 
     /** Перо ушло из зоны действия экрана: контакт заканчивается. */
@@ -136,18 +145,80 @@ class NativeTouchEngine(
         penFrames += PenFrame(time, PenPoint(penX, penY, RdpeiFlags.UP or RdpeiFlags.CANCELED, 0, 0))
     }
 
+    /**
+     * Повтор неподвижных контактов: настоящий сенсорный экран шлёт кадры непрерывно, а Android при неподвижном пальце
+     * событий почти не даёт, и без кадров Windows ведёт удержание хуже (повтор клавиши сенсорной клавиатуры шёл рывками:
+     * 3 символа за 1,5 с против 39 с кадрами каждые 10 мс). Если с прошлого кадра прошло не меньше [minGapMs], пальцы
+     * на экране и перо в зоне уходят ещё раз на прежних местах (`UPDATE`). Возвращает true, пока есть что повторять.
+     */
+    fun keepAlive(time: Long, minGapMs: Long): Boolean {
+        if (slots.isNotEmpty() && time - lastTouchAt >= minGapMs) {
+            val points = slots.values.sorted().map { slot ->
+                val xy = last[slot] ?: intArrayOf(0, 0)
+                TouchPoint(slot, xy[0], xy[1], RdpeiFlags.UPDATE or RdpeiFlags.INRANGE or RdpeiFlags.INCONTACT)
+            }
+            touchFrames += TouchFrame(time, points)
+        }
+        val p = lastPen
+        if (penInRange && p != null && time - lastPenAt >= minGapMs) {
+            val again = PenPoint(p.x, p.y, (p.flags and RdpeiFlags.DOWN.inv()) or RdpeiFlags.UPDATE, p.penFlags, p.pressure, p.tiltX, p.tiltY)
+            lastPen = again
+            penFrames += PenFrame(time, again)
+        }
+        flush()
+        return slots.isNotEmpty() || penInRange
+    }
+
     /** Отдаёт накопленные кадры одним вызовом на пальцы и одним на перо. */
     fun flush() {
         if (touchFrames.isNotEmpty()) {
             val frames = ArrayList(touchFrames)
             touchFrames.clear()
+            lastTouchAt = frames.last().timeMs
             out.touch(frames)
         }
         if (penFrames.isNotEmpty()) {
             val frames = ArrayList(penFrames)
             penFrames.clear()
+            lastPenAt = frames.last().timeMs
             out.pen(frames)
         }
+    }
+}
+
+/**
+ * Щелчок в нативном режиме: один контакт, отпущенный быстрее [maxMs] и не ушедший дальше порога сдвига. Агенту нужен
+ * этот признак, чтобы решить про сенсорную клавиатуру: щелчок мышью он видит сам (ловушка мыши), а касания Windows
+ * из сеанса RDP в его ловушку не попадают. Долгое касание (контекстное меню Windows) щелчком не считается.
+ */
+class NativeTapDetector(private val maxMs: Long) {
+    private var downAt = 0L
+    private var x0 = 0f
+    private var y0 = 0f
+    private var armed = false
+
+    fun down(x: Float, y: Float, time: Long) {
+        downAt = time
+        x0 = x
+        y0 = y
+        armed = true
+    }
+
+    /** Контакт сдвинулся; дальше [slop] — это уже прокрутка или перетаскивание. */
+    fun move(x: Float, y: Float, slop: Float) {
+        if (armed && Math.hypot((x - x0).toDouble(), (y - y0).toDouble()) > slop) armed = false
+    }
+
+    /** Второй палец, отмена, уход пера: жест щелчком не будет. */
+    fun cancel() {
+        armed = false
+    }
+
+    /** Контакт отпущен: true — это был щелчок. */
+    fun up(time: Long): Boolean {
+        val tap = armed && time - downAt < maxMs
+        armed = false
+        return tap
     }
 }
 

@@ -202,6 +202,21 @@ namespace HiWebAgent
             return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
         }
 
+        /// <summary>
+        /// Щелчок касанием или пером с планшета (сообщение tap, координаты экрана): нативные касания сеанса RDP в ловушку
+        /// мыши не попадают, поэтому о них сообщает сам планшет. Дальше — как после щелчка мышью.
+        /// </summary>
+        public void Tap(int x, int y)
+        {
+            if (!active) return;
+            object r = paneRect;
+            var pt = new Point();
+            pt.X = x;
+            pt.Y = y;
+            clickOnKeyboard = r != null && Contains((Rect)r, pt);
+            clicked.Set();
+        }
+
         void Work()
         {
             while (true)
@@ -260,15 +275,21 @@ namespace HiWebAgent
             try { type = el.Current.ControlType; }
             catch (ElementNotAvailableException) { return false; }
             // Страница браузера или окно просмотра тоже «документ»: печатать в них можно, только если есть курсор.
-            bool candidate = type == ControlType.Edit || (type == ControlType.Document && HasCaret());
+            // Поле с подсказками (поиск google.com, строки поиска на сайтах — роль combobox) для UI Automation — ComboBox;
+            // печатать в нём можно, только если значение не «только для чтения» (выпадающий список select — нельзя).
+            bool combo = type == ControlType.ComboBox;
+            bool candidate = type == ControlType.Edit || combo || (type == ControlType.Document && HasCaret());
             if (!candidate)
             {
                 Log.Write("touch keyboard: not an input, class=" + cls + ", type=" + type.ProgrammaticName);
                 return false;
             }
             object pattern;
-            if (el.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)) return !((ValuePattern)pattern).Current.IsReadOnly;
-            return true;
+            bool editable = el.TryGetCurrentPattern(ValuePattern.Pattern, out pattern)
+                ? !((ValuePattern)pattern).Current.IsReadOnly
+                : !combo;
+            if (!editable) Log.Write("touch keyboard: read-only, class=" + cls + ", type=" + type.ProgrammaticName);
+            return editable;
         }
 
         /// <summary>Класс окна, которому принадлежит фокус ввода (или активного окна, если фокус не определён).</summary>
@@ -285,14 +306,17 @@ namespace HiWebAgent
         }
 
         /// <summary>
-        /// Окна редакторов с собственной отрисовкой текста: Scintilla (Notepad++, SciTE) и Java AWT/Swing (IDE
-        /// JetBrains). О том, какой именно элемент в окне Java в фокусе, система не знает: клавиатура покажется
-        /// при щелчке в любом месте такого окна, зато печатать в редакторе можно.
+        /// Окна редакторов с собственной отрисовкой текста: Scintilla (Notepad++, SciTE) и главное окно Java AWT/Swing
+        /// (IDE JetBrains, `SunAwtFrame` и его дочерние окна). О том, какой именно элемент в окне Java в фокусе, система не знает: клавиатура
+        /// покажется при щелчке в любом месте такого окна, зато печатать в редакторе можно. Диалоги и всплывающие окна Java
+        /// (`SunAwtDialog`, `SunAwtWindow`: «Confirm Exit», подтверждения, меню) — не редактор: там клавиатура не нужна.
         /// </summary>
-        static bool IsSelfDrawnEditor(string cls)
+        internal static bool IsSelfDrawnEditor(string cls)
         {
             return cls.StartsWith("Scintilla", StringComparison.OrdinalIgnoreCase)
-                || cls.StartsWith("SunAwt", StringComparison.OrdinalIgnoreCase);
+                || (cls.StartsWith("SunAwt", StringComparison.OrdinalIgnoreCase)
+                    && !cls.Equals("SunAwtDialog", StringComparison.OrdinalIgnoreCase)
+                    && !cls.Equals("SunAwtWindow", StringComparison.OrdinalIgnoreCase));
         }
 
         static bool HasCaret()
@@ -350,6 +374,7 @@ namespace HiWebAgent
         static void Show()
         {
             if (IsVisible()) return;
+            Log.Write("touch keyboard: show");
             if (Process.GetProcessesByName("TabTip").Length == 0)
             {
                 // Без запущенного TabTip переключатель недоступен; сам запуск обычно и открывает клавиатуру.
@@ -363,7 +388,9 @@ namespace HiWebAgent
 
         static void Hide()
         {
-            if (IsVisible()) Toggle();
+            if (!IsVisible()) return;
+            Log.Write("touch keyboard: hide");
+            Toggle();
         }
 
         static void Toggle()

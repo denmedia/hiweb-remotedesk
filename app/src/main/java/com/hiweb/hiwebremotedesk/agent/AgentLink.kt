@@ -192,6 +192,14 @@ class AgentLink(
         send(JSONObject().put("t", "notif_ack").put("id", id).put("posted", blockedBy == null).put("reason", blockedBy ?: ""))
     }
 
+    /**
+     * Щелчок нативным касанием или пером в точке стола: агент (1.11.1+) проверяет поле ввода под фокусом, как после щелчка
+     * мышью, — касания сеанса RDP его ловушка мыши не видит. Прежние агенты сообщение пропускают.
+     */
+    fun sendTap(x: Int, y: Int) {
+        send(JSONObject().put("t", "tap").put("x", x).put("y", y))
+    }
+
     /** Произвольное сообщение агенту (команды защиты); ничего не делает, пока канал не открыт. */
     fun sendRaw(msg: JSONObject) = send(msg)
 

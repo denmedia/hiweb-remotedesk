@@ -326,6 +326,10 @@ namespace HiWebAgent
                     tabletKbMode = Str(msg, "kbmode");
                     if (tabletKbMode != "show" && tabletKbMode != "hide") tabletKbMode = "auto";
                     break;
+                case "tap":
+                    // Щелчок касанием с планшета: в ловушку мыши касания сеанса RDP не попадают.
+                    touchKeyboard.Tap(Int(msg, "x"), Int(msg, "y"));
+                    break;
                 case "pair":
                     SavePairing(msg);
                     break;
@@ -1007,6 +1011,12 @@ namespace HiWebAgent
             object v;
             if (msg.TryGetValue(key, out v) && v is bool) return (bool)v;
             return null;
+        }
+
+        static int Int(Dictionary<string, object> msg, string key)
+        {
+            object v;
+            return msg.TryGetValue(key, out v) && v is int ? (int)v : 0;
         }
 
         static bool Bool(Dictionary<string, object> msg, string key, bool fallback)

@@ -336,6 +336,23 @@ class RemoteActivity : ComponentActivity() {
 
     private val clearTouchHint = Runnable { touchHint = null }
 
+    /** Экран Windows заблокирован (по сообщению агента `status`). */
+    private var remoteLocked = false
+
+    /**
+     * На экране блокировки Windows касания и перо RDPEI не принимает (проверено по журналам ПК: после сна и закрытой крышки
+     * касания оживали только с разблокировкой), а мышь работает. Пока экран заблокирован, пальцы идут мышью, после
+     * разблокировки — снова касаниями Windows.
+     */
+    private fun setRemoteLocked(locked: Boolean) {
+        if (locked == remoteLocked) return
+        remoteLocked = locked
+        remoteView.setRemoteLocked(locked)
+        if (locked && nativeTouchOn && touchChannelReady && !isFinishing) {
+            showTouchHint("Экран Windows заблокирован: касания там не принимаются, пальцы работают как мышь до разблокировки.")
+        }
+    }
+
     /** Включает или выключает нативное управление для этого ПК: действует сразу и запоминается. */
     private fun setNativeTouch(on: Boolean) {
         nativeTouchOn = on
@@ -597,6 +614,8 @@ class RemoteActivity : ComponentActivity() {
                     agentVersion = null
                     remoteView.keyboardPane = null
                     remoteView.setAgentCursor(null)
+                    // Без агента о блокировке не узнать: прежнее «заблокирован» не должно навсегда оставить мышь.
+                    setRemoteLocked(false)
                 }
             }
 
@@ -621,6 +640,8 @@ class RemoteActivity : ComponentActivity() {
 
             override fun onAgentStatus(msg: org.json.JSONObject) {
                 PcStateStore.get(this@RemoteActivity).report(device.id, msg)
+                val locked = msg.optString("state") == "locked"
+                runOnUiThread { setRemoteLocked(locked) }
             }
 
             override fun onAgentGuard(msg: org.json.JSONObject) {
@@ -825,6 +846,8 @@ class RemoteActivity : ComponentActivity() {
 
         remoteView = RemoteView(this)
         remoteView.onRotationWait = { rotationWait = it }
+        // Режим клавиатуры «автоматически»: агент узнаёт о щелчке касанием только от нас.
+        remoteView.onNativeTap = { x, y -> agent?.sendTap(x, y) }
         // Сила прокрутки и инерции задаётся в настройках этого ПК
         remoteView.setScrollSettings(StrengthLevels.factor(device.scrollPercent), StrengthLevels.inertiaFactor(device.inertiaPercent))
         remoteView.setMouseSpeed(StrengthLevels.mouseFactor(device.mouseSpeedPercent))

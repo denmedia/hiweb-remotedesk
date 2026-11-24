@@ -132,7 +132,9 @@ Android-клиент удалённого рабочего стола (RDP) дл
   Канал `rdp/RdpeiChannel.kt` (DVC `Microsoft::Windows::RDS::Input`, объявляется для любой Windows при `RdpConfig.touch`; сжатые
   целые `RdpeiInts`, рукопожатие SC_READY→CS_READY, кадры касаний `0x0003` и пера `0x0008`, SUSPEND/RESUME) открывает сама Windows;
   `RdpClient.touchReady`/`penReady`, `sendTouch`/`sendPen` (через очередь ввода), `RdpListener.onTouchChannel`. Чистая логика —
-  `NativeTouchEngine` (контакты 0…9, отпуск обязателен, `cancelAll` шлёт `UP|CANCELED`, у пера своя машина наведение/касание/уход);
+  `NativeTouchEngine` (контакты 0…9, отпуск обязателен, `cancelAll` шлёт `UP|CANCELED`, у пера своя машина наведение/касание/уход;
+  `keepAlive` повторяет неподвижные контакты `UPDATE`-кадрами каждые `RemoteView.NATIVE_KEEPALIVE_MS` = 20 мс — Android неподвижный палец
+  не сообщает, а без кадров Windows ведёт удержание хуже: опыт с `InjectTouchInput` на ПК — повтор клавиши TabTip 3 символа за 1,5 с против 39);
   `RemoteView` при `setNativeTouch(true)` и готовом канале отдаёт пальцы (`nativeFingerTouch`) и перо (`nativePenEvent`) Windows целиком,
   без `TouchscreenGestures`/`StylusEngine`/кнопки мыши; путь жеста выбирается на `ACTION_DOWN` (`nativeGesture`), при смене режима и
   потере фокуса контакты отменяются. Перо идёт нативно, только если сервер объявил multipen (`penReady`), иначе остаётся `StylusEngine`.
@@ -142,6 +144,13 @@ Android-клиент удалённого рабочего стола (RDP) дл
   `RemoteView.setStylusMode`): `MOUSE` — `StylusEngine`, `TOUCH` — перо идёт тем же путём, что палец (`nativeFingerTouch`, номера контактов
   со сдвигом `stylusContactOffset`, без наведения/нажима/кнопки), `PEN` (по умолчанию) — настоящее перо RDPEI, если сервер объявил multipen. Без
   нативного режима перо всегда `StylusEngine`.
+  **На экране блокировки Windows кадры RDPEI не применяет** (канал открыт, кадры уходят, но касания оживают только с разблокировкой —
+  по журналам ПК: Kernel-Power 566 `SessionUnlock`, после сна и закрытой крышки), а мышь работает. Поэтому `status` агента с
+  `state: locked` (`RemoteActivity.setRemoteLocked` → `RemoteView.setRemoteLocked`) временно переводит пальцы и перо на мышь
+  (`nativeAllowed()`), разблокировка возвращает нативный ввод; без агента это не определяется. **После сна ПК** (и без блокировки)
+  Windows не применяет касания нового подключения, пока не придёт ввод мышью (журналы 24.11 07:16: касания ожили сразу после щелчков
+  в режиме «мышь»), поэтому `RemoteView.primeNativeInput` перед первым нативным касанием каждого `RdpClient` сдвигает курсор в точку
+  касания (два `PTR_MOVE`, в журнале `rdpei: перед первым касанием курсор сдвинут…`).
   Windows открывает канал не на экране входа (там запрашиваются только `CoreInput`, `MouseCursor`, `ECHO`, видео-каналы), а в живом
   сеансе — открывает и присылает `SC_READY` версии 3.0 с multipen (по журналу планшета, тег RDP). Отправка кадров пишется в журнал
   (`rdpei: → касание/перо №N`, первые пять пакетов и каждый 500-й; `…не отправлено` — канал приостановлен): по нему видно, уходит ли
@@ -364,7 +373,10 @@ Android-клиент удалённого рабочего стола (RDP) дл
   (`TouchKeyboard.cs`: ловушка мыши + UI Automation + `ITipInvocation`) показывает TabTip при щелчке в поле ввода
   (UIA `Edit`/`Document` с системным курсором; программы с собственной отрисовкой текста — Scintilla/Notepad++ и
   Java AWT/Swing/IDE JetBrains — не отдают ни того, ни другого, поэтому узнаются по классу окна с фокусом,
-  `IsSelfDrawnEditor`) и шлёт её прямоугольник (`tkb`); долгое касание внутри него на планшете — автоповтор клавиши, а не правая кнопка.
+  `IsSelfDrawnEditor`; диалоги и всплывающие окна Java `SunAwtDialog`/`SunAwtWindow` редактором не считаются; поле с ролью combobox —
+  поиск google.com и т. п., UIA `ComboBox` — ввод, если его `ValuePattern` не только для чтения) и шлёт её прямоугольник (`tkb`). Нативные касания и перо RDPEI в ловушку мыши не попадают (по журналу агента
+  на реальном ПК), поэтому в нативном режиме планшет сам шлёт `tap` с координатами стола (`NativeTapDetector`: один контакт, без сдвига,
+  короче `LONG_PRESS_MS`; `RemoteView.onNativeTap` → `AgentLink.sendTap`, агент 1.11.1+ — `TouchKeyboard.Tap`); долгое касание внутри него на планшете — автоповтор клавиши, а не правая кнопка.
 - **Уведомления Windows → планшет**: `NotificationWatcher.cs` опрашивает `UserNotificationListener` раз в секунду,
   `AgentApp.Forward` шлёт `notif` **только по каналу сеанса RDP** и только при свёрнутом приложении (`ForwardSkipReason`;
   по LAN без сеанса уведомления не идут). Каждое решение пишется в `agent.log` строкой `notif: <приложение> — …`
