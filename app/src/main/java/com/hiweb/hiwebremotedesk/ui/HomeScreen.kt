@@ -187,6 +187,37 @@ fun HomeScreen(onLaunch: (deviceId: String, power: PowerAction?) -> Unit, vm: Ho
         }
     }
 
+    // Нажатие в виджете «ПК» на главном экране: выполняем теми же окнами, что и нажатие на карточке.
+    val widgetRequest by com.hiweb.hiwebremotedesk.widget.WidgetRequests.pending.collectAsState()
+    var widgetHint by remember { mutableStateOf<ButtonHint?>(null) }
+    LaunchedEffect(widgetRequest) {
+        val r = widgetRequest ?: return@LaunchedEffect
+        com.hiweb.hiwebremotedesk.widget.WidgetRequests.pending.value = null
+        val d = devices.firstOrNull { it.id == r.deviceId } ?: return@LaunchedEffect
+        val action = r.action
+        when {
+            action == com.hiweb.hiwebremotedesk.widget.WidgetRequests.CONNECT -> connect(d)
+            action == com.hiweb.hiwebremotedesk.widget.WidgetRequests.SETTINGS -> editing = d
+            action == com.hiweb.hiwebremotedesk.widget.WidgetRequests.SHARE -> sharing = d
+            action == com.hiweb.hiwebremotedesk.widget.WidgetRequests.HINT -> widgetHint = r.hint
+            action.startsWith(com.hiweb.hiwebremotedesk.widget.WidgetRequests.POWER_PREFIX) ->
+                PowerAction.entries.firstOrNull { it.name == action.removePrefix(com.hiweb.hiwebremotedesk.widget.WidgetRequests.POWER_PREFIX) }
+                    ?.let { powerConfirm = d to it }
+            action.startsWith(com.hiweb.hiwebremotedesk.widget.WidgetRequests.AGENT_PREFIX) ->
+                AgentPower.entries.firstOrNull { it.name == action.removePrefix(com.hiweb.hiwebremotedesk.widget.WidgetRequests.AGENT_PREFIX) }
+                    ?.let { agentConfirm = d to it }
+        }
+    }
+    widgetHint?.let { h ->
+        AlertDialog(
+            onDismissRequest = { widgetHint = null },
+            containerColor = Surface,
+            title = { Text(h.title, color = TextPrimary) },
+            text = { Text(h.text, color = TextSecondary, fontSize = 14.sp) },
+            confirmButton = { TextButton(onClick = { widgetHint = null }) { Text("Понятно") } },
+        )
+    }
+
     BoxWithConstraints(Modifier.fillMaxSize().background(Background)) {
         // Телефон (Compact): боковая панель не помещается рядом со списком, поэтому фильтры
         // переезжают в строку чипов над списком, а действия «добавить/найти» — в кнопки поверх списка.

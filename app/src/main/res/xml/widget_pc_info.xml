@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Виджет «ПК»: карточка выбранного ПК, нажатие на превью открывает его рабочий стол (widget/PcWidgetProvider) -->
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:configure="com.hiweb.hiwebremotedesk.widget.PcWidgetConfigActivity"
+    android:description="@string/widget_pc_description"
+    android:initialLayout="@layout/widget_pc"
+    android:minWidth="250dp"
+    android:minHeight="300dp"
+    android:minResizeWidth="220dp"
+    android:minResizeHeight="260dp"
+    android:previewLayout="@layout/widget_pc"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="3"
+    android:targetCellHeight="4"
+    android:updatePeriodMillis="1800000"
+    android:widgetCategory="home_screen"
+    android:widgetFeatures="reconfigurable" />

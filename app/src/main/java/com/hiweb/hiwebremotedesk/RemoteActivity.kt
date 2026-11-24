@@ -824,6 +824,8 @@ class RemoteActivity : ComponentActivity() {
             return
         }
         device = found
+        openDeviceId = found.id
+        com.hiweb.hiwebremotedesk.widget.PcWidgets.watch(this)
         powerAction = intent.getStringExtra(EXTRA_POWER_ACTION)?.let { name -> PowerAction.entries.firstOrNull { it.name == name } }
         keyHintDismissed = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("key_hint_dismissed", false)
         keyboardMode = KeyboardMode.parse(uiPrefs.getString(keyboardModeKey(), null))
@@ -1791,6 +1793,7 @@ class RemoteActivity : ComponentActivity() {
         cancelReconnect()
         handler.removeCallbacks(agentTimeout)
         if (::device.isInitialized) {
+            if (openDeviceId == device.id) openDeviceId = null
             runCatching { unregisterReceiver(batteryReceiver) }
             SessionService.stop(this)
             agent?.let { GuardHub.detach(device.id, it) }
@@ -2574,6 +2577,9 @@ class RemoteActivity : ComponentActivity() {
 
         /** Сеанс открыт командой «Переключиться на Планшет» с ПК. */
         const val EXTRA_SWITCH = "switch_from_pc"
+
+        /** ПК последнего открытого экрана сеанса (null — сеанса нет): виджет поднимает его, а не открывает второй. */
+        @Volatile var openDeviceId: String? = null
 
         // Скан-коды модификаторов и символы, которые нажимаются с Shift.
         private const val SHIFT_SCAN = 0x2A

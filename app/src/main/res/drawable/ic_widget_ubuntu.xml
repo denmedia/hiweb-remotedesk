@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Упрощённый «круг друзей» Ubuntu, как UbuntuLogo в карточке ПК -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="2.4"
+        android:pathData="M4.8,12a7.2,7.2 0,1 0,14.4 0a7.2,7.2 0,1 0,-14.4 0" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M0.24,12a2.64,2.64 0,1 0,5.28 0a2.64,2.64 0,1 0,-5.28 0" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M14.16,3.69a2.64,2.64 0,1 0,5.28 0a2.64,2.64 0,1 0,-5.28 0" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M14.16,20.31a2.64,2.64 0,1 0,5.28 0a2.64,2.64 0,1 0,-5.28 0" />
+</vector>

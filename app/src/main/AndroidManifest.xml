@@ -63,6 +63,37 @@
             android:screenOrientation="fullUser"
             android:theme="@style/Theme.HiWebRemoteDesk"
             android:windowSoftInputMode="stateAlwaysHidden" />
+        <!-- Виджет «ПК»: карточка ПК на главном экране, нажатие на превью — сразу сеанс (widget/PcWidgets) -->
+        <receiver
+            android:name=".widget.PcWidgetProvider"
+            android:exported="false"
+            android:label="@string/widget_pc_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_pc_info" />
+        </receiver>
+        <!-- Выбор ПК для виджета: открывает лаунчер при добавлении и перенастройке, поэтому exported -->
+        <activity
+            android:name=".widget.PcWidgetConfigActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:taskAffinity=""
+            android:theme="@style/Theme.HiWebRemoteDesk">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+        <!-- Нажатие на превью в виджете: открыть сеанс ПК и сразу закрыться -->
+        <activity
+            android:name=".widget.WidgetLaunchActivity"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.NoDisplay" />
         <service
             android:name=".SessionService"
             android:exported="false"

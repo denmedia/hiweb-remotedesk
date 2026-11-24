@@ -205,6 +205,22 @@ Android-клиент удалённого рабочего стола (RDP) дл
   и папка общего диска. **Пароль по умолчанию в код не кладётся** (переключатель «Передать пароль» в диалоге, QR часто уходит в
   мессенджер). Новое поле `Device`, которое должно переезжать на другой планшет, добавлять в `DeviceShareCode.toJson/fromJson`
   (тест — `DeviceShareCodeTest`). Зависимости: `zxing-core`, `camera-camera2/lifecycle/view` (в `libs.versions.toml`).
+- **Виджет «ПК» на главном экране** — `widget/`: `PcWidgets` (привязка виджет → ПК в prefs `widgets`, ключ `w<id виджета>`;
+  отрисовка `RemoteViews` по `res/layout/widget_pc.xml` — та же карточка, что `DeviceCard`, со всеми элементами: точка и текст
+  состояния, логотип ОС, «Файлы» и щит с числом угроз (Windows), превью или заглушка-градиент с надписью `offlineTitle`/`offlineHint`,
+  название, адрес и «Поделиться», «Подключиться»/«Разбудить» и «Настройки», кнопки питания; плюс значок «⇄» выбора ПК). Разметка
+  генерируется скриптом (кнопки одинаковые: id `<кнопка>`, `_icon`, `_label`); узкий виджет (< 300 dp) — кнопки без подписей
+  (`RemoteViews(Map<SizeF, …>)`). **Правила кнопок карточки — `ui/CardActions.kt`** (`powerSlots`, `connectEnabled`/`connectLabel`,
+  тест `CardActionsTest`), общие для `DeviceCard` и виджета: новую кнопку или правило менять там, а не в одном из двух мест.
+  Нажатия идут в `WidgetLaunchActivity` (невидимая прокладка, решает в момент нажатия): подключение открывает `RemoteActivity`
+  (уже открытый сеанс этого ПК — `RemoteActivity.openDeviceId` — поднимается; без пароля при NLA — окно пароля в списке), «Файлы» —
+  `PcFilesLauncher`, щит — `GuardNavigation`; остальное (питание с подтверждением, настройки, «Поделиться», подсказка неактивной
+  кнопки) кладётся в `WidgetRequests.pending` и выполняется `HomeScreen` теми же окнами, что карточка; `MainActivity` поднимается
+  `REORDER_TO_FRONT`, не `CLEAR_TOP` (закрыл бы сеанс поверх неё). `PcWidgetProvider` (`xml/widget_pc_info.xml`, `reconfigurable`,
+  обновление раз в 30 мин), `PcWidgetConfigActivity` (выбор ПК при добавлении, перенастройке и по «⇄»). Состояние —
+  `PcStatusRules.derive` с проверкой порта RDP не чаще раза в 20 с; `PcWidgets.watch` (зовут `MainActivity`, `RemoteActivity`,
+  `SwitchListenerService`, сам виджет) перерисовывает виджеты при смене списка ПК, превью, сообщений агента, связи с ним и журнала
+  защиты, пока процесс жив.
 - **Ручная проверка обновления приложения** — пункт «Проверить обновление» в меню «⋮» главного экрана (обе панели,
   `TopBar` и `TopBarCompact` в `HomeScreen`) → `ui/UpdateDialog`. Логика: `data/AppUpdate.kt` (`GET api.github.com/repos/denmedia/
   hiweb-remotedesk/releases/latest`, без токена; версия из `tag_name` без `v`, сравнение по числам через точку; APK — первый asset

@@ -113,6 +113,9 @@ Alt+Tab, «домой», переключатель приложений.
 - **Состояние ПК по-человечески**: «онлайн», «за ПК работают», «экран заблокирован», «вход не выполнен»,
   «сон», «гибернация», «перезагружается», «выключен».
 - **Пробуждение по сети (Wake-on-LAN)**: подключение к спящему ПК сначала будит его, затем ждёт порт RDP.
+- **Виджет «ПК» на главном экране**: та же карточка, что в списке, — состояние, превью рабочего стола, файлы, защита RDP,
+  «Поделиться», «Подключиться», «Настройки» и кнопки питания — для выбранного ПК; нажатие на превью сразу открывает его
+  рабочий стол, команды питания спрашивают подтверждение, как на карточке, значок «⇄» переключает виджет на другой ПК.
 
 ### Питание ПК
 Три пути — какой доступен, такой и используется:
@@ -205,6 +208,7 @@ app/src/main/java/com/hiweb/hiwebremotedesk/
 │                 LinuxSsh, WakeOnLan, PcState/PcStatus, ThumbnailStore, SafDriveStorage,
 │                 AppUpdate/UpdateManager (ручная проверка обновления по GitHub Releases)
 ├── ui/           HomeScreen, Dialogs, HomeViewModel, Components, theme
+├── widget/       виджет «ПК» на главном экране: PcWidgets, PcWidgetProvider, PcWidgetConfigActivity
 ├── RemoteActivity / RemoteView     экран сеанса и отрисовка
 ├── TouchpadEngine / TouchpadGestures / TouchscreenGestures / TwoFingerClassifier / ScrollFling
 ├── KeyCaptureService               служба специальных возможностей

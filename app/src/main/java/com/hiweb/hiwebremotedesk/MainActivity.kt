@@ -35,6 +35,8 @@ class MainActivity : ComponentActivity() {
         showGuardFrom(intent)
         // Если ПК привязаны к HiWeb Agent, ждём их команду «Переключиться на Планшет».
         com.hiweb.hiwebremotedesk.agent.SwitchListenerService.startIfPaired(this)
+        // Виджеты «ПК» на главном экране следят за превью и состоянием, пока процесс жив.
+        com.hiweb.hiwebremotedesk.widget.PcWidgets.watch(this)
     }
 
     override fun onNewIntent(intent: Intent) {

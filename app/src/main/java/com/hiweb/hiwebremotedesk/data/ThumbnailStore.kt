@@ -33,8 +33,11 @@ class ThumbnailStore private constructor(context: Context) {
         try { save(id, frame) } finally { frame.recycle() }
     }
 
-    fun load(id: String): ImageBitmap? =
-        file(id).takeIf { it.exists() }?.let { BitmapFactory.decodeFile(it.path)?.asImageBitmap() }
+    fun load(id: String): ImageBitmap? = loadBitmap(id)?.asImageBitmap()
+
+    /** Тот же кадр обычным [Bitmap] (виджет на главном экране). */
+    fun loadBitmap(id: String): Bitmap? =
+        file(id).takeIf { it.exists() }?.let { BitmapFactory.decodeFile(it.path) }
 
     fun delete(id: String) {
         file(id).delete()

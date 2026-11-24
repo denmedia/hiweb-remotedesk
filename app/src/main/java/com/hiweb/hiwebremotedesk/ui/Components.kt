@@ -190,6 +190,23 @@ private fun ActionButton(
     }
 }
 
+/** Надпись поверх превью спящего/выключенного/недоступного ПК (карточка и виджет). */
+fun offlineTitle(state: PcState): String = when (state) {
+    PcState.SLEEP -> "Спящий режим"
+    PcState.HIBERNATE -> "Гибернация"
+    PcState.SHUTDOWN -> "Компьютер выключен"
+    PcState.RESTARTING -> "Перезагрузка…"
+    else -> "Устройство недоступно"
+}
+
+/** Подсказка под [offlineTitle]: можно ли разбудить ПК нажатием; null — подсказки нет. */
+fun offlineHint(device: Device, state: PcState): String? = when {
+    state == PcState.RESTARTING -> null
+    device.canWake -> "Нажмите, чтобы разбудить по сети и подключиться"
+    state.tone == StatusTone.ASLEEP -> "Чтобы будить ПК, укажите его MAC-адрес в настройках"
+    else -> null
+}
+
 @Composable
 private fun PreviewBox(device: Device, status: PcStatus, thumbnail: ImageBitmap?, onDisabledClick: () -> Unit, onClick: () -> Unit) {
     val shape = RoundedCornerShape(12.dp)
@@ -232,19 +249,8 @@ private fun PreviewBox(device: Device, status: PcStatus, thumbnail: ImageBitmap?
                 PcState.RESTARTING -> Icons.Outlined.RestartAlt
                 else -> Icons.Outlined.Cancel
             }
-            val title = when (state) {
-                PcState.SLEEP -> "Спящий режим"
-                PcState.HIBERNATE -> "Гибернация"
-                PcState.SHUTDOWN -> "Компьютер выключен"
-                PcState.RESTARTING -> "Перезагрузка…"
-                else -> "Устройство недоступно"
-            }
-            val hint = when {
-                state == PcState.RESTARTING -> null
-                device.canWake -> "Нажмите, чтобы разбудить по сети и подключиться"
-                state.tone == StatusTone.ASLEEP -> "Чтобы будить ПК, укажите его MAC-адрес в настройках"
-                else -> null
-            }
+            val title = offlineTitle(state)
+            val hint = offlineHint(device, state)
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(icon, null, tint = TextPrimary.copy(alpha = 0.8f), modifier = Modifier.size(44.dp))
                 Spacer(Modifier.height(6.dp))
@@ -285,9 +291,6 @@ fun DeviceCard(
 ) {
     val shape = RoundedCornerShape(20.dp)
     val state = status.state
-    // Подключиться можно и к спящему ПК, если его можно разбудить; команды через сеанс — только к доступному.
-    val canConnect = state.up || state == PcState.CHECKING || device.canWake
-    val canPower = state.up || state == PcState.CHECKING
     var powerMenu by remember { mutableStateOf(false) }
     var hint by remember { mutableStateOf<ButtonHint?>(null) }
     Column(
@@ -342,23 +345,24 @@ fun DeviceCard(
             }
         }
         Spacer(Modifier.height(10.dp))
-        // Кнопки питания видны всегда; недоступные неактивны и включаются, как только агент сообщит о режиме.
-        // Через агента (на связи) — без открытия сеанса и только режимы из GetPwrCapabilities; без агента сон и
-        // гибернация недоступны, остальное — через сеанс RDP/SSH.
+        // Кнопки питания видны всегда; недоступные неактивны и включаются, как только агент сообщит о режиме
+        // (правила — CardActions, общие с виджетом на главном экране).
         val viaAgent = agentPower != null
-        val power = com.hiweb.hiwebremotedesk.agent.AgentPower.entries.map { p ->
-            when {
-                viaAgent -> PowerButton(agentPowerIcon(p), p.title, p in agentPower!!, { onAgentPower(p) }, ButtonHints.power(device.os, p, true, state.up, state))
-                p == com.hiweb.hiwebremotedesk.agent.AgentPower.SHUTDOWN -> PowerButton(agentPowerIcon(p), p.title, canPower, onShutdown, ButtonHints.sessionPower(state))
-                p == com.hiweb.hiwebremotedesk.agent.AgentPower.RESTART -> PowerButton(agentPowerIcon(p), "Перезагрузка", canPower, onReboot, ButtonHints.sessionPower(state))
-                else -> PowerButton(agentPowerIcon(p), p.title, false, {}, ButtonHints.power(device.os, p, false, state.up, state))
+        val power = CardActions.powerSlots(device, state, agentPower).map { s ->
+            val click: () -> Unit = when (val c = s.command) {
+                is CardPower.Agent -> { { onAgentPower(c.power) } }
+                is CardPower.Session -> when (c.action) {
+                    com.hiweb.hiwebremotedesk.rdp.PowerAction.SHUTDOWN -> onShutdown
+                    com.hiweb.hiwebremotedesk.rdp.PowerAction.REBOOT -> onReboot
+                    com.hiweb.hiwebremotedesk.rdp.PowerAction.LOGOUT -> onLogout
+                }
             }
-        } + if (viaAgent) emptyList() else listOf(PowerButton(Icons.AutoMirrored.Outlined.Logout, "Выйти", canPower, onLogout, ButtonHints.sessionPower(state)))
-        val connectLabel = if (viaAgent || state.up || state == PcState.CHECKING) "Подключиться" else "Разбудить"
+            PowerButton(powerIcon(s.icon), s.label, s.enabled, click, s.hint)
+        }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             ActionButton(
-                Icons.Outlined.DesktopWindows, connectLabel, Modifier.weight(if (viaAgent || !compact) 2f else 1f),
-                primary = true, enabled = viaAgent || canConnect, compact = compact,
+                Icons.Outlined.DesktopWindows, CardActions.connectLabel(state, agentPower), Modifier.weight(if (viaAgent || !compact) 2f else 1f),
+                primary = true, enabled = CardActions.connectEnabled(device, state, agentPower), compact = compact,
                 onDisabledClick = { hint = ButtonHints.connect(state) }, onClick = onConnect,
             )
             ActionButton(Icons.Outlined.Settings, "Настройки", Modifier.weight(1f), compact = compact, onClick = onSettings)
@@ -431,9 +435,10 @@ private fun GuardBadge(threats: Int, enabled: Boolean, onDisabledClick: () -> Un
     }
 }
 
-private fun agentPowerIcon(p: com.hiweb.hiwebremotedesk.agent.AgentPower): ImageVector = when (p) {
-    com.hiweb.hiwebremotedesk.agent.AgentPower.SHUTDOWN -> Icons.Outlined.PowerSettingsNew
-    com.hiweb.hiwebremotedesk.agent.AgentPower.RESTART -> Icons.Outlined.RestartAlt
-    com.hiweb.hiwebremotedesk.agent.AgentPower.SLEEP -> Icons.Outlined.DarkMode
-    com.hiweb.hiwebremotedesk.agent.AgentPower.HIBERNATE -> Icons.Outlined.AcUnit
+private fun powerIcon(icon: PowerIcon): ImageVector = when (icon) {
+    PowerIcon.SHUTDOWN -> Icons.Outlined.PowerSettingsNew
+    PowerIcon.RESTART -> Icons.Outlined.RestartAlt
+    PowerIcon.SLEEP -> Icons.Outlined.DarkMode
+    PowerIcon.HIBERNATE -> Icons.Outlined.AcUnit
+    PowerIcon.LOGOUT -> Icons.AutoMirrored.Outlined.Logout
 }

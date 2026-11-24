@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Скругление превью рабочего стола в виджете (обрезка по контуру — clipToOutline) -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#FF081326" />
+    <corners android:radius="12dp" />
+</shape>

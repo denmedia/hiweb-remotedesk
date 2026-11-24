@@ -115,6 +115,9 @@ Alt+Tab, "home", app switcher.
 - **PC status in plain words**: "online", "someone is working at the PC", "screen locked", "not signed in",
   "sleeping", "hibernating", "restarting", "off".
 - **Wake-on-LAN**: connecting to a sleeping PC first wakes it, then waits for the RDP port.
+- **Home screen widget "PC"**: the same card as in the list — status, desktop preview, files, RDP protection, share,
+  "Connect", "Settings" and power buttons — for the PC you pick; tap the preview to open its desktop right away, power
+  actions ask for confirmation as on the card, the "⇄" icon switches the widget to another PC.
 
 ### PC power
 Three paths — whichever is available is used:
@@ -207,6 +210,7 @@ app/src/main/java/com/hiweb/hiwebremotedesk/
 │                 LinuxSsh, WakeOnLan, PcState/PcStatus, ThumbnailStore, SafDriveStorage,
 │                 AppUpdate/UpdateManager (manual update check via GitHub Releases)
 ├── ui/           HomeScreen, Dialogs, HomeViewModel, Components, theme
+├── widget/       "PC" home screen widget: PcWidgets, PcWidgetProvider, PcWidgetConfigActivity
 ├── RemoteActivity / RemoteView     session screen and rendering
 ├── TouchpadEngine / TouchpadGestures / TouchscreenGestures / TwoFingerClassifier / ScrollFling
 ├── KeyCaptureService               accessibility service

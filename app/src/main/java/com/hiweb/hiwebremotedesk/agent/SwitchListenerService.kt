@@ -41,6 +41,8 @@ class SwitchListenerService : Service() {
     override fun onCreate() {
         super.onCreate()
         PcNotifications.ensureChannels(this)
+        // Служба живёт в фоне: через неё виджеты «ПК» узнают о связи с агентом и его снимках экрана.
+        com.hiweb.hiwebremotedesk.widget.PcWidgets.watch(this)
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val notification = Notification.Builder(this, PcNotifications.CHANNEL_SWITCH)
             .setSmallIcon(R.drawable.ic_stat_pc)
